@@ -1,0 +1,190 @@
+#include "windows_video.h"
+#include "windows_audio.h"
+#include "windows_capture_abi.h"
+#include <d3d11.h>
+#include <roapi.h>
+#include <winstring.h>
+#include <algorithm>
+#include <stdexcept>
+#include <thread>
+extern "C" {
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_d3d11va.h>
+HRESULT WINAPI CreateDirect3D11DeviceFromDXGIDevice(IDXGIDevice*, IInspectable**);
+}
+namespace clipsapp {
+namespace {
+void check(HRESULT code, const char* operation) {
+    if (FAILED(code)) throw std::runtime_error(QString("%1 (Windows 0x%2)").arg(operation).arg(quint32(code), 8, 16, QLatin1Char('0')).toStdString());
+}
+template<class T> struct Com {
+    T* p = nullptr;
+    ~Com() { reset(); }
+    void reset() { if (p) p->Release(); p = nullptr; }
+    T** out() { reset(); return &p; }
+    T* operator->() const { return p; }
+};
+void close(IUnknown* object) { if (object) { Com<wgc::Closable> closable; if (SUCCEEDED(object->QueryInterface(wgc::closableId, reinterpret_cast<void**>(closable.out())))) closable->Close(); } }
+void factory(const wchar_t* name, REFIID id, void** output) {
+    HSTRING string; check(WindowsCreateString(name, UINT32(wcslen(name)), &string), "Nom de la capture");
+    const HRESULT result = RoGetActivationFactory(string, id, output); WindowsDeleteString(string); check(result, "API Windows Graphics Capture");
+}
+bool disableBorder(wgc::Session* session, const std::atomic_bool& stop) {
+    try {
+        Com<wgc::Border> border;
+        check(session->QueryInterface(wgc::borderId, reinterpret_cast<void**>(border.out())), "Réglage de la bordure Windows");
+        Com<wgc::AccessFactory> access;
+        factory(L"Windows.Graphics.Capture.GraphicsCaptureAccess", wgc::accessFactoryId, reinterpret_cast<void**>(access.out()));
+        Com<wgc::AccessOperation> operation;
+        check(access->Request(0 /* Borderless */, operation.out()), "Autorisation de capture sans bordure");
+        Com<wgc::AsyncInfo> info;
+        check(operation->QueryInterface(wgc::asyncInfoId, reinterpret_cast<void**>(info.out())), "Autorisation Windows");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        INT32 state = 0;
+        do {
+            check(info->Status(&state), "État de l'autorisation Windows");
+            if (state != 0) break;
+            if (stop || std::chrono::steady_clock::now() >= deadline) { info->Cancel(); return false; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        } while (true);
+        if (state != 1 /* Completed */) return false;
+        INT32 permission = 0;
+        check(operation->Results(&permission), "Résultat de l'autorisation Windows");
+        check(border->Set(false), "Désactivation de la bordure Windows");
+        boolean required = true; check(border->Get(&required), "État de la bordure Windows");
+        return permission == 4 /* AppCapabilityAccessStatus.Allowed */ && !required;
+    } catch (const std::exception&) { return false; }
+}
+}
+struct WindowsVideo::Impl {
+    VideoSettings settings;
+    QString warning;
+    bool apartment = false;
+    HWND window = nullptr;
+    HMONITOR monitor = nullptr;
+    Com<ID3D11Device> device;
+    Com<ID3D11DeviceContext> context;
+    Com<ID3D11VideoDevice> videoDevice;
+    Com<ID3D11VideoContext> videoContext;
+    Com<IInspectable> winrtDevice;
+    Com<wgc::Item> item;
+    Com<wgc::Pool> pool;
+    Com<wgc::Session> session;
+    Com<ID3D11VideoProcessorEnumerator> enumerator;
+    Com<ID3D11VideoProcessor> processor;
+    AVBufferRef* hardware = nullptr;
+    AVBufferRef* frames = nullptr;
+    AVFrame* last = av_frame_alloc();
+    int inputWidth = 0, inputHeight = 0;
+    wgc::Size poolSize{};
+    ~Impl() {
+        close(session.p); close(pool.p); session.reset(); pool.reset(); item.reset(); winrtDevice.reset();
+        av_frame_free(&last); av_buffer_unref(&frames); av_buffer_unref(&hardware);
+        processor.reset(); enumerator.reset(); videoContext.reset(); videoDevice.reset(); context.reset(); device.reset();
+        if (apartment) RoUninitialize();
+    }
+    void setup(const std::atomic_bool& stop) {
+        check(RoInitialize(RO_INIT_MULTITHREADED), "Initialisation de la capture"); apartment = true;
+        const QString resolved = windowsVideoOptions(settings.targetId);
+        if (resolved.startsWith("hwnd=")) window = reinterpret_cast<HWND>(quintptr(resolved.mid(5).toULongLong()));
+        else monitor = reinterpret_cast<HMONITOR>(quintptr(resolved.mid(9).toULongLong()));
+        check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                               nullptr, 0, D3D11_SDK_VERSION, device.out(), nullptr, context.out()), "Périphérique graphique D3D11");
+        check(device->QueryInterface(__uuidof(ID3D11VideoDevice), reinterpret_cast<void**>(videoDevice.out())), "Redimensionnement GPU");
+        check(context->QueryInterface(__uuidof(ID3D11VideoContext), reinterpret_cast<void**>(videoContext.out())), "Traitement vidéo GPU");
+        Com<IDXGIDevice> dxgi; check(device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(dxgi.out())), "Périphérique DXGI");
+        check(CreateDirect3D11DeviceFromDXGIDevice(dxgi.p, winrtDevice.out()), "Périphérique de capture");
+        Com<wgc::ItemFactory> itemFactory; factory(L"Windows.Graphics.Capture.GraphicsCaptureItem", wgc::itemFactoryId, reinterpret_cast<void**>(itemFactory.out()));
+        if (window) check(itemFactory->ForWindow(window, wgc::itemId, reinterpret_cast<void**>(item.out())), "Capture de la fenêtre");
+        else check(itemFactory->ForMonitor(monitor, wgc::itemId, reinterpret_cast<void**>(item.out())), "Capture du moniteur");
+        check(item->GetSize(&poolSize), "Dimensions de la source");
+        Com<wgc::PoolFactory> poolFactory; factory(L"Windows.Graphics.Capture.Direct3D11CaptureFramePool", wgc::poolFactoryId, reinterpret_cast<void**>(poolFactory.out()));
+        check(poolFactory->Create(winrtDevice.p, 87 /* B8G8R8A8_UNORM */, 2, poolSize, pool.out()), "Buffer de capture GPU");
+        check(pool->CreateSession(item.p, session.out()), "Session de capture");
+        Com<wgc::Cursor> cursor;
+        check(session->QueryInterface(wgc::cursorId, reinterpret_cast<void**>(cursor.out())), "Réglage du curseur");
+        check(cursor->Set(settings.captureCursor), "Capture du curseur");
+        if (!disableBorder(session.p, stop)) warning = QStringLiteral("Windows n'a pas autorisé la capture sans bordure. La bordure jaune peut rester visible.");
+        hardware = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA); if (!hardware) throw std::bad_alloc();
+        auto* hardwareContext = reinterpret_cast<AVD3D11VADeviceContext*>(reinterpret_cast<AVHWDeviceContext*>(hardware->data)->hwctx);
+        device->AddRef(); hardwareContext->device = device.p;
+        if (av_hwdevice_ctx_init(hardware) < 0) throw std::runtime_error("Contexte d'encodage D3D11 indisponible.");
+        frames = av_hwframe_ctx_alloc(hardware); if (!frames) throw std::bad_alloc();
+        auto* frameContext = reinterpret_cast<AVHWFramesContext*>(frames->data);
+        frameContext->format = AV_PIX_FMT_D3D11; frameContext->sw_format = AV_PIX_FMT_NV12;
+        frameContext->width = settings.width; frameContext->height = settings.height;
+        // Dynamic textures are reused by the AVBufferPool; no large fixed pool.
+        frameContext->initial_pool_size = 0;
+        reinterpret_cast<AVD3D11VAFramesContext*>(frameContext->hwctx)->BindFlags = D3D11_BIND_RENDER_TARGET;
+        if (av_hwframe_ctx_init(frames) < 0) throw std::runtime_error("Buffer d'encodage GPU indisponible.");
+        check(session->Start(), "Démarrage de Windows Graphics Capture");
+    }
+    void scale(ID3D11Texture2D* input, wgc::Size content, AVFrame* output) {
+        D3D11_TEXTURE2D_DESC inputDesc; input->GetDesc(&inputDesc);
+        if (int(inputDesc.Width) != inputWidth || int(inputDesc.Height) != inputHeight) {
+            inputWidth = int(inputDesc.Width); inputHeight = int(inputDesc.Height);
+            D3D11_VIDEO_PROCESSOR_CONTENT_DESC description{};
+            description.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE; description.InputWidth = inputDesc.Width; description.InputHeight = inputDesc.Height;
+            description.OutputWidth = UINT(settings.width); description.OutputHeight = UINT(settings.height);
+            description.InputFrameRate = description.OutputFrameRate = {UINT(settings.fps), 1}; description.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+            check(videoDevice->CreateVideoProcessorEnumerator(&description, enumerator.out()), "Dimensions du traitement GPU");
+            check(videoDevice->CreateVideoProcessor(enumerator.p, 0, processor.out()), "Processeur vidéo GPU");
+        }
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inputViewDesc{}; inputViewDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+        Com<ID3D11VideoProcessorInputView> inputView;
+        check(videoDevice->CreateVideoProcessorInputView(input, enumerator.p, &inputViewDesc, inputView.out()), "Lecture de la texture capturée");
+        if (av_hwframe_get_buffer(frames, output, 0) < 0) throw std::runtime_error("Allocation de l'image GPU impossible.");
+        auto* texture = reinterpret_cast<ID3D11Texture2D*>(output->data[0]); D3D11_TEXTURE2D_DESC outputDesc; texture->GetDesc(&outputDesc);
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outputViewDesc{};
+        if (outputDesc.ArraySize > 1) { outputViewDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2DARRAY; outputViewDesc.Texture2DArray.ArraySize = 1; outputViewDesc.Texture2DArray.FirstArraySlice = UINT(quintptr(output->data[1])); }
+        else outputViewDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+        Com<ID3D11VideoProcessorOutputView> outputView;
+        check(videoDevice->CreateVideoProcessorOutputView(texture, enumerator.p, &outputViewDesc, outputView.out()), "Écriture de la texture d'encodage");
+        const int width = std::clamp(content.width, 1, inputWidth), height = std::clamp(content.height, 1, inputHeight);
+        const double ratio = std::min(settings.width / double(width), settings.height / double(height));
+        const int outWidth = std::max(2, int(width * ratio) & ~1), outHeight = std::max(2, int(height * ratio) & ~1);
+        const int x = ((settings.width - outWidth) / 2) & ~1, y = ((settings.height - outHeight) / 2) & ~1;
+        const RECT sourceRect{0, 0, width, height}, destinationRect{x, y, x + outWidth, y + outHeight}, targetRect{0, 0, settings.width, settings.height};
+        videoContext->VideoProcessorSetStreamFrameFormat(processor.p, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+        videoContext->VideoProcessorSetStreamSourceRect(processor.p, 0, TRUE, &sourceRect);
+        videoContext->VideoProcessorSetStreamDestRect(processor.p, 0, TRUE, &destinationRect);
+        videoContext->VideoProcessorSetOutputTargetRect(processor.p, TRUE, &targetRect);
+        D3D11_VIDEO_COLOR background{}; background.RGBA.A = 1; videoContext->VideoProcessorSetOutputBackgroundColor(processor.p, FALSE, &background);
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE inputSpace{}, outputSpace{};
+        inputSpace.RGB_Range = 0; outputSpace.YCbCr_Matrix = 1; outputSpace.Nominal_Range = 1; // BT.709, studio range.
+        videoContext->VideoProcessorSetStreamColorSpace(processor.p, 0, &inputSpace);
+        videoContext->VideoProcessorSetOutputColorSpace(processor.p, &outputSpace);
+        videoContext->VideoProcessorSetStreamAutoProcessingMode(processor.p, 0, FALSE);
+        D3D11_VIDEO_PROCESSOR_STREAM stream{}; stream.Enable = TRUE; stream.pInputSurface = inputView.p;
+        check(videoContext->VideoProcessorBlt(processor.p, outputView.p, 0, 1, &stream), "Redimensionnement et conversion GPU");
+        context->Flush();
+        output->sample_aspect_ratio = {1, 1}; output->color_primaries = AVCOL_PRI_BT709; output->color_trc = AVCOL_TRC_BT709; output->colorspace = AVCOL_SPC_BT709; output->color_range = AVCOL_RANGE_MPEG;
+    }
+};
+WindowsVideo::WindowsVideo(const VideoSettings& settings, const std::atomic_bool& stop) : m_impl(std::make_unique<Impl>()) { m_impl->settings = settings; m_impl->setup(stop); }
+WindowsVideo::~WindowsVideo() = default;
+QString WindowsVideo::warning() const { return m_impl->warning; }
+bool WindowsVideo::read(AVFrame* output) {
+    auto& capture = *m_impl;
+    if (capture.window && !IsWindow(capture.window)) throw std::runtime_error("La fenêtre capturée a été fermée. La capture est arrêtée et le buffer vidé.");
+    if (capture.monitor) { MONITORINFO info{}; info.cbSize = sizeof(info); if (!GetMonitorInfoW(capture.monitor, &info)) throw std::runtime_error("Le moniteur capturé a été déconnecté."); }
+    Com<wgc::Frame> frame; check(capture.pool->Next(frame.out()), "Lecture de la capture");
+    if (frame.p) {
+        Com<IInspectable> surface; Com<wgc::DxgiAccess> access; Com<ID3D11Texture2D> texture;
+        wgc::Size size{}; check(frame->ContentSize(&size), "Dimensions de l'image");
+        check(frame->Surface(surface.out()), "Surface capturée");
+        check(surface->QueryInterface(wgc::dxgiAccessId, reinterpret_cast<void**>(access.out())), "Accès à la texture");
+        check(access->GetInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(texture.out())), "Texture de capture");
+        if (size.width > 0 && size.height > 0) {
+            capture.scale(texture.p, size, output); av_frame_unref(capture.last);
+            if (av_frame_ref(capture.last, output) < 0) throw std::bad_alloc();
+        }
+        close(frame.p); frame.reset();
+        if (size.width > 0 && size.height > 0 && (size.width != capture.poolSize.width || size.height != capture.poolSize.height)) {
+            check(capture.pool->Recreate(capture.winrtDevice.p, 87, 2, size), "Redimensionnement de la fenêtre"); capture.poolSize = size;
+        }
+    }
+    if (!output->buf[0] && capture.last->buf[0]) { if (av_frame_ref(output, capture.last) < 0) throw std::bad_alloc(); }
+    return output->buf[0] != nullptr;
+}
+}

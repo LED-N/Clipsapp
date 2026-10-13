@@ -1,0 +1,18 @@
+# Outils téléchargés par scripts/bootstrap-windows.ps1, résultats de compilation, paquets et archives à publier.
+/.tools/
+/build/
+/dist/
+# Dossiers locaux, hors du dépôt.
+/docs/
+/backups/
+# Réglages locaux des éditeurs.
+/CMakeUserPresets.json
+/.vs/
+/.vscode/
+/.idea/
+*.user
+*.autosave
+# Fichiers du système.
+Thumbs.db
+desktop.ini
+.DS_Store

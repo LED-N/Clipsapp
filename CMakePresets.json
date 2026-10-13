@@ -1,0 +1,36 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "windows-local",
+      "displayName": "Windows — outils locaux",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_PREFIX_PATH": "${sourceDir}/.tools",
+        "CMAKE_CXX_COMPILER": "${sourceDir}/.tools/Tools/mingw1310_64/bin/g++.exe",
+        "CMAKE_MAKE_PROGRAM": "${sourceDir}/.tools/ninja.exe",
+        "BUILD_TESTING": "ON"
+      },
+      "environment": {
+        "PATH": "${sourceDir}/.tools/Tools/mingw1310_64/bin;${sourceDir}/.tools/bin;$penv{PATH}"
+      }
+    },
+    {
+      "name": "linux",
+      "displayName": "Linux — Qt système",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "BUILD_TESTING": "ON" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "windows-local", "configurePreset": "windows-local" },
+    { "name": "linux", "configurePreset": "linux" }
+  ],
+  "testPresets": [
+    { "name": "windows-local", "configurePreset": "windows-local", "output": { "outputOnFailure": true } },
+    { "name": "linux", "configurePreset": "linux", "output": { "outputOnFailure": true } }
+  ]
+}

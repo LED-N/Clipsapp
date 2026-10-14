@@ -31,14 +31,31 @@ void ReplayBuffer::push(EncodedPacket packet) {
 }
 ReplaySnapshot ReplayBuffer::snapshot() const {
     ReplaySnapshot result;
-    qint64 start = -1;
-    for (const auto& packet : m_packets) if (packet.stream == 0 && packet.keyframe)
-        if (start < 0 || packet.dtsUs < start) start = packet.dtsUs;
-    if (start < 0) return result;
-    result.startUs = start; result.endUs = m_latestVideo;
+    const EncodedPacket* key = nullptr;
+    for (const auto& packet : m_packets) if (packet.stream == 0 && packet.keyframe && (!key || packet.dtsUs < key->dtsUs)) key = &packet;
+    if (!key) return result;
+    const auto decodingOrder = [](const auto& a, const auto& b) { return a.dtsUs < b.dtsUs; };
+    QList<EncodedPacket> video;
+    for (const auto& packet : m_packets) if (packet.stream == 0 && packet.dtsUs >= key->dtsUs) video.append(packet);
+    std::stable_sort(video.begin(), video.end(), decodingOrder);
+    // A B-frame is decoded after the picture that follows it on screen. Such a stream may only
+    // stop where the next picture decoded is also the next one shown: cut anywhere else, the clip
+    // would end on a hole. The few pictures past that point are still being reordered.
+    qsizetype count = video.size();
+    if (std::any_of(video.cbegin(), video.cend(), [](const auto& packet) { return packet.ptsUs != packet.dtsUs; })) {
+        count = 0; qint64 latest = video.first().ptsUs;
+        for (qsizetype index = 0; index + 1 < video.size(); ++index) {
+            latest = std::max(latest, video[index].ptsUs);
+            if (video[index + 1].ptsUs > latest) count = index + 1;
+        }
+    }
+    if (!count) return result;
+    // Time starts where the first picture is shown, which reordering puts after where it is decoded.
+    result.startUs = key->ptsUs; result.packets = video.first(count);
+    for (const auto& packet : result.packets) result.endUs = std::max(result.endUs, packet.ptsUs + packet.durationUs);
     for (const auto& packet : m_packets)
-        if (packet.dtsUs >= start && packet.ptsUs < result.endUs) result.packets.append(packet);
-    std::stable_sort(result.packets.begin(), result.packets.end(), [](const auto& a, const auto& b) { return a.dtsUs < b.dtsUs; });
+        if (packet.stream != 0 && packet.ptsUs >= result.startUs && packet.ptsUs < result.endUs) result.packets.append(packet);
+    std::stable_sort(result.packets.begin(), result.packets.end(), decodingOrder);
     return result;
 }
 }

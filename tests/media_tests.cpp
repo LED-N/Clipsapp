@@ -102,6 +102,17 @@ private slots:
         const auto requested = pending(); QVERIFY2(requested.error.isEmpty(), qPrintable(requested.error));
         QVERIFY(inspect(requested.path).error.isEmpty());
     }
+    void recordsAt144ImagesPerSecondWithPictureAndSoundInStep() {
+        auto profile = AppConfig::defaults().profiles.first(); profile.video.width = 320; profile.video.height = 192; profile.video.fps = 144; profile.video.bitrateMbps = 5; profile.replay.durationSeconds = 2;
+        Run capture(profile); QTemporaryDir directory;
+        QTRY_VERIFY_WITH_TIMEOUT(capture.backend->stats().videoFrames >= 3 * 144 || capture.future.isFinished(), 10000);
+        QVERIFY2(!capture.future.isFinished(), qPrintable(capture.future.isFinished() ? capture.future.result() : QString()));
+        const auto saved = capture.backend->save(directory.filePath("fast.mp4")); QVERIFY2(saved.error.isEmpty(), qPrintable(saved.error));
+        const auto inspected = inspect(saved.path); QVERIFY2(inspected.error.isEmpty(), qPrintable(inspected.error));
+        // Whatever the encoder had time for, the clip lasts what was recorded: an image given up is not time slowed down.
+        QVERIFY(inspected.duration >= 2.0 && inspected.duration <= 4.2); QVERIFY(inspected.videoFrames >= 144); QVERIFY(inspected.videoFrames <= int(inspected.duration * 144) + 2);
+        QVERIFY(qAbs(inspected.audioFrames[1] / 48000.0 - inspected.duration) < 0.4);
+    }
     void groupsSourcesOnOneTrackAndOmitsDisabledSources() {
         auto profile = AppConfig::defaults().profiles.first(); profile.video.width = 320; profile.video.height = 192; profile.video.fps = 60; profile.video.bitrateMbps = 5;
         profile.sources[0].enabled = false; profile.sources[1].enabled = profile.sources[2].enabled = true; profile.sources[2].trackId = profile.sources[1].trackId;

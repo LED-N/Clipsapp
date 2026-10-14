@@ -1,4 +1,5 @@
 #include "widgets.h"
+#include "video_surface.h"
 #include <QEvent>
 #include <QFocusEvent>
 #include <QHBoxLayout>
@@ -395,12 +396,16 @@ void ModalDialog::paintEvent(QPaintEvent*) {
 void ModalDialog::showEvent(QShowEvent* event) {
     if (auto* owner = parentWidget()) {
         auto* top = owner->window(); adjustSize();
-        if (!m_scrim) { m_scrim = new Scrim(top); m_scrim->setGeometry(top->rect()); m_scrim->show(); m_scrim->raise(); }
+        if (!m_scrim) { m_scrim = new Scrim(top); m_scrim->setGeometry(top->rect()); m_scrim->show(); m_scrim->raise(); for (auto* surface : top->findChildren<VideoSurface*>()) surface->setDimmed(true); }
         move(top->mapToGlobal(top->rect().center()) - QPoint(width() / 2, height() / 2));
     }
     QDialog::showEvent(event);
 }
-void ModalDialog::hideEvent(QHideEvent* event) { if (m_scrim) { m_scrim->hide(); m_scrim->deleteLater(); m_scrim = nullptr; } QDialog::hideEvent(event); }
+void ModalDialog::hideEvent(QHideEvent* event) {
+    // The image the card shows is not under the veil: it is darkened there, and given back with it.
+    if (m_scrim) { for (auto* surface : m_scrim->window()->findChildren<VideoSurface*>()) surface->setDimmed(false); m_scrim->hide(); m_scrim->deleteLater(); m_scrim = nullptr; }
+    QDialog::hideEvent(event);
+}
 
 bool askText(QWidget* parent, const QString& title, const QString& subtitle, const QString& fieldLabel, QString& value, const QString& acceptText) {
     ModalDialog dialog(parent, 420); dialog.setObjectName("text-prompt"); dialog.setHeading(title, subtitle);
@@ -453,6 +458,8 @@ void ToastHost::show(Kind kind, const QString& title, const QString& text, QList
     m_toasts.append(toast);
     m_toasts.erase(std::remove_if(m_toasts.begin(), m_toasts.end(), [](const auto& entry) { return entry.isNull(); }), m_toasts.end());
     while (m_toasts.size() > 3) { if (auto* oldest = m_toasts.takeFirst().data()) { oldest->hide(); oldest->deleteLater(); } }
+    // Over an image the graphics card shows itself, a notification needs a window of its own.
+    VideoSurface::raiseAbove(toast);
     toast->show(); toast->raise(); layout();
 }
 void ToastHost::layout() {

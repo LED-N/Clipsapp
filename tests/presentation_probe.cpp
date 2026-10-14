@@ -25,12 +25,13 @@ int main(int argc, char** argv) {
     parser.addOption({"input", "Local clip to play", "file"});
     parser.addOption({"output-dir", "Directory for the report", "directory"});
     parser.addOption({"box", "Size of the screen to fill", "widthxheight", "2560x1440"});
+    parser.addOption({"preview", "Measure the preview of the editor instead: no screen-sized images"});
     parser.addOption({"seconds", "Playback duration to observe", "seconds", "8"}); parser.process(app);
     if (!parser.isSet("input") || !parser.isSet("output-dir")) return 2;
     const QDir directory(parser.value("output-dir")); if (!QDir().mkpath(directory.path())) return 2;
     const auto dimensions = parser.value("box").split('x'); if (dimensions.size() != 2) return 2;
     const QSize box(dimensions[0].toInt(), dimensions[1].toInt()); const int seconds = std::clamp(parser.value("seconds").toInt(), 2, 120);
-    ClipPlayer player; player.setPresentation(box);
+    ClipPlayer player; if (!parser.isSet("preview")) player.setPresentation(box);
     QImage screen(box, QImage::Format_RGB32); screen.fill(Qt::black);
     QJsonObject report; bool started = false, finished = false; qint64 lastKey = 0, firstMs = -1, lastPosition = 0; qint64 peakBytes = 0;
     std::vector<double> gaps, paints; QElapsedTimer sinceImage, playback;

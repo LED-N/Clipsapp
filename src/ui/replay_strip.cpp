@@ -91,7 +91,7 @@ void ReplayStrip::refresh() {
     case ReplayView::Stopping: title = QStringLiteral("Arrêt du replay…"); detail = QStringLiteral("Libération de la mémoire"); status->set(tk::surface, QColor(0x2A, 0x31, 0x3C), tk::text3, true); break;
     case ReplayView::Error: title = QStringLiteral("Le replay s'est arrêté"); detail = v.error; status->set(tk::dangerBg, tk::dangerLine, tk::danger, false); break;
     case ReplayView::Running:
-        if (warned) { title = QStringLiteral("Replay actif · bordure Windows visible"); detail = v.warning; status->set(tk::warnBg, tk::warnLine, tk::warn, false); }
+        if (warned) { title = QStringLiteral("Replay actif · ") + v.warningTitle; detail = v.warning; status->set(tk::warnBg, tk::warnLine, tk::warn, false); }
         else { title = QStringLiteral("Replay actif"); detail = v.saving ? QStringLiteral("Écriture du clip sur le disque…") : v.liveSummary; status->set(tk::liveBg, tk::liveLine, tk::accent, false); }
         break;
     }

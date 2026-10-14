@@ -9,10 +9,14 @@ QRect boundedCrop(QRect crop, QSize source) {
     const int x = std::clamp(crop.x(), 0, width - 2) & ~1, y = std::clamp(crop.y(), 0, height - 2) & ~1;
     return {x, y, std::clamp(crop.width(), 2, width - x) & ~1, std::clamp(crop.height(), 2, height - y) & ~1};
 }
-ClipEdit defaultEdit(const ClipInfo& info) {
+ClipEdit defaultEdit(const ClipInfo& info, const TrackMix& mix) {
     ClipEdit edit; edit.crop = boundedCrop({QPoint(), info.size}, info.size); edit.endMs = info.durationMs;
-    for (const auto& track : info.audio) edit.tracks.append({track.stream, track.name, 1, false});
+    for (const auto& track : info.audio) edit.tracks.append({track.stream, track.name, info.mixed ? 1 : std::clamp(mixLevel(mix, track.name), 0.0, 2.0), false});
     return edit;
+}
+TrackMix editLevels(const ClipEdit& edit) {
+    TrackMix levels; for (const auto& track : edit.tracks) if (!track.muted) levels.insert(mixKey(track.name), track.volume);
+    return levels;
 }
 int audioExportTrackCount(const ClipEdit& edit) {
     return int(std::count_if(edit.tracks.cbegin(), edit.tracks.cend(), [](const auto& track) { return !track.muted; }));

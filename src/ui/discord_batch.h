@@ -6,7 +6,8 @@
 #include <optional>
 namespace clipsapp {
 struct DiscordPrepared { ClipInfo info; QString error; };
-struct ShareOptions { QString directory; qint64 maxBytes = 20000000; QString codec = "h264"; bool autoResize = true; };
+// The mix is the usual level of each track: a clip shared whole is given it, as in the editor.
+struct ShareOptions { QString directory; qint64 maxBytes = 20000000; QString codec = "h264"; bool autoResize = true; TrackMix mix; };
 struct ShareJob {
     enum State { Pending, Running, Ready, Failed, Cancelled };
     QString source, name; State state = Pending; int progress = 0, batch = 0;

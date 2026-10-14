@@ -1,7 +1,10 @@
 #pragma once
 #include <QImage>
 #include <QWidget>
+class QCursor;
+class QPainter;
 namespace clipsapp {
+class VideoSurface;
 class VideoCanvas final : public QWidget {
     Q_OBJECT
 public:
@@ -14,15 +17,27 @@ public:
     // Width over height the crop must keep; 0 leaves it free.
     void setAspect(double ratio) { m_aspect = ratio; }
     // "Libre" on the whole image: show the frame and its corners, so there is something to pull.
-    void setFreeFrame(bool shown) { m_freeFrame = shown; update(); }
-    void setCropLabel(const QString& label) { m_label = label; update(); }
-    void setNotice(const QString& notice) { m_notice = notice; update(); }
+    void setFreeFrame(bool shown) { m_freeFrame = shown; refresh(); }
+    void setCropLabel(const QString& label) { m_label = label; refresh(); }
+    void setNotice(const QString& notice) { if (notice == m_notice) return; m_notice = notice; refresh(); }
     void setOverlay(QWidget* overlay);
+    // The size, in pixels of the screen, at which an image of the whole frame is drawn without being
+    // scaled: what the view shows of it then fills its place pixel for pixel. Never larger than the frame.
+    QSize wantedSize() const;
+    // Where the graphics card can show the clip itself, the place it does so in this view; nothing
+    // elsewhere. The view then draws what belongs over the image, and no longer the image.
+    VideoSurface* prepareSurface();
+    VideoSurface* surface() const { return m_surface; }
+    void setDirect(bool direct);
+    // The image being shown, for what measures how often it changes.
+    qint64 frameKey() const { return m_image.cacheKey(); }
 signals:
     void cropSelected(QRect crop);
+    void sizeWanted(QSize size);
 protected:
     void paintEvent(QPaintEvent*) override;
     void resizeEvent(QResizeEvent*) override;
+    void changeEvent(QEvent*) override;
     void mousePressEvent(QMouseEvent*) override;
     void mouseMoveEvent(QMouseEvent*) override;
     void mouseReleaseEvent(QMouseEvent*) override;
@@ -33,8 +48,18 @@ private:
     QPoint sourcePoint(QPointF point) const;
     Drag hit(QPointF point) const;
     QRect dragged() const;
+    void announce();
+    void paintOver(QPainter& painter, const QRectF& display, bool result);
+    void point(const QCursor& cursor);
+    void placeSurface();
+    // Windows shows the surface above this view, which is then never asked to draw itself: what
+    // lies over the image is drawn again whenever something of it changes.
+    void refresh();
+    void layOver();
+    bool m_stale = false;
+    VideoSurface* m_surface = nullptr; bool m_direct = false;
     QImage m_image;
-    QSize m_original;
+    QSize m_original, m_wanted;
     QRect m_crop, m_start;
     QPoint m_anchor, m_current;
     QString m_label, m_notice;

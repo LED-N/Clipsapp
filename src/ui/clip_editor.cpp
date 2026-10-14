@@ -1,5 +1,6 @@
 #include "clip_editor.h"
 #include "video_canvas.h"
+#include "video_surface.h"
 #include "clip_timeline.h"
 #include "layout_keys.h"
 #include "widgets.h"
@@ -60,6 +61,11 @@ ClipEditor::ClipEditor(QWidget* parent) : QWidget(parent), m_player(this), m_exp
     m_fullScreen->setToolTip(QStringLiteral("Voir le résultat en plein écran (F)")); m_fullScreen->setAccessibleName(QStringLiteral("Voir le résultat en plein écran")); overlayLayout->addWidget(m_fullScreen);
     m_canvas->setOverlay(overlay);
     m_canvas->setCropTool(true); m_canvas->setResultPreview(true);
+    // The preview is made at the size it is drawn at: showing an image is then copying it, at the
+    // pace of the clip. A view that is being resized asks many times; its last word is waited for.
+    m_previewSize.setSingleShot(true); m_previewSize.setInterval(60);
+    connect(m_canvas, &VideoCanvas::sizeWanted, this, [this] { m_previewSize.start(); });
+    connect(&m_previewSize, &QTimer::timeout, this, [this] { m_player.setPresentation(previewBox(), true); });
 
     m_transport = new QWidget; m_transport->setFixedHeight(40); auto* transport = new QHBoxLayout(m_transport); transport->setContentsMargins(0, 0, 0, 0); transport->setSpacing(8);
     auto* toStart = new Button(QStringLiteral("start"), QString(), Button::Ghost); toStart->setToolTip(QStringLiteral("Aller au début de la sélection (Origine)")); toStart->setAccessibleName(toStart->toolTip());
@@ -213,6 +219,9 @@ QWidget* ClipEditor::buildInspector() {
     m_audioMode = new Segmented; m_audioMode->setObjectName("export-audio-mode"); m_audioMode->addOption(QStringLiteral("Une piste mixée")); m_audioMode->addOption(QStringLiteral("Pistes séparées")); sound->addWidget(m_audioMode);
     m_audioSummary = label({}, "hint", true); m_audioSummary->setObjectName("export-audio-summary"); sound->addWidget(m_audioSummary);
     m_restoreTracks = new Button(QStringLiteral("undo"), QStringLiteral("Rétablir les pistes retirées"), Button::Ghost, Button::Small); m_restoreTracks->setObjectName("restore-audio-tracks"); m_restoreTracks->setPadding(6); m_restoreTracks->hide(); sound->addWidget(m_restoreTracks, 0, Qt::AlignLeft);
+    m_keepMix = new Button(QStringLiteral("check"), QStringLiteral("Garder ces volumes par défaut"), Button::Ghost, Button::Small); m_keepMix->setObjectName("keep-mix"); m_keepMix->setPadding(6); m_keepMix->hide(); sound->addWidget(m_keepMix, 0, Qt::AlignLeft);
+    m_keepMix->setToolTip(QStringLiteral("<qt>Les prochains clips s'ouvriront avec ces volumes, dans l'éditeur, en plein écran et dans les copies de partage. Les fichiers enregistrés ne sont pas modifiés.</qt>"));
+    connect(m_keepMix, &QPushButton::clicked, this, [this] { if (m_initialized) emit mixChosen(chosenMix()); });
     layout->addWidget(separator());
 
     // In a small window the facts fold behind one line, so the trash button stays in view.
@@ -282,8 +291,14 @@ void ClipEditor::beginAnalysis() {
 void ClipEditor::openClip(const QString& path) {
     if (m_exporter.running()) return;
     stopAnalysis(); m_initialized = false; m_path = QFileInfo(path).absoluteFilePath(); m_controls->setEnabled(false); m_title->setFullText(QFileInfo(path).completeBaseName());
-    m_banner->hide(); m_problem->hide(); m_exportedPath.clear(); finishRename(false); updateActions(); m_player.load(m_path);
+    m_banner->hide(); m_problem->hide(); m_exportedPath.clear(); finishRename(false); updateActions(); m_player.setPresentation(previewBox(), true);
+    // Where the card can show the clip itself, the images go straight to their place in the view.
+    auto* surface = m_canvas->prepareSurface();
+    m_player.setFrameSink(surface ? [surface](const GpuFrame& frame) { surface->present(frame); } : std::function<void(const GpuFrame&)>());
+    m_player.load(m_path);
 }
+// Until the view knows the clip, a size that suits most of them.
+QSize ClipEditor::previewBox() const { const auto wanted = m_canvas->wantedSize(); return wanted.isEmpty() ? QSize(1280, 720) : wanted; }
 void ClipEditor::suspend() { stopAnalysis(); m_player.close(); }
 QList<QFuture<ClipAnalysis>> ClipEditor::pendingAnalyses() const {
     QList<QFuture<ClipAnalysis>> pending;
@@ -311,7 +326,7 @@ void ClipEditor::stepFrames(int frames) {
 void ClipEditor::updatePlayer() {
     const auto state = m_player.snapshot();
     if (state.loaded && !m_initialized) {
-        m_updating = true; m_info = state.info; m_edit = m_drafts.value(m_path, defaultEdit(m_info)); if (!validateEdit(m_info, m_edit).isEmpty()) m_edit = defaultEdit(m_info);
+        m_updating = true; m_info = state.info; m_usualEdit = defaultEdit(m_info, m_mix); m_edit = m_drafts.value(m_path, m_usualEdit); if (!validateEdit(m_info, m_edit).isEmpty()) m_edit = m_usualEdit;
         m_originalEdit = defaultEdit(m_info); m_baseline = m_exports.value(m_path, m_originalEdit);
         m_start->setRange(0, m_info.durationMs / 1000.0 - 0.05); m_end->setRange(0.05, m_info.durationMs / 1000.0);
         m_start->setValue(m_edit.startMs / 1000.0); m_end->setValue(m_edit.endMs / 1000.0); m_audioMode->setCurrentIndex(m_edit.separateTracks ? 1 : 0);
@@ -326,7 +341,15 @@ void ClipEditor::updatePlayer() {
         m_ratio = m_edit.crop == QRect(QPoint(), m_info.size) ? 0 : 4; m_canvas->setAspect(0);
         m_updating = false; m_initialized = true; updateCrop(m_edit.crop); applyEdits(); beginAnalysis();
     }
-    m_canvas->setFrame(state.image, state.info.size); m_play->setEnabled(state.loaded); updateActions();
+    // The card stopped showing the clip: it is opened again, drawn from memory this time.
+    if (state.direct && m_canvas->surface() && m_canvas->surface()->lost()) { VideoSurface::giveUp(); m_canvas->setDirect(false); m_initialized = false; const auto path = m_path; QMetaObject::invokeMethod(this, [this, path] { if (path == m_path) openClip(path); }, Qt::QueuedConnection); return; }
+    m_canvas->setFrame(state.image, state.info.size); m_canvas->setDirect(state.direct);
+    // While the clip plays the picture follows every image, and the rest of the page the pace of a
+    // screen: the buttons, the time and the timeline have nothing to say two hundred times a second.
+    const bool settled = state.playing && m_seenPlaying && state.loaded == m_seenLoaded && state.error.isEmpty() && state.warning.isEmpty();
+    if (settled && m_refresh.isValid() && m_refresh.elapsed() < 15) return;
+    m_refresh.start(); m_seenPlaying = state.playing; m_seenLoaded = state.loaded;
+    m_play->setEnabled(state.loaded); updateActions();
     m_play->setText(state.playing ? QStringLiteral("Pause") : QStringLiteral("Lire")); m_play->setIconName(state.playing ? QStringLiteral("pause") : QStringLiteral("play"));
     m_timeline->setPosition(state.positionMs); m_time->setText(timeText(state.positionMs)); m_total->setText(QStringLiteral("/ ") + timeText(state.info.durationMs));
     if (state.playing && (state.positionMs < m_timeline->viewStart() || state.positionMs > m_timeline->viewStart() + m_timeline->visibleDuration())) m_timeline->setViewStart(state.positionMs - m_timeline->visibleDuration() / 8);
@@ -379,6 +402,8 @@ void ClipEditor::updateSummary() {
     m_audioSummary->setText(text); m_audioMode->setVisible(loaded && audioCount > 1);
     QStringList removed; for (const auto& audio : m_info.audio) { bool present = false; for (const auto& track : m_edit.tracks) present |= track.stream == audio.stream; if (!present) removed.append(audio.name); }
     m_restoreTracks->setVisible(loaded && !removed.isEmpty());
+    // Offered once the levels of this clip are not the usual ones. A clip mixed by an export says nothing of the habit.
+    m_keepMix->setVisible(loaded && !m_info.mixed && !m_edit.tracks.isEmpty() && !sameMix(chosenMix(), m_mix));
     m_restoreTracks->setText(removed.size() == 1 ? QStringLiteral("Rétablir la piste « %1 »").arg(removed.first()) : QStringLiteral("Rétablir les %1 pistes retirées").arg(removed.size()));
     if (loaded) m_details[2]->setText(removed.isEmpty() ? QString::number(m_info.audio.size()) : QStringLiteral("%1, dont %2 retirée%3").arg(m_info.audio.size()).arg(removed.size()).arg(removed.size() > 1 ? "s" : ""));
 }
@@ -395,17 +420,26 @@ void ClipEditor::updateActions() {
     // A disabled export always says why, next to the button rather than in a tooltip.
     const QString reason = !loaded ? (m_path.isEmpty() ? QStringLiteral("Ouvrez un clip depuis la bibliothèque.") : QStringLiteral("Chargement du clip…")) : m_sharingBusy ? QStringLiteral("Attendez la fin du partage Discord pour exporter.")
         : !changed ? QStringLiteral("Rien à exporter : coupez, recadrez ou réglez une piste.") : !valid ? validateEdit(m_info, m_edit) : QString();
-    m_stateTag->setVisible(running || (loaded && changed));
+    // A clip that only carries the usual levels can be exported, but nobody modified it yet.
+    const bool touched = changed && !sameClipEdits(m_edit, m_usualEdit);
+    m_stateTag->setVisible(running || (loaded && touched));
     if (running) m_stateTag->set(QStringLiteral("Export en cours"), Tag::Info); else m_stateTag->set(QStringLiteral("Modifié"), Tag::Warn);
     auto* hint = static_cast<ElideLabel*>(m_hint);
     hint->setAlignment((reason.isEmpty() || running ? Qt::AlignLeft : Qt::AlignRight) | Qt::AlignVCenter);
-    hint->setFullText(running ? QString() : reason.isEmpty() ? QStringLiteral("Exportez pour garder vos changements après la fermeture.") : reason);
+    hint->setFullText(running ? QString() : !reason.isEmpty() ? reason : touched ? QStringLiteral("Exportez pour garder vos changements après la fermeture.") : QStringLiteral("Vos volumes habituels sont appliqués. Exportez pour les garder dans un fichier."));
     m_export->setToolTip(reason);
 }
 bool ClipEditor::hasExportChanges() const {
     return m_initialized && !sameClipEdits(m_edit, m_originalEdit) && !sameClipEdits(m_edit, m_baseline);
 }
 void ClipEditor::setSharingBusy(bool busy) { m_sharingBusy = busy; updateActions(); }
+// The clip being edited keeps the levels it shows: the new mix is where the next ones start.
+void ClipEditor::setDefaultMix(const TrackMix& mix) { m_mix = mix; if (m_initialized) m_usualEdit = defaultEdit(m_info, m_mix); updateActions(); }
+TrackMix ClipEditor::chosenMix() const {
+    auto mix = m_mix; const auto levels = editLevels(m_edit);
+    for (auto track = levels.cbegin(); track != levels.cend(); ++track) mix.insert(track.key(), track.value());
+    return mix;
+}
 void ClipEditor::noteHighQualityExport(const QString& original, const ClipEdit& edit) {
     if (m_exports.size() >= 128 && !m_exports.contains(original)) m_exports.erase(m_exports.begin());
     m_exports.insert(original, edit); if (m_path == original) { m_baseline = edit; updateActions(); }
@@ -418,7 +452,7 @@ void ClipEditor::removeTrack(int stream) {
     applyEdits(); stopAnalysis(); beginAnalysis();
 }
 void ClipEditor::restoreTracks() {
-    auto restored = defaultEdit(m_info).tracks;
+    auto restored = defaultEdit(m_info, m_mix).tracks;
     for (auto& track : restored) for (const auto& kept : m_edit.tracks) if (kept.stream == track.stream) track = kept;
     m_edit.tracks = std::move(restored); m_timeline->setEdit(m_edit); m_volumes = m_timeline->volumes(); m_mutes = m_timeline->mutes();
     m_timeline->setFixedHeight(m_timeline->preferredHeight());

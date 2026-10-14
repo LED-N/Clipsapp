@@ -1,6 +1,7 @@
 #include "clip_reader.h"
 #include <QFileInfo>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <deque>
@@ -55,8 +56,13 @@ struct ClipReader::Impl {
     QImage lastImage;
     void recycle(QImage&& image) { if (!image.isNull() && output.fit && spare.size() < 4) spare.push_back(std::move(image)); }
     qint64 originUs = 0, readMs = -1, targetMs = 0, presentMs = -1;
+    // While the clip plays, the time it is at keeps moving during a reading: it is followed on the clock.
+    std::chrono::steady_clock::time_point presentSince; bool presentMoves = false;
+    qint64 presentNow() const { return presentMs < 0 || !presentMoves ? presentMs : presentMs + std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - presentSince).count(); }
     qint64 pendingBytes = 0;
     bool eof = false, audioOnly = false;
+    // Images kept on the card, a few only: each one holds a surface of the decoder.
+    bool presentable = false, direct = false; std::deque<std::pair<qint64, GpuFrame>> gpuVideo; GpuFrame lastGpu;
     const std::atomic_bool* stop = nullptr;
     FrameOutput output;
     QSize outputSize(QSize region) const {
@@ -81,11 +87,18 @@ struct ClipReader::Impl {
         auto* stream = file->streams[info.videoStream]; info.size = {stream->codecpar->width, stream->codecpar->height};
         info.videoBitrate = stream->codecpar->bit_rate;
         info.videoCodec = QString::fromUtf8(avcodec_get_name(stream->codecpar->codec_id));
+        if (const auto* comment = av_dict_get(file->metadata, "comment", nullptr, 0)) info.mixed = strstr(comment->value, mixedMark) != nullptr;
         const auto rate = av_guess_frame_rate(file, stream, nullptr); if (rate.den && rate.num) info.fps = av_q2d(rate);
         if (info.durationMs <= 0 && stream->duration != AV_NOPTS_VALUE) info.durationMs = av_rescale_q(stream->duration, stream->time_base, {1, 1000});
         if (info.durationMs <= 0 || info.size.width() < 2 || info.size.height() < 2) throw std::runtime_error("Durée ou dimensions du clip invalides.");
         if (file->nb_streams > 128) throw std::runtime_error("Ce fichier contient trop de pistes.");
         decoders.resize(file->nb_streams); audio.resize(file->nb_streams);
+        // The graphics card spares the processor, but each image must then be copied back to memory, and a
+        // game that keeps the card busy makes that copy wait: a clip faster than 60 images per second
+        // falls to a third of its pace. A processor with cores to spare decodes it steadily by itself.
+        // None of this concerns images that stay on the card: nothing is copied back.
+        auto* shared = presentable ? GpuVideo::shared() : nullptr;
+        const unsigned cores = std::thread::hardware_concurrency(); const bool spare = !shared && info.fps > 61 && cores >= 12;
         for (unsigned index = 0; index < file->nb_streams; ++index) {
             auto* input = file->streams[index]; const bool isVideo = int(index) == info.videoStream;
             if (isVideo && audioOnly) continue;
@@ -93,9 +106,9 @@ struct ClipReader::Impl {
             const auto* codec = avcodec_find_decoder(input->codecpar->codec_id); if (!codec) throw std::runtime_error("Codec de lecture indisponible.");
             auto decoder = std::make_unique<Decoder>(); decoder->context = avcodec_alloc_context3(codec); if (!decoder->context) throw std::bad_alloc();
             auto* context = decoder->context; check(avcodec_parameters_to_context(context, input->codecpar), "Paramètres du décodeur");
-            context->pkt_timebase = input->time_base; context->thread_count = 2;
+            context->pkt_timebase = input->time_base; context->thread_count = isVideo && (spare || !hardware) ? int(std::clamp(cores / 2, 2u, 8u)) : 2;
             decoder->endMs = input->duration == AV_NOPTS_VALUE ? info.durationMs : av_rescale_q(input->duration, input->time_base, {1, 1000}) + (input->start_time == AV_NOPTS_VALUE ? 0 : av_rescale_q(input->start_time, input->time_base, {1, 1000})) - originUs / 1000;
-            if (isVideo && hardware) {
+            if (isVideo && hardware && !spare) {
 #ifdef Q_OS_WIN
                 constexpr auto deviceType = AV_HWDEVICE_TYPE_D3D11VA;
 #else
@@ -103,7 +116,10 @@ struct ClipReader::Impl {
 #endif
                 for (int configIndex = 0; const auto* config = avcodec_get_hw_config(codec, configIndex); ++configIndex) {
                     if (config->device_type != deviceType || !(config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) continue;
-                    if (av_hwdevice_ctx_create(&context->hw_device_ctx, deviceType, nullptr, nullptr, 0) >= 0) {
+                    // A presentable reader decodes on the device its window draws with, and lets a few
+                    // more surfaces than the decoder needs be held: those waiting for their turn on screen.
+                    if (shared) { context->hw_device_ctx = av_buffer_ref(shared->decodingDevice()); context->extra_hw_frames = 10; direct = context->hw_device_ctx != nullptr; }
+                    if (context->hw_device_ctx || av_hwdevice_ctx_create(&context->hw_device_ctx, deviceType, nullptr, nullptr, 0) >= 0) {
                         decoder->hardwareFormat = config->pix_fmt; context->opaque = &decoder->hardwareFormat; context->get_format = hardwareFormat;
                         info.decoder = QString::fromUtf8(av_hwdevice_get_type_name(deviceType));
                     }
@@ -130,7 +146,16 @@ struct ClipReader::Impl {
                 const qint64 ms = pts == AV_NOPTS_VALUE ? std::max<qint64>(0, readMs) : av_rescale_q(pts, stream->time_base, {1, 1000}) - originUs / 1000;
                 const qint64 duration = frame->duration > 0 ? av_rescale_q(frame->duration, stream->time_base, {1, 1000}) : qint64(std::ceil(1000.0 / info.fps));
                 decoder.decodedMs = std::max(decoder.decodedMs, ms + std::max<qint64>(1, duration));
-                if (ms >= targetMs - 1000.0 / info.fps && (presentMs < 0 || ms + std::max<qint64>(1, duration) > presentMs)) {
+                // An image whose time has passed is not converted: at 144 images per second, the work of one
+                // that nobody will see is what makes the next ones late, and the picture falls further behind.
+                const qint64 present = presentNow(); const bool wanted = ms >= targetMs - 1000.0 / info.fps && (present < 0 || ms + std::max<qint64>(1, duration) > present);
+                // Decoded on the device of the window, the image waits there for its turn, as it is.
+                // The decoder may still fall back to memory for a clip the card cannot read: such
+                // an image takes the other way, below.
+                if (direct && frame->format != AV_PIX_FMT_D3D11) direct = false;
+                if (direct) {
+                    if (wanted) { if (auto* kept = av_frame_clone(frame)) gpuVideo.emplace_back(ms, GpuFrame(kept, [](AVFrame* held) { av_frame_free(&held); })); while (gpuVideo.size() > 6) gpuVideo.pop_front(); }
+                } else if (wanted) {
                     AVFrame* image = frame;
                     if (frame->hw_frames_ctx) {
                         // The memory that receives the GPU picture is kept from one image to the next:
@@ -197,7 +222,11 @@ struct ClipReader::Impl {
             } else {
                 const qint64 delay = decoder.resampler ? swr_get_delay(decoder.resampler, 48000) : 0;
                 qint64 start = pts == AV_NOPTS_VALUE ? (decoder.nextAudio == AV_NOPTS_VALUE ? targetMs * 48 : decoder.nextAudio) : av_rescale_q(pts, stream->time_base, {1, 48000}) - originUs * 48 / 1000 - delay;
-                if (decoder.nextAudio != AV_NOPTS_VALUE && std::abs(start - decoder.nextAudio) <= 2) start = decoder.nextAudio;
+                // Decoded sound is one continuous signal, whatever the file says of each block: some
+                // recorders stamp their packets with the time they arrived, a few milliseconds early or
+                // late. Placed at those times the blocks overlap or leave holes, and the sound crackles.
+                // Only a real break, a tenth of a second as for the export, moves the sound in time.
+                if (decoder.nextAudio != AV_NOPTS_VALUE && std::abs(start - decoder.nextAudio) <= 4800) start = decoder.nextAudio;
                 if (!decoder.resampler) {
                     AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
                     check(swr_alloc_set_opts2(&decoder.resampler, &stereo, AV_SAMPLE_FMT_FLT, 48000, &frame->ch_layout, AVSampleFormat(frame->format), frame->sample_rate, 0, nullptr), "Format audio de lecture");
@@ -217,7 +246,13 @@ struct ClipReader::Impl {
         if (result != AVERROR(EAGAIN) && result != AVERROR_EOF) check(result, "Décodage du clip");
     }
 };
-ClipReader::ClipReader(const QString& path, bool hardware, bool audioOnly) : m_impl(std::make_unique<Impl>()) { m_impl->audioOnly = audioOnly; m_impl->open(path, hardware); }
+ClipReader::ClipReader(const QString& path, bool hardware, bool audioOnly, bool presentable) : m_impl(std::make_unique<Impl>()) { m_impl->audioOnly = audioOnly; m_impl->presentable = presentable && hardware && !audioOnly; m_impl->open(path, hardware); }
+bool ClipReader::direct() const { return m_impl->direct; }
+GpuFrame ClipReader::gpuFrameAt(qint64 positionMs) {
+    auto& reader = *m_impl;
+    while (!reader.gpuVideo.empty() && (reader.gpuVideo.front().first <= positionMs || !reader.lastGpu)) { reader.lastGpu = std::move(reader.gpuVideo.front().second); reader.gpuVideo.pop_front(); }
+    return reader.lastGpu;
+}
 ClipReader::~ClipReader() = default;
 ClipInfo ClipReader::info() const { return m_impl->info; }
 bool ClipReader::setAudioTracks(const QList<TrackEdit>& tracks) {
@@ -239,11 +274,13 @@ void ClipReader::seek(qint64 ms) {
     check(avformat_seek_file(reader.file, -1, INT64_MIN, timestamp, timestamp, 0), "Déplacement dans le clip");
     for (auto& decoder : reader.decoders) if (decoder) { avcodec_flush_buffers(decoder->context); swr_free(&decoder->resampler); decoder->nextAudio = AV_NOPTS_VALUE; decoder->decodedMs = -1; decoder->flushed = false; decoder->clearPackets(); }
     reader.pendingBytes = 0;
-    for (auto& queue : reader.audio) queue.clear(); reader.video.clear(); reader.lastImage = {};
+    for (auto& queue : reader.audio) queue.clear(); reader.video.clear(); reader.lastImage = {}; reader.gpuVideo.clear(); reader.lastGpu.reset();
     reader.readMs = -1; reader.targetMs = ms; reader.eof = false; av_packet_unref(reader.packet);
 }
 bool ClipReader::setFrameOutput(const FrameOutput& output) {
     if (m_impl->output == output || output.box.width() < 2 || output.box.height() < 2) return false;
+    // Images that stay on the card are scaled by it when they are shown: nothing has to be decoded again.
+    if (m_impl->direct) { m_impl->output = output; return false; }
     m_impl->output = output; return true;
 }
 QSize ClipReader::frameSize() const {
@@ -251,7 +288,7 @@ QSize ClipReader::frameSize() const {
     return m_impl->outputSize(region.isEmpty() ? whole.size() : region.size());
 }
 void ClipReader::readUntil(qint64 endMs, const std::atomic_bool& stop, bool videoOnly, qint64 videoEndMs, qint64 presentMs) {
-    auto& reader = *m_impl; reader.stop = &stop; reader.presentMs = presentMs;
+    auto& reader = *m_impl; reader.stop = &stop; reader.presentMs = presentMs; reader.presentMoves = !videoOnly && presentMs >= 0; reader.presentSince = std::chrono::steady_clock::now();
     // Container packet order is not necessarily timestamp order. In particular,
     // GSR MP4 files may deliver video a second ahead of the other tracks.
     // Wait for each decoded stream and defer ahead-of-time packets, so neither

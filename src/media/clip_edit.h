@@ -1,8 +1,11 @@
 #pragma once
+#include "core/track_mix.h"
 #include <QList>
 #include <QRect>
 #include <QString>
 namespace clipsapp {
+// What an export writes in the comment of its file, and what tells the reader the sound was mixed.
+inline constexpr char mixedMark[] = "Mixé par Clipsapp";
 struct ClipAudioInfo { int stream = -1; QString name; QString codec; };
 struct ClipInfo {
     QString path, decoder;
@@ -13,6 +16,8 @@ struct ClipInfo {
     QList<ClipAudioInfo> audio;
     qint64 videoBitrate = 0;
     QString videoCodec;
+    // Written by an export of the application: its sound already carries the levels that were chosen.
+    bool mixed = false;
 };
 struct TrackEdit { int stream = -1; QString name; double volume = 1; bool muted = false; };
 struct ClipEdit {
@@ -22,7 +27,10 @@ struct ClipEdit {
     bool separateTracks = false;
 };
 QRect boundedCrop(QRect requested, QSize source);
-ClipEdit defaultEdit(const ClipInfo& info);
+// The clip as it is, each track at its usual level. A clip that was already mixed is left as it sounds.
+ClipEdit defaultEdit(const ClipInfo& info, const TrackMix& mix = {});
+// The levels an edit gives to the tracks it keeps audible, for the mix to learn from.
+TrackMix editLevels(const ClipEdit& edit);
 QString validateEdit(const ClipInfo& info, const ClipEdit& edit);
 int audioExportTrackCount(const ClipEdit& edit);
 bool sameClipEdits(const ClipEdit& left, const ClipEdit& right);

@@ -8,7 +8,9 @@
 #include "capture/replay_engine.h"
 #include "platform/global_hotkey.h"
 #include "sharing_page.h"
+class QAction;
 class QCloseEvent;
+class QShowEvent;
 class QStackedWidget;
 class QSystemTrayIcon;
 class QVBoxLayout;
@@ -40,8 +42,14 @@ public:
     void announceUpdated(const QString& previousVersion);
     // Set once the files of a new version are in place: the application closes and is started again.
     bool relaunchRequested() const { return m_relaunch; }
+    // The folder where Windows lists the user's programs: this copy keeps its shortcut there when
+    // the settings ask for one. Without this call it never touches the Start menu.
+    void manageStartMenu(const QString& programsDirectory);
+    // Brings the window back from the notification area, as when the application is started again.
+    void surface();
 protected:
     void closeEvent(QCloseEvent* event) override;
+    void showEvent(QShowEvent* event) override;
 private:
     QWidget* buildRail();
     void rebuildRail();
@@ -71,6 +79,12 @@ private:
     void showUpdate();
     void installUpdate();
     void refreshUpdateButton();
+    void refreshTray();
+    // The usual mix: handed to what plays and exports clips, replaced on request, learnt from the exports.
+    void spreadMix();
+    void adoptMix(const TrackMix& mix);
+    void learnMix(const TrackMix& levels);
+    QString mixText(const TrackMix& from, const TrackMix& to) const;
     QString targetName(const VideoSettings& video) const;
     RecordingProfile& profile();
 
@@ -109,6 +123,7 @@ private:
     int m_libraryFilter = 0; QString m_libraryGame;
     bool m_firstLaunch = false, m_relaunch = false;
     UpdateService* m_updates; Button* m_updateButton;
-    QSystemTrayIcon* m_tray;
+    QSystemTrayIcon* m_tray; QAction* m_traySave; QAction* m_trayToggle;
+    QString m_programs; bool m_quitting = false; TrackMix m_mixAsked;
 };
 }

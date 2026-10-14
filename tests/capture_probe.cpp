@@ -24,6 +24,10 @@ int main(int argc, char** argv) {
     parser.addOption({"fps", "Frame rate", "fps", "30"});
     parser.addOption({"hevc", "Use HEVC"});
     parser.addOption({"4k", "Use 4K resolution"});
+    parser.addOption({"1440p", "Use 1440p resolution"});
+    parser.addOption({"bitrate", "Target bitrate, or ceiling of the constant quality", "Mbit/s", "25"});
+    parser.addOption({"quality", "Hold this constant quality instead of a bitrate", "level"});
+    parser.addOption({"thorough", "Ask the encoder for its thorough effort"});
     parser.addOption({"seconds", "Observation duration", "seconds", "5"});
     parser.addOption({"buffer", "Replay duration", "seconds", "3"});
     parser.addOption({"automatic-audio", "Capture applications automatically"});
@@ -44,6 +48,10 @@ int main(int argc, char** argv) {
     }
     if (parser.isSet("hevc")) profile.video.codec = "hevc";
     if (parser.isSet("4k")) { profile.video.width = 3840; profile.video.height = 2160; }
+    if (parser.isSet("1440p")) { profile.video.width = 2560; profile.video.height = 1440; }
+    profile.video.bitrateMbps = parser.value("bitrate").toInt();
+    if (parser.isSet("quality")) { profile.video.rateControl = "quality"; profile.video.quality = parser.value("quality").toInt(); }
+    if (parser.isSet("thorough")) profile.video.effort = "thorough";
     profile.sources.clear();
     profile.sources.append({"output", "Son système", parser.isSet("automatic-audio") ? SourceKind::ApplicationMix : SourceKind::Output, "@default", "Par défaut", profile.tracks[1].id, true});
     if (parser.isSet("microphone")) profile.sources.append({"microphone", "Micro", SourceKind::Microphone, "@default", "Par défaut", profile.tracks[0].id, true});
@@ -70,7 +78,7 @@ int main(int argc, char** argv) {
     const auto stats = backend->stats();
     stop = true; future.waitForFinished();
     const auto stoppedStats = backend->stats();
-    QJsonObject report{{"targetId", profile.video.targetId}, {"captureError", future.result()}, {"exportError", saved.error}, {"warning", stats.warning}, {"path", saved.path}, {"encoder", stats.encoder}, {"frames", qint64(stats.videoFrames)}, {"bufferBytes", stats.bytes}, {"seconds", stats.seconds}, {"bufferBytesAfterStop", stoppedStats.bytes}, {"secondsAfterStop", stoppedStats.seconds}, {"fps", profile.video.fps}, {"width", profile.video.width}, {"height", profile.video.height}};
+    QJsonObject report{{"targetId", profile.video.targetId}, {"captureError", future.result()}, {"exportError", saved.error}, {"warning", stats.warning}, {"path", saved.path}, {"encoder", stats.encoder}, {"frames", qint64(stats.videoFrames)}, {"lost", stats.lost}, {"bufferBytes", stats.bytes}, {"seconds", stats.seconds}, {"bufferBytesAfterStop", stoppedStats.bytes}, {"secondsAfterStop", stoppedStats.seconds}, {"fps", profile.video.fps}, {"width", profile.video.width}, {"height", profile.video.height}};
     report.insert("memory", memory);
     const auto json = QJsonDocument(report).toJson(QJsonDocument::Indented); QFile file(QDir(directory).filePath("report.json")); if (file.open(QIODevice::WriteOnly)) file.write(json);
     std::fwrite(json.constData(), 1, size_t(json.size()), stdout);

@@ -6,6 +6,7 @@
 #include <QFutureWatcher>
 #include <QHash>
 #include <QThreadPool>
+#include <QTimer>
 #include <QWidget>
 class QAbstractButton;
 class QDoubleSpinBox;
@@ -47,6 +48,10 @@ public:
     void noteHighQualityExport(const QString& original, const ClipEdit& edit);
     void setSharingBusy(bool busy);
     bool exporting() const { return m_exporter.running(); }
+    // The usual level of each track: where a clip starts, and what "Garder ces volumes" replaces.
+    void setDefaultMix(const TrackMix& mix);
+    // The edit of the last export, for the mix to learn from.
+    ClipEdit exportedEdit() const { return m_exportEdit; }
     // For the full-screen viewer: it shows the current result from where the editor is, then hands the position back.
     qint64 position() const { return m_player.snapshot().positionMs; }
     void pausePlayback() { if (m_player.snapshot().playing) m_player.setPlaying(false); }
@@ -60,6 +65,8 @@ signals:
     void renameRequested(const QString& path, const QString& name);
     void openRequested(const QString& path);
     void failed(const QString& title, const QString& detail);
+    // The levels of this clip are to become the usual ones.
+    void mixChosen(const TrackMix& mix);
 protected:
     void resizeEvent(QResizeEvent* event) override;
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -84,7 +91,12 @@ private:
     ClipExporter m_exporter;
     ClipInfo m_info;
     ClipEdit m_edit;
-    ClipEdit m_originalEdit, m_baseline, m_exportEdit;
+    // The file as it is, the same with each track at its usual level, the last export, the one running.
+    ClipEdit m_originalEdit, m_usualEdit, m_baseline, m_exportEdit;
+    TrackMix m_mix;
+    TrackMix chosenMix() const;
+    QSize previewBox() const;
+    QTimer m_previewSize; QElapsedTimer m_refresh; bool m_seenPlaying = false, m_seenLoaded = false;
     QHash<QString, ClipEdit> m_drafts;
     QHash<QString, ClipEdit> m_exports;
     QString m_path, m_game;
@@ -109,6 +121,6 @@ private:
     QWidget* m_inspector; QWidget* m_controls; QDoubleSpinBox* m_start; QDoubleSpinBox* m_end; QLabel* m_kept;
     QList<QVBoxLayout*> m_sections; QLabel* m_originCaption; Button* m_detailsToggle; QWidget* m_facts;
     QList<Tile*> m_ratios; QHBoxLayout* m_ratioRow; QWidget* m_precise; Button* m_preciseToggle; QSpinBox* m_x; QSpinBox* m_y; QSpinBox* m_width; QSpinBox* m_height;
-    Segmented* m_audioMode; QLabel* m_audioSummary; Button* m_restoreTracks; QList<QLabel*> m_details; ElideLabel* m_fileName; Button* m_delete;
+    Segmented* m_audioMode; QLabel* m_audioSummary; Button* m_restoreTracks; Button* m_keepMix; QList<QLabel*> m_details; ElideLabel* m_fileName; Button* m_delete;
 };
 }

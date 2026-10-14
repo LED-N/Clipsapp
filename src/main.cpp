@@ -1,10 +1,13 @@
 #include <QApplication>
 #include <QCommandLineParser>
+#include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
 #include <QFontDatabase>
 #include <QIcon>
 #include <QJsonDocument>
+#include <QLocalServer>
+#include <QLocalSocket>
 #include <QProcess>
 #include <QStandardPaths>
 #include <QTimer>
@@ -38,10 +41,21 @@ int main(int argc, char** argv) {
     // Only a published copy of the application follows the project's releases: it carries the list
     // of its files. A build made from the sources is left as its developer made it.
     const bool published = QFile::exists(QDir(installDirectory).filePath("manifest.txt"));
+    // One copy runs per set of settings. Started again while its window waits in the notification
+    // area, from the Start menu for instance, the application only asks that copy to show itself.
+    const QString instance = QStringLiteral("Clipsapp-") + QString::fromLatin1(QCryptographicHash::hash(configDirectory.toCaseFolded().toUtf8(), QCryptographicHash::Sha1).toHex().left(16));
+    QLocalServer running; running.setSocketOptions(QLocalServer::UserAccessOption);
+    if (!smoke) {
+        QLocalSocket other; other.connectToServer(instance);
+        if (other.waitForConnected(300)) { other.write("show"); other.waitForBytesWritten(300); return 0; }
+        running.listen(instance);
+    }
     int code = 0; bool relaunch = false;
     {
         clipsapp::MainWindow window(configDirectory);
         if (smoke) window.setAttribute(Qt::WA_DontShowOnScreen, true);
+        else window.manageStartMenu(QStandardPaths::writableLocation(QStandardPaths::ApplicationsLocation));
+        QObject::connect(&running, &QLocalServer::newConnection, &window, [&running, &window] { while (auto* asking = running.nextPendingConnection()) asking->deleteLater(); window.surface(); });
         window.show();
         if (!smoke && published) {
             window.followUpdates(QStringLiteral(CLIPSAPP_UPDATE_REPOSITORY));
@@ -67,6 +81,7 @@ int main(int argc, char** argv) {
         code = application.exec(); relaunch = window.relaunchRequested();
     }
     // The window is gone, with its capture and its global shortcut: the new version can take over.
+    running.close();
     if (relaunch) {
         QStringList arguments{QStringLiteral("--updated-from"), QStringLiteral(CLIPSAPP_VERSION)};
         if (parser.isSet("data-dir")) arguments << QStringLiteral("--data-dir") << configDirectory;

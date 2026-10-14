@@ -7,7 +7,7 @@ class Button;
 struct ReplayView {
     enum State { Idle, Starting, Running, Stopping, Error };
     State state = Idle;
-    QString profileSummary, liveSummary, warning, error, hotkey;
+    QString profileSummary, liveSummary, warning, warningTitle, error, hotkey;
     double seconds = 0, capacity = 60;
     qint64 bytes = 0;
     bool saving = false, canStart = true, canSave = false, canFixWarning = false;

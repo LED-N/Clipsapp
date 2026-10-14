@@ -12,6 +12,7 @@
 #include "thumbnail_cache.h"
 #include "update_service.h"
 #include "widgets.h"
+#include "platform/start_menu.h"
 #include <QApplication>
 #include <QClipboard>
 #include <QCloseEvent>
@@ -22,6 +23,7 @@
 #include <QFileInfo>
 #include <QHBoxLayout>
 #include <QJsonObject>
+#include <QMenu>
 #include <QMimeData>
 #include <QPainter>
 #include <QProcess>
@@ -35,6 +37,7 @@
 #include <QVBoxLayout>
 #include <QtConcurrent/QtConcurrentRun>
 #include <algorithm>
+#include <utility>
 
 namespace clipsapp {
 namespace {
@@ -106,7 +109,17 @@ MainWindow::MainWindow(QString configDirectory, QWidget* parent, ClipTrashOperat
     m_updates = new UpdateService(QStringLiteral(CLIPSAPP_VERSION), QCoreApplication::applicationDirPath(), this);
     setWindowTitle(QStringLiteral("Clipsapp[*]")); resize(1220, 820); setMinimumSize(980, 650); setWindowIcon(appIcon());
     m_tray = new QSystemTrayIcon(windowIcon(), this); m_tray->setToolTip("Clipsapp");
-    connect(m_tray, &QSystemTrayIcon::activated, this, [this] { showNormal(); raise(); activateWindow(); });
+    // A click brings the window back; the menu of the right button acts on the replay without it.
+    connect(m_tray, &QSystemTrayIcon::activated, this, [this](QSystemTrayIcon::ActivationReason reason) { if (reason == QSystemTrayIcon::Trigger || reason == QSystemTrayIcon::DoubleClick) surface(); });
+    connect(m_tray, &QSystemTrayIcon::messageClicked, this, [this] { surface(); });
+    auto* trayMenu = new QMenu(this); trayMenu->setObjectName("tray-menu");
+    connect(trayMenu->addAction(QStringLiteral("Ouvrir Clipsapp")), &QAction::triggered, this, [this] { surface(); });
+    trayMenu->addSeparator();
+    m_traySave = trayMenu->addAction(QStringLiteral("Sauvegarder le clip")); connect(m_traySave, &QAction::triggered, this, [this] { saveReplay(); });
+    m_trayToggle = trayMenu->addAction(QString()); connect(m_trayToggle, &QAction::triggered, this, [this] { toggleCapture(); });
+    trayMenu->addSeparator();
+    connect(trayMenu->addAction(QStringLiteral("Quitter Clipsapp")), &QAction::triggered, this, [this] { m_quitting = true; close(); });
+    m_tray->setContextMenu(trayMenu);
 
     auto* root = new QWidget; setCentralWidget(root); auto* vertical = new QVBoxLayout(root); vertical->setContentsMargins(0, 0, 0, 0); vertical->setSpacing(0);
     m_strip = new ReplayStrip; vertical->addWidget(m_strip);
@@ -181,6 +194,7 @@ MainWindow::MainWindow(QString configDirectory, QWidget* parent, ClipTrashOperat
     connect(m_batch, &DiscordBatch::highQualityReady, this, [this](const QString& path, const QString& original, const ClipEdit& edit) {
         const auto game = m_labels.gameFor(original, {}); QString error; if (!game.isEmpty()) m_labels.setGame(path, game, error);
         m_editor->noteHighQualityExport(original, edit); refreshLibrary();
+        if (m_editor->clipPath() == original && !m_editor->clipInfo().mixed) learnMix(editLevels(edit));
     });
     connect(m_batch, &DiscordBatch::finished, this, [this](int, int failed, bool cancelled) {
         refreshSharing(); if (m_shareDialog) return;
@@ -218,6 +232,10 @@ MainWindow::MainWindow(QString configDirectory, QWidget* parent, ClipTrashOperat
         const auto game = m_labels.gameFor(original, {}); QString error;
         if (!game.isEmpty() && !m_labels.setGame(path, game, error)) m_toasts->show(ToastHost::Warn, QStringLiteral("Classement non repris"), error);
         m_fresh.insert(path); refreshLibrary();
+        if (m_editor->clipPath() == original && !m_editor->clipInfo().mixed) learnMix(editLevels(m_editor->exportedEdit()));
+    });
+    connect(m_editor, &ClipEditor::mixChosen, this, [this](const TrackMix& mix) {
+        adoptMix(mix); m_toasts->show(ToastHost::Ok, QStringLiteral("Volumes habituels enregistrés"), QStringLiteral("Les prochains clips s'ouvrent avec ces volumes. Ils se règlent aussi dans Réglages › Audio."));
     });
     connect(m_editor, &ClipEditor::deleteRequested, this, [this](const QString& path, bool confirmed) { deleteClips({path}, confirmed); });
     connect(m_editor, &ClipEditor::renameRequested, this, &MainWindow::renameClip);
@@ -228,6 +246,7 @@ MainWindow::MainWindow(QString configDirectory, QWidget* parent, ClipTrashOperat
     // The welcome page writes its choices straight into the configuration; the settings form follows before it is read again.
     connect(m_onboarding, &OnboardingPage::chooseFolderRequested, this, [this] { m_settings->load(); chooseLibraryFolder(); m_onboarding->refresh(); });
     connect(m_onboarding, &OnboardingPage::finished, this, [this](bool start) {
+        m_config.startMenuShortcut = m_onboarding->startMenuWanted();
         m_firstLaunch = false; m_settings->load(); saveConfig(false); setPage(Library);
         if (start) startCapture();
     });
@@ -270,7 +289,7 @@ MainWindow::MainWindow(QString configDirectory, QWidget* parent, ClipTrashOperat
     });
     auto* find = new QShortcut(QKeySequence::Find, this); connect(find, &QShortcut::activated, this, [this] { if (m_pages->currentWidget() == m_library) m_library->focusSearch(); });
 
-    m_settings->refreshCatalog(); m_settings->load(); m_settings->setSaved(m_saved); m_onboarding->setCatalog(m_settings->catalog());
+    m_settings->refreshCatalog(); m_settings->load(); m_settings->setSaved(m_saved); m_onboarding->setCatalog(m_settings->catalog()); spreadMix();
     setPage(m_firstLaunch ? Onboarding : Library);
     if (!m_loadError.isEmpty()) m_toasts->show(ToastHost::Warn, QStringLiteral("Réglages illisibles"), QStringLiteral("Les réglages par défaut sont affichés. Le fichier d'origine sera conservé à côté du nouveau."));
     if (!labelsError.isEmpty()) m_toasts->show(ToastHost::Warn, QStringLiteral("Classement illisible"), labelsError);
@@ -343,9 +362,10 @@ bool MainWindow::saveConfig(bool announce) {
     }
     QString error;
     if (!m_store.save(m_config, error)) { m_toasts->show(ToastHost::Error, QStringLiteral("Réglages non enregistrés"), error); return false; }
-    const bool changedFolder = m_saved.libraryPath != m_config.libraryPath;
+    const bool changedFolder = m_saved.libraryPath != m_config.libraryPath, changedShortcut = m_saved.startMenuShortcut != m_config.startMenuShortcut;
     m_loadError.clear(); m_saved = m_config; m_settings->setSaved(m_saved); setWindowModified(false);
-    if (!m_config.clipSavedNotification) m_tray->hide();
+    refreshTray(); spreadMix();
+    if (changedShortcut && !m_programs.isEmpty() && !setStartMenuShortcut(m_programs, QCoreApplication::applicationFilePath(), m_saved.startMenuShortcut, error)) m_toasts->show(ToastHost::Warn, QStringLiteral("Menu Démarrer inchangé"), error);
     if (announce) m_toasts->show(ToastHost::Ok, QStringLiteral("Réglages enregistrés"), QStringLiteral("Ils s'appliquent aux prochains clips."));
     if (changedFolder) { refreshLibrary(); refreshSharing(); }
     updateCapture(); return true;
@@ -395,7 +415,7 @@ void MainWindow::startDiscordSharing(QStringList paths, bool edited) {
     if (edited && !m_batch->running()) { if (!m_editor->ready()) return; info = m_editor->clipInfo(); edit = m_editor->currentEdit(); }
     // A running batch is shown rather than replaced: the dialog opens on its progress.
     if (m_batch->running()) paths.clear();
-    const ShareOptions options{QDir(m_config.libraryPath).filePath("Partage Discord"), m_config.discordLimitBytes, m_config.discordCodec, m_config.discordAutoResize};
+    const ShareOptions options{QDir(m_config.libraryPath).filePath("Partage Discord"), m_config.discordLimitBytes, m_config.discordCodec, m_config.discordAutoResize, m_saved.defaultMix};
     auto* dialog = new DiscordDialog(m_batch, m_cache, paths, options, this, info, edit); m_shareDialog = dialog; dialog->setAttribute(Qt::WA_DeleteOnClose);
     connect(dialog, &DiscordDialog::preferencesChosen, this, [this](qint64 bytes, const QString& codec, bool resize) {
         m_config.discordLimitBytes = m_saved.discordLimitBytes = bytes; m_config.discordCodec = m_saved.discordCodec = codec; m_config.discordAutoResize = m_saved.discordAutoResize = resize;
@@ -468,7 +488,7 @@ void MainWindow::viewClips(const QStringList& playlist, int index, bool fromEdit
     if (playlist.isEmpty() || index < 0 || index >= playlist.size() || m_trash->isRunning() || m_rename->isRunning()) return;
     if (!QFileInfo(playlist[index]).isFile()) { m_toasts->show(ToastHost::Warn, QStringLiteral("Clip introuvable"), QStringLiteral("Le fichier a été déplacé ou supprimé.")); refreshLibrary(); return; }
     if (!m_viewer) {
-        m_viewer = new ClipViewer(this); m_viewer->setVolume(m_saved.playbackVolume);
+        m_viewer = new ClipViewer(this); m_viewer->setVolume(m_saved.playbackVolume); m_viewer->setDefaultMix(m_saved.defaultMix);
         connect(m_viewer, &ClipViewer::viewed, this, [this](const QString& path) { if (m_fresh.remove(path)) rebuildLibrary(); });
         // Back from the full screen, the editor is where the viewing stopped.
         connect(m_viewer, &ClipViewer::closed, this, [this](const QString& path, qint64 position) {
@@ -559,14 +579,82 @@ void MainWindow::installUpdate() {
     QString error; if (!m_updates->install(error)) { m_toasts->show(ToastHost::Error, QStringLiteral("Mise à jour non installée"), error); return; }
     m_relaunch = true; m_restartPending = false; m_replay->stop(); close();
 }
+void MainWindow::spreadMix() { m_editor->setDefaultMix(m_saved.defaultMix); if (m_viewer) m_viewer->setDefaultMix(m_saved.defaultMix); }
+void MainWindow::adoptMix(const TrackMix& mix) {
+    // The habit starts again from the new levels: what led to them, and what was refused, is forgotten.
+    m_config.defaultMix = m_saved.defaultMix = mix; m_config.mixHistory = m_saved.mixHistory = {}; m_config.mixDeclined = m_saved.mixDeclined = {}; m_mixAsked.clear();
+    QString error; if (m_loadError.isEmpty() && !m_store.save(m_saved, error)) m_toasts->show(ToastHost::Warn, QStringLiteral("Volumes habituels non enregistrés"), error);
+    m_settings->load(); m_settings->setSaved(m_saved); spreadMix();
+}
+QString MainWindow::mixText(const TrackMix& from, const TrackMix& to) const {
+    QStringList parts;
+    for (auto track = to.cbegin(); track != to.cend(); ++track) {
+        if (std::abs(track.value() - from.value(track.key(), 1)) < 0.01) continue;
+        // Tracks are kept by their folded name: the profile gives back the way it is written.
+        QString name = track.key(); for (const auto& known : m_saved.profiles) for (const auto& candidate : known.tracks) if (mixKey(candidate.name) == track.key()) name = candidate.name;
+        parts.append(QStringLiteral("%1 à %2 %").arg(name).arg(qRound(track.value() * 100)));
+    }
+    return parts.size() > 1 ? parts.mid(0, parts.size() - 1).join(QStringLiteral(", ")) + QStringLiteral(" et ") + parts.last() : parts.join(QString());
+}
+void MainWindow::learnMix(const TrackMix& levels) {
+    if (levels.isEmpty() || !m_loadError.isEmpty()) return;
+    rememberExport(m_saved.mixHistory, levels); m_config.mixHistory = m_saved.mixHistory;
+    QString error; m_store.save(m_saved, error); m_settings->setSaved(m_saved);
+    const auto proposal = suggestedMix(m_saved.mixHistory, m_saved.defaultMix, m_saved.mixDeclined);
+    // Asked once: a question left unanswered is not put again before the habit changes.
+    if (!proposal || (!m_mixAsked.isEmpty() && sameMix(*proposal, m_mixAsked))) return;
+    m_mixAsked = *proposal; const auto mix = *proposal;
+    m_toasts->show(ToastHost::Info, QStringLiteral("En faire vos volumes habituels ?"), QStringLiteral("Vous réglez souvent %1. Les prochains clips s'ouvriraient ainsi ; les enregistrements ne changent pas.").arg(mixText(m_saved.defaultMix, mix)), {
+        {QStringLiteral("Appliquer"), [this, mix] { adoptMix(mix); }},
+        {QStringLiteral("Non merci"), [this, mix] {
+            m_config.mixDeclined = m_saved.mixDeclined = mix; m_config.mixHistory = m_saved.mixHistory = {};
+            QString failure; if (m_loadError.isEmpty()) m_store.save(m_saved, failure); m_settings->setSaved(m_saved);
+        }}}, QStringLiteral("speaker"));
+}
+void MainWindow::manageStartMenu(const QString& programsDirectory) {
+    m_programs = programsDirectory; m_settings->setStartMenu(!m_programs.isEmpty()); m_onboarding->setStartMenu(!m_programs.isEmpty());
+    // A folder that was moved leaves its shortcut pointing nowhere: it is drawn again. One that
+    // leads to another copy of the application is that copy's own, and is left alone.
+    QString error; if (!m_programs.isEmpty() && m_saved.startMenuShortcut && !m_firstLaunch && !startMenuShortcutWorks(m_programs)) setStartMenuShortcut(m_programs, QCoreApplication::applicationFilePath(), true, error);
+}
+void MainWindow::surface() {
+    setWindowState(windowState() & ~Qt::WindowMinimized); show(); raise(); activateWindow();
+}
+void MainWindow::refreshTray() {
+    const auto state = m_replay->state(); const bool running = state == ReplayEngine::State::Running, busy = running || state == ReplayEngine::State::Starting;
+    m_traySave->setEnabled(running && m_replay->stats().seconds > 0 && !m_replay->exporting());
+    m_trayToggle->setText(busy ? QStringLiteral("Arrêter le replay") : QStringLiteral("Démarrer le replay"));
+    m_trayToggle->setEnabled(state != ReplayEngine::State::Stopping && m_pages->currentWidget() != m_onboarding);
+    m_tray->setToolTip(busy ? QStringLiteral("Clipsapp · replay en cours") : QStringLiteral("Clipsapp · replay arrêté"));
+    // The icon is there from the moment the window is on screen, since the window may then hide
+    // behind it. Otherwise it only comes with the notification of a saved clip.
+    if (m_saved.closeToTray && QSystemTrayIcon::isSystemTrayAvailable() && !testAttribute(Qt::WA_DontShowOnScreen)) { if (isVisible()) m_tray->show(); }
+    else if (!m_saved.clipSavedNotification) m_tray->hide();
+}
+void MainWindow::showEvent(QShowEvent* event) { QMainWindow::showEvent(event); refreshTray(); }
 void MainWindow::closeEvent(QCloseEvent* event) {
+    // Closing the window leaves the replay running behind the notification area. Only "Quitter",
+    // in the menu of its icon, or an update being installed, ends the application from there.
+    // The welcome page is not left that way: a first launch that is closed starts again.
+    const bool quitting = std::exchange(m_quitting, false) || m_relaunch;
+    if (!quitting && !m_firstLaunch && m_saved.closeToTray && m_tray->isVisible()) {
+        event->ignore(); if (m_editor->ready()) m_editor->pausePlayback(); hide();
+        if (!m_saved.trayNoticeShown) {
+            m_tray->showMessage(QStringLiteral("Clipsapp reste ouvert"), QStringLiteral("Le replay continue ici, près de l'horloge. Pour fermer l'application : clic droit sur l'icône, puis Quitter."), QSystemTrayIcon::NoIcon, 8000);
+            m_saved.trayNoticeShown = m_config.trayNoticeShown = true; m_settings->setSaved(m_saved);
+            QString error; if (m_loadError.isEmpty()) m_store.save(m_saved, error);
+        }
+        return;
+    }
+    // Asked to quit from its icon, a hidden window comes back only if it has something to say.
+    if (isHidden() && (m_trash->isRunning() || m_rename->isRunning() || m_batch->running() || dirty())) surface();
     if (m_trash->isRunning() || m_rename->isRunning()) { m_toasts->show(ToastHost::Info, QStringLiteral("Un instant"), QStringLiteral("Des fichiers sont en cours de traitement.")); event->ignore(); return; }
     if (m_batch->running() && choose(this, "quit-batch-prompt", QStringLiteral("Un lot de copies Discord est en cours"), QStringLiteral("Quitter l'arrête. Les copies déjà prêtes sont conservées."), {QStringLiteral("Continuer le lot"), QStringLiteral("Quitter quand même")}, -1, 0) != 1) { event->ignore(); return; }
     if (dirty()) {
         const int choice = choose(this, "unsaved-settings-prompt", QStringLiteral("Des réglages ne sont pas enregistrés"), QStringLiteral("Les enregistrer avant de fermer ?"), {QStringLiteral("Annuler"), QStringLiteral("Ne pas enregistrer"), QStringLiteral("Enregistrer")}, 2, 2);
         if (choice <= 0 || (choice == 2 && !saveConfig(false))) { event->ignore(); return; }
     }
-    event->accept();
+    m_tray->hide(); event->accept();
 }
 QJsonObject MainWindow::smokeReport() const {
     const auto& catalog = m_settings->catalog();
@@ -620,11 +708,17 @@ void MainWindow::updateCapture() {
     const auto format = QStringLiteral("%1p %2 FPS").arg(p.video.height).arg(p.video.fps);
     if (state == ReplayEngine::State::Starting) view.liveSummary = QStringLiteral("Préparation de l'encodeur · %1").arg(targetName(p.video));
     else { const auto game = m_replay->clipGameName(); QStringList parts; if (!game.isEmpty()) parts << (p.gameName.trimmed().isEmpty() && p.detectGame && game != p.name ? game + QStringLiteral(" détecté") : game); parts << format; if (!stats.encoder.isEmpty()) parts << stats.encoder; view.liveSummary = parts.join(QStringLiteral(" · ")); }
-    view.warning = stats.warning; view.canFixWarning = p.video.targetId.startsWith(QLatin1String("window:")); view.error = m_replayError.isEmpty() ? QStringLiteral("La capture s'est interrompue. Les clips déjà sauvegardés ne sont pas touchés.") : m_replayError;
+    view.warning = stats.warning; view.warningTitle = QStringLiteral("bordure Windows visible"); view.canFixWarning = p.video.targetId.startsWith(QLatin1String("window:"));
+    // Images given up come before the border: a clip that stutters is the worse of the two.
+    if (stats.lost > 0.02) {
+        view.warningTitle = QStringLiteral("images perdues"); view.canFixWarning = false;
+        view.warning = QStringLiteral("L'encodeur ne suit pas à %1 FPS : %2 % des images sont perdues. Baissez la fréquence, la résolution ou l'effort d'encodage.").arg(p.video.fps).arg(qRound(stats.lost * 100));
+    }
+    view.error = m_replayError.isEmpty() ? QStringLiteral("La capture s'est interrompue. Les clips déjà sauvegardés ne sont pas touchés.") : m_replayError;
     const bool onboarding = m_pages->currentWidget() == m_onboarding;
     view.canStart = ReplayEngine::supported() && !m_replay->exporting() && !onboarding; view.canSave = state == ReplayEngine::State::Running && stats.seconds > 0;
     view.blockedReason = !ReplayEngine::supported() ? QStringLiteral("La capture Linux arrivera avec PipeWire et le portail KDE.") : onboarding ? QStringLiteral("Terminez la configuration pour démarrer") : QString();
-    m_strip->apply(view);
+    m_strip->apply(view); refreshTray();
     m_library->setReplayHint(QKeySequence::fromString(p.replay.hotkey, QKeySequence::PortableText), p.replay.durationSeconds, view.canStart, busy);
 }
 bool MainWindow::smokeCheck(QString& error) {

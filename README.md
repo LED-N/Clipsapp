@@ -16,12 +16,14 @@ Il existe pour une raison simple : faire ces deux choses dans une seule applicat
 2. Lancez `Clipsapp.exe`, dans ce dossier.
 3. Au premier lancement, Windows peut afficher « Windows a protégé votre ordinateur » : cliquez sur **Informations complémentaires**, puis **Exécuter quand même**.
 
-Clipsapp pose ensuite quatre questions (dossier des clips, écran ou fenêtre, sons, raccourci), et le replay peut tourner.
+Clipsapp pose ensuite quatre questions (dossier des clips, écran ou fenêtre, sons, raccourci) et propose de s'ajouter au menu Démarrer ; le replay peut alors tourner.
 
 ## Ce que fait Clipsapp
 
-- **Replay** : de 15 secondes à 10 minutes gardées en mémoire, enregistrées d'un raccourci, **Ctrl + Alt + F10** par défaut. Jusqu'en 4K à 60 images par seconde.
-- **Son en pistes séparées** : micro, jeu et Discord, pour régler ou couper chacun après coup.
+- **Replay** : de 15 secondes à 10 minutes gardées en mémoire, enregistrées d'un raccourci, **Ctrl + Alt + F10** par défaut. Jusqu'en 4K, à 30, 60, 120 ou 144 images par seconde.
+- **Qualité au choix** : quatre préréglages, de « Légère » à « Maximale », ou des réglages avancés (débit cible ou qualité constante jusqu'au quasi sans perte), chacun expliqué par une infobulle.
+- **Son en pistes séparées** : micro, jeu et Discord, pour régler ou couper chacun après coup. Chaque piste a son volume habituel, que Clipsapp apprend de vos exports.
+- **Discret** : fermer la fenêtre laisse Clipsapp et son replay dans la zone de notification, près de l'horloge.
 - **Bibliothèque** : clips rangés par jeu et par jour, favoris, recherche, renommage.
 - **Lecture en plein écran**, pour regarder un clip ou le montrer sans l'envoyer.
 - **Éditeur** : découpe, recadrage, volume de chaque piste, export. L'original est conservé.
@@ -30,7 +32,8 @@ Clipsapp pose ensuite quatre questions (dossier des clips, écran ou fenêtre, s
 ## À savoir
 
 - **Système** : Windows 11, 64 bits. Clipsapp est développé et essayé avec une carte graphique NVIDIA ; il n'a pas encore été essayé avec une carte AMD.
-- **Rien d'autre à installer** : tout ce dont Clipsapp a besoin est dans son dossier. Pour le désinstaller, supprimez ce dossier.
+- **Rien d'autre à installer** : tout ce dont Clipsapp a besoin est dans son dossier. Pour le désinstaller, retirez-le du menu Démarrer dans **Réglages → Fichiers et alertes** si vous l'y aviez ajouté, quittez-le, puis supprimez ce dossier.
+- **Quitter** : la croix de la fenêtre range Clipsapp dans la zone de notification. Pour le fermer vraiment, clic droit sur son icône, puis **Quitter**. Ce comportement se désactive dans **Réglages → Fichiers et alertes**.
 - **Mises à jour** : Clipsapp signale une nouvelle version à son lancement et l'installe en deux clics, sans toucher aux clips ni aux réglages. Cela se désactive dans **Réglages → Fichiers et alertes**.
 - **Vie privée** : vos clips et vos réglages ne quittent pas votre PC. La seule connexion de Clipsapp est cette recherche de mises à jour auprès de GitHub, qui ne contient que son numéro de version.
 - **Application non signée** : c'est la raison de l'avertissement de Windows au premier lancement.

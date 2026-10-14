@@ -76,6 +76,8 @@ OnboardingPage::OnboardingPage(AppConfig& config, QWidget* parent) : QWidget(par
         if (keys.isEmpty()) return;
         profile().replay.hotkey = keys.toString(QKeySequence::PortableText); m_hotkey->hide(); m_caps->show(); refresh();
     });
+    // The application has no installer: this is where it offers to appear in the Start menu.
+    m_startMenu = new Toggle(QStringLiteral("Ajouter Clipsapp au menu Démarrer, pour le retrouver rapidement")); m_startMenu->setObjectName("onboarding-start-menu"); m_startMenu->setChecked(true); m_startMenu->hide(); layout->addWidget(m_startMenu);
     layout->addSpacing(8);
     auto* bottom = new QHBoxLayout; auto* skip = new Button(QStringLiteral("Passer, je réglerai plus tard"), Button::Ghost); skip->setObjectName("onboarding-skip"); bottom->addWidget(skip); bottom->addStretch();
     m_start = new Button(QStringLiteral("rec"), QStringLiteral("Démarrer le replay"), Button::Primary, Button::Large); m_start->setObjectName("onboarding-start"); bottom->addWidget(m_start); layout->addLayout(bottom); layout->addStretch();
@@ -83,6 +85,8 @@ OnboardingPage::OnboardingPage(AppConfig& config, QWidget* parent) : QWidget(par
     refresh();
 }
 RecordingProfile& OnboardingPage::profile() { if (auto* active = m_config.activeProfile()) return *active; return m_config.profiles.first(); }
+void OnboardingPage::setStartMenu(bool managed) { m_startMenu->setVisible(managed); }
+bool OnboardingPage::startMenuWanted() const { return !m_startMenu->isHidden() && m_startMenu->isChecked(); }
 void OnboardingPage::go(int step) { m_step = std::clamp(step, 0, 4); refresh(); }
 void OnboardingPage::setCatalog(const SourceCatalog& catalog) {
     m_catalog = catalog;

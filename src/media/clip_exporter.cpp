@@ -142,7 +142,8 @@ QStringList ClipExporter::arguments(const QString& encoder) const {
         args << "-c:a" << "aac" << "-b:a" << QString::number(m_audioBitrate) << "-ar" << "48000";
         for (int i = 0; i < active.size(); ++i) args << QString("-metadata:s:a:%1").arg(i) << "handler_name=" + names[i];
     } else args << "-an";
-    args << "-map_metadata" << "-1" << "-progress" << "pipe:1" << "-nostats";
+    // The file says its sound was mixed here: opened again, it is not given the usual levels a second time.
+    args << "-map_metadata" << "-1" << "-metadata" << QStringLiteral("comment=") + QString::fromUtf8(mixedMark) << "-progress" << "pipe:1" << "-nostats";
     if (m_pass == 1) args << "-f" << "null" << "-";
     else args << "-movflags" << "+faststart" << "-f" << "mp4" << m_temporary->fileName();
     return args;

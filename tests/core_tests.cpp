@@ -3,6 +3,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QTemporaryDir>
 #include "core/config_store.h"
@@ -11,6 +12,8 @@
 #include "core/audio_routing.h"
 #include "core/game_identity.h"
 #include "core/update.h"
+#include "media/clip_edit.h"
+#include "platform/start_menu.h"
 
 using namespace clipsapp;
 class CoreTests final : public QObject {
@@ -132,6 +135,20 @@ private slots:
         QVERIFY(snapshot.packets.first().stream == 0); QVERIFY(snapshot.packets.first().keyframe);
         qint64 previous = -1; for (const auto& packet : snapshot.packets) { QVERIFY(packet.dtsUs >= snapshot.startUs); QVERIFY(packet.dtsUs >= previous); previous = packet.dtsUs; }
     }
+    void reorderedPicturesStartOnScreenTimeAndNeverEndOnAHole() {
+        // Two B-frames between references, as an encoder hands them out: decoded two pictures late.
+        ReplayBuffer buffer(60000000, 1048576); const qint64 frame = 10000;
+        const auto push = [&](int shown, int decoded, bool key = false) { buffer.push({0, shown * frame, (decoded - 2) * frame, frame, key, QByteArray(20, 'v')}); };
+        for (int index = 0; index < 8; ++index) buffer.push({1, index * frame, index * frame, frame, true, QByteArray(10, 'a')});
+        push(0, 0, true); push(3, 1); push(1, 2); push(2, 3);
+        // Nothing says yet that the pictures decoded after the first are all there: the clip stops on it.
+        auto snapshot = buffer.snapshot(); QCOMPARE(snapshot.startUs, qint64(0)); QCOMPARE(snapshot.endUs, frame);
+        push(6, 4); snapshot = buffer.snapshot(); QCOMPARE(snapshot.endUs, 4 * frame);
+        push(4, 5); QCOMPARE(buffer.snapshot().endUs, 4 * frame);
+        push(5, 6); push(9, 7); snapshot = buffer.snapshot(); QCOMPARE(snapshot.startUs, qint64(0)); QCOMPARE(snapshot.endUs, 7 * frame);
+        int pictures = 0, sounds = 0; for (const auto& packet : snapshot.packets) { QVERIFY(packet.ptsUs >= 0 && packet.ptsUs < snapshot.endUs); packet.stream == 0 ? ++pictures : ++sounds; }
+        QCOMPARE(pictures, 7); QCOMPARE(sounds, 7); QVERIFY(snapshot.packets.first().stream == 0 && snapshot.packets.first().keyframe);
+    }
     void memoryLimitDropsWholeGroupsOfPictures() {
         EncodedPacket packet{0, 0, 0, 1000000, true, QByteArray(256, 'v')};
         ReplayBuffer buffer(60000000, packet.storageBytes() * 3);
@@ -175,7 +192,8 @@ private slots:
     void invalidSavePreservesExistingConfiguration() {
         QTemporaryDir directory; ConfigStore store(directory.path()); auto config = AppConfig::defaults(); QString error;
         QVERIFY(store.save(config, error)); QFile file(store.filePath()); QVERIFY(file.open(QIODevice::ReadOnly)); const auto original = file.readAll(); file.close();
-        config.profiles.first().video.fps = 144; QVERIFY(!store.save(config, error)); QVERIFY(!error.isEmpty());
+        for (const int rate : {30, 60, 120, 144}) { auto fast = config; fast.profiles.first().video.fps = rate; QVERIFY(fast.validationErrors().isEmpty()); }
+        config.profiles.first().video.fps = 50; QVERIFY(!store.save(config, error)); QVERIFY(!error.isEmpty());
         QVERIFY(file.open(QIODevice::ReadOnly)); QCOMPARE(file.readAll(), original);
     }
     void corruptionIsReportedWithoutOverwriting() {
@@ -200,6 +218,76 @@ private slots:
         QVERIFY(estimatedBufferMiB(profile) > oneTrack);
         const auto expected = (25000000.0 + 192000.0) * 60 / 8 / 1048576;
         QVERIFY(qAbs(oneTrack - expected) < 0.001);
+    }
+    void recordingQualityRoundTripsAndOlderFilesKeepATargetBitrate() {
+        auto config = AppConfig::defaults(); auto& video = config.profiles.first().video;
+        video.rateControl = "quality"; video.quality = 14; video.effort = "thorough"; video.bitrateMbps = 200;
+        AppConfig loaded; QString error; QVERIFY2(AppConfig::fromJson(config.toJson(), loaded, error), qPrintable(error));
+        QCOMPARE(loaded.profiles.first().video.rateControl, QString("quality")); QCOMPARE(loaded.profiles.first().video.quality, 14); QCOMPARE(loaded.profiles.first().video.effort, QString("thorough"));
+        // A file written before these settings existed records as it always did.
+        auto older = config.toJson(); auto profiles = older.value("profiles").toArray(); auto profile = profiles.first().toObject(); auto stored = profile.value("video").toObject();
+        for (const auto& key : {"rateControl", "quality", "effort"}) stored.remove(QLatin1String(key));
+        profile.insert("video", stored); profiles.replace(0, profile); older.insert("profiles", profiles);
+        QVERIFY2(AppConfig::fromJson(older, loaded, error), qPrintable(error)); QCOMPARE(loaded.profiles.first().video.rateControl, QString("bitrate")); QCOMPARE(loaded.profiles.first().video.effort, QString("fast"));
+        for (const auto& broken : {QStringLiteral("rateControl"), QStringLiteral("effort")}) { auto invalid = config; (broken == "effort" ? invalid.profiles.first().video.effort : invalid.profiles.first().video.rateControl) = "unknown"; QVERIFY(!invalid.validationErrors().isEmpty()); }
+        video.quality = 5; QVERIFY(!config.validationErrors().isEmpty()); video.quality = 14; video.bitrateMbps = 301; QVERIFY(!config.validationErrors().isEmpty());
+    }
+    void constantQualityIsEstimatedAsARangeThatFollowsItsLevelUnderItsCeiling() {
+        auto profile = AppConfig::defaults().profiles.first(); for (auto& source : profile.sources) source.enabled = false;
+        // A target bitrate weighs what it says.
+        auto usual = usualBufferMiB(profile); QCOMPARE(usual.low, usual.high); QCOMPARE(usual.high, estimatedBufferMiB(profile));
+        auto& video = profile.video; video.width = 2560; video.height = 1440; video.fps = 60; video.rateControl = "quality"; video.quality = 20; video.bitrateMbps = 300;
+        usual = usualBufferMiB(profile); QVERIFY(qAbs(usual.low - 56e6 * 60 / 8 / 1048576) < 0.5); QVERIFY(qAbs(usual.high - 91e6 * 60 / 8 / 1048576) < 0.5); QVERIFY(usual.high < estimatedBufferMiB(profile));
+        // A better level weighs more, a smaller picture less, and nothing goes over the ceiling.
+        video.quality = 14; const auto better = usualBufferMiB(profile); QVERIFY(better.low > usual.low * 2 && better.high > usual.high * 2);
+        video.width = 1920; video.height = 1080; QVERIFY(usualBufferMiB(profile).high < better.high);
+        video.bitrateMbps = 50; const auto capped = usualBufferMiB(profile); QCOMPARE(capped.low, estimatedBufferMiB(profile)); QCOMPARE(capped.high, capped.low);
+    }
+    void usualMixIsProposedOnlyWhenTheLastExportsAgree() {
+        const auto micro = mixKey("Micro"), discord = mixKey(" DISCORD "), game = mixKey("Jeu"); QCOMPARE(discord, QString("discord"));
+        const auto levels = [&](double m, double d, double g) { return TrackMix{{micro, m}, {discord, d}, {game, g}}; };
+        QList<TrackMix> history; rememberExport(history, levels(0.7, 1.3, 1)); rememberExport(history, levels(0.72, 1.25, 1));
+        // Two exports are not a habit yet.
+        QVERIFY(!suggestedMix(history, {}, {}));
+        rememberExport(history, levels(0.65, 1.3, 1));
+        // The median, to the nearest five percent; a track left at its usual level stays out of it.
+        auto proposal = suggestedMix(history, {}, {}); QVERIFY(proposal); QCOMPARE(*proposal, (TrackMix{{micro, 0.7}, {discord, 1.3}}));
+        // Refused, it is not proposed again; a habit that moved on is.
+        QVERIFY(!suggestedMix(history, {}, *proposal)); QVERIFY(suggestedMix(history, {}, TrackMix{{micro, 0.4}, {discord, 1.3}}));
+        // Once it is the usual mix, exports that keep it ask nothing.
+        QList<TrackMix> kept; for (int count = 0; count < 3; ++count) rememberExport(kept, *proposal); QVERIFY(!suggestedMix(kept, *proposal, {}));
+        // Levels that go both ways, or far from one another, are choices made for each clip.
+        QList<TrackMix> mixed{levels(0.7, 1, 1), levels(1.3, 1, 1), levels(0.7, 1, 1)}; QVERIFY(!suggestedMix(mixed, {}, {}));
+        QList<TrackMix> apart{levels(0.9, 1, 1), levels(0.3, 1, 1), levels(0.6, 1, 1)}; QVERIFY(!suggestedMix(apart, {}, {}));
+        // Only the last three count, and only a few are kept.
+        for (int count = 0; count < 10; ++count) rememberExport(history, levels(1, 1, 0.8)); QCOMPARE(history.size(), 6);
+        proposal = suggestedMix(history, {}, {}); QVERIFY(proposal); QCOMPARE(*proposal, (TrackMix{{game, 0.8}}));
+        QCOMPARE(mixLevel(*proposal, "JEU"), 0.8); QCOMPARE(mixLevel(*proposal, "Micro"), 1.0); QVERIFY(sameMix(TrackMix{{micro, 1}}, {})); QVERIFY(!sameMix(TrackMix{{micro, 0.9}}, {}));
+    }
+    void usualMixRoundTripsAndOnlyReachesClipsThatWereNotMixedYet() {
+        auto config = AppConfig::defaults(); config.defaultMix = {{mixKey("Micro"), 0.7}, {mixKey("Discord"), 1.3}}; config.mixDeclined = {{mixKey("Jeu"), 0.8}}; rememberExport(config.mixHistory, config.defaultMix);
+        AppConfig loaded; QString error; QVERIFY2(AppConfig::fromJson(config.toJson(), loaded, error), qPrintable(error));
+        QCOMPARE(loaded.defaultMix, config.defaultMix); QCOMPARE(loaded.mixDeclined, config.mixDeclined); QCOMPARE(loaded.mixHistory, config.mixHistory);
+        // A level the editor could not show is dropped rather than refused with the whole file.
+        auto json = config.toJson(); auto mix = json.value("mix").toObject(); mix.insert("levels", QJsonObject{{"Micro", 5}, {"Jeu", 0.5}}); json.insert("mix", mix);
+        QVERIFY(AppConfig::fromJson(json, loaded, error)); QCOMPARE(loaded.defaultMix, (TrackMix{{mixKey("Jeu"), 0.5}}));
+        ClipInfo info; info.size = {320, 192}; info.durationMs = 1000; info.audio = {{1, "Micro", "aac"}, {2, "Jeu", "aac"}, {3, "DISCORD", "aac"}};
+        auto edit = defaultEdit(info, config.defaultMix); QCOMPARE(edit.tracks[0].volume, 0.7); QCOMPARE(edit.tracks[1].volume, 1.0); QCOMPARE(edit.tracks[2].volume, 1.3);
+        edit.tracks[1].muted = true; QCOMPARE(editLevels(edit), config.defaultMix);
+        info.mixed = true; for (const auto& track : defaultEdit(info, config.defaultMix).tracks) QCOMPARE(track.volume, 1.0);
+    }
+    void startMenuShortcutIsAddedRepairedAndRemovedWithoutTouchingItsNeighbours() {
+        QTemporaryDir directory; const auto programs = directory.filePath("Programmes"), executable = QCoreApplication::applicationFilePath(); QString error;
+        QVERIFY(!startMenuShortcutWorks(programs));
+        QVERIFY2(setStartMenuShortcut(programs, executable, true, error), qPrintable(error)); QVERIFY(startMenuShortcutWorks(programs));
+        QCOMPARE(QFileInfo(QFileInfo(startMenuShortcut(programs)).symLinkTarget()), QFileInfo(executable));
+        QFile neighbour(QDir(programs).filePath("Autre programme.txt")); QVERIFY(neighbour.open(QIODevice::WriteOnly)); neighbour.close();
+        // The folder of the application was moved: the shortcut leads nowhere until it is drawn again.
+        const auto moved = directory.filePath("Clipsapp.exe"); { QFile file(moved); QVERIFY(file.open(QIODevice::WriteOnly)); }
+        QVERIFY(setStartMenuShortcut(programs, moved, true, error)); QVERIFY(startMenuShortcutWorks(programs)); QVERIFY(QFile::remove(moved)); QVERIFY(!startMenuShortcutWorks(programs));
+        QVERIFY(setStartMenuShortcut(programs, executable, true, error)); QVERIFY(startMenuShortcutWorks(programs));
+        QVERIFY(setStartMenuShortcut(programs, executable, false, error)); QVERIFY(!QFileInfo(startMenuShortcut(programs)).isSymLink()); QVERIFY(!startMenuShortcutWorks(programs));
+        QVERIFY(setStartMenuShortcut(programs, executable, false, error)); QVERIFY(neighbour.exists());
     }
     void libraryUsesGameFoldersAndFiltersExtensions() {
         QTemporaryDir directory; QDir root(directory.path()); QVERIFY(root.mkpath("Mon jeu"));

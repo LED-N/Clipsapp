@@ -1,5 +1,7 @@
 #pragma once
 #include "clip_edit.h"
+#include "gpu_video.h"
+#include <functional>
 #include <QImage>
 #include <QMutex>
 #include <QObject>
@@ -17,6 +19,8 @@ struct PlayerSnapshot {
     QImage image;
     qint64 positionMs = 0;
     bool loaded = false, loading = false, playing = false;
+    // The images go straight from the graphics card to a window: there is none in memory to draw.
+    bool direct = false;
     QString error, warning;
 };
 class ClipPlayer final : public QObject {
@@ -26,7 +30,11 @@ public:
     ~ClipPlayer() override;
     // Presentation: images come out as the edited result (cropped) fitted to this box, pixel for
     // pixel, instead of the light 720p editing preview. Chosen before load(); the box may then change while the clip is shown.
-    void setPresentation(QSize box);
+    // The editor asks for the whole image, on which it draws the crop itself.
+    void setPresentation(QSize box, bool whole = false);
+    // Chosen before load(): each image that is due is handed over as the card decoded it, from the
+    // thread of the player. A clip the card cannot decode still comes out as images in memory.
+    void setFrameSink(std::function<void(const GpuFrame&)> sink);
     void load(const QString& path);
     void close();
     void setPlaying(bool playing);
@@ -49,7 +57,8 @@ private:
     std::atomic<float> m_volume{1.f};
     PlayerSnapshot m_snapshot;
     ClipEdit m_edit;
-    QSize m_presentation;
+    QSize m_presentation; bool m_whole = false;
+    std::function<void(const GpuFrame&)> m_sink;
     qint64 m_requestedMs = 0;
     quint64 m_seekSerial = 1, m_revision = 0;
     bool m_playing = false, m_audioEnabled;

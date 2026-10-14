@@ -1,4 +1,5 @@
 #include "clip_viewer.h"
+#include "video_surface.h"
 #include "layout_keys.h"
 #include "widgets.h"
 #include <QApplication>
@@ -106,7 +107,7 @@ ClipViewer::~ClipViewer() { disconnect(&m_player, nullptr, this, nullptr); keepA
 void ClipViewer::open(const QStringList& playlist, int index, std::optional<ClipEdit> edit, qint64 startMs) {
     if (playlist.isEmpty()) return;
     m_playlist = playlist; m_edit = std::move(edit); m_start = startMs; m_open = true;
-    if (testAttribute(Qt::WA_DontShowOnScreen)) show();
+    if (testAttribute(Qt::WA_DontShowOnScreen) || property("windowed").toBool()) show();
     else {
         // The screen the application is on, whole: no frame, no title bar.
         auto* screen = m_owner ? m_owner->screen() : QGuiApplication::primaryScreen();
@@ -114,6 +115,8 @@ void ClipViewer::open(const QStringList& playlist, int index, std::optional<Clip
         showFullScreen();
     }
     raise(); activateWindow(); setFocus(); qApp->installEventFilter(this);
+    // The image goes straight from the card to the screen where that is possible; the bars stay above it.
+    if (!m_surface && VideoSurface::usable(this)) { m_surface = new VideoSurface(this); m_surface->setGeometry(rect()); m_surface->lower(); m_surface->hide(); for (auto* bar : {m_top, m_bottom}) VideoSurface::raiseAbove(bar); }
     load(std::clamp(index, 0, int(playlist.size()) - 1));
 }
 void ClipViewer::load(int index) {
@@ -122,6 +125,8 @@ void ClipViewer::load(int index) {
     m_count->setText(QStringLiteral("%1 sur %2").arg(index + 1).arg(m_playlist.size())); m_count->setVisible(m_playlist.size() > 1);
     m_previous->setVisible(m_playlist.size() > 1); m_next->setVisible(m_playlist.size() > 1); m_previous->setEnabled(index > 0); m_next->setEnabled(index + 1 < m_playlist.size());
     { QSignalBlocker blocker(m_seek); m_seek->setRange(0, 0); } m_time->setText(clock(0)); m_total->setText(clock(0));
+    m_direct = false; if (m_surface) { m_surface->hide(); m_surface->clear(); }
+    auto* surface = VideoSurface::usable(this) ? m_surface : nullptr; m_player.setFrameSink(surface ? [surface](const GpuFrame& frame) { surface->present(frame); } : std::function<void(const GpuFrame&)>());
     m_player.setPresentation(deviceSize()); m_player.load(path);
     update(); wake();
 }
@@ -130,7 +135,7 @@ void ClipViewer::jump(int index) { if (index < 0 || index >= m_playlist.size() |
 void ClipViewer::finish() {
     if (!m_open) return;
     m_open = false; const auto path = currentPath(); const auto position = m_player.snapshot().positionMs;
-    qApp->removeEventFilter(this); m_hide.stop(); keepAwake(false); m_player.close(); m_image = {}; m_index = -1; hide(); setCursor(Qt::ArrowCursor);
+    qApp->removeEventFilter(this); m_hide.stop(); keepAwake(false); m_player.close(); m_image = {}; m_index = -1; m_direct = false; if (m_surface) { m_surface->hide(); m_surface->clear(); } hide(); setCursor(Qt::ArrowCursor);
     emit closed(path, position);
 }
 void ClipViewer::updatePlayer() {
@@ -138,12 +143,14 @@ void ClipViewer::updatePlayer() {
     const auto state = m_player.snapshot();
     if (!state.error.isEmpty()) { if (m_message != state.error) { m_message = state.error; m_image = {}; update(); setControlsVisible(true); } return; }
     if (state.loaded && !m_ready) {
-        m_ready = true; m_current = m_edit && validateEdit(state.info, *m_edit).isEmpty() ? *m_edit : defaultEdit(state.info);
+        m_ready = true; m_frame = state.info.size; m_current = m_edit && validateEdit(state.info, *m_edit).isEmpty() ? *m_edit : defaultEdit(state.info, m_mix);
         m_player.setEdit(m_current); if (m_start > m_current.startMs) m_player.seek(m_start);
         { QSignalBlocker blocker(m_seek); m_seek->setRange(0, int(std::max<qint64>(1, m_current.endMs - m_current.startMs))); }
         m_total->setText(clock(m_current.endMs - m_current.startMs)); m_player.setPlaying(true); emit viewed(currentPath()); return;
     }
     if (!state.image.isNull() && state.image.cacheKey() != m_imageKey) { m_image = state.image; m_imageKey = state.image.cacheKey(); update(); }
+    if (m_surface && state.direct && m_surface->lost()) { VideoSurface::giveUp(); m_surface->hide(); m_direct = false; const int index = m_index; QMetaObject::invokeMethod(this, [this, index] { if (m_open && index == m_index) load(index); }, Qt::QueuedConnection); return; }
+    if (m_surface && state.direct != m_direct) { m_direct = state.direct; if (m_direct) placeSurface(); m_surface->setVisible(m_direct); for (auto* bar : {m_top, m_bottom}) bar->raise(); update(); }
     if (!m_ready) return;
     keepAwake(state.playing);
     const int position = int(std::clamp<qint64>(state.positionMs - m_current.startMs, 0, m_seek->maximum()));
@@ -164,20 +171,30 @@ void ClipViewer::wake() { setControlsVisible(true); m_hide.start(); }
 void ClipViewer::setControlsVisible(bool visible) {
     if (m_top->isVisible() == visible && m_bottom->isVisible() == visible) return;
     m_top->setVisible(visible); m_bottom->setVisible(visible); setCursor(visible ? Qt::ArrowCursor : Qt::BlankCursor);
+    if (m_surface) m_surface->setCursor(cursor());
 }
 void ClipViewer::step(int frames) {
     const auto state = m_player.snapshot(); if (!m_ready || !state.loaded) return;
     if (state.playing) m_player.setPlaying(false);
     m_player.seek(qRound64(state.positionMs + frames * 1000.0 / std::max(1.0, state.info.fps)));
 }
+// The card shows the result of the edit, the crop alone, as large as the screen allows.
+void ClipViewer::placeSurface() {
+    if (!m_surface || m_frame.isEmpty()) return;
+    m_surface->setGeometry(rect());
+    const QRect whole(QPoint(), m_frame), source = m_current.crop.isValid() && !m_current.crop.intersected(whole).isEmpty() ? m_current.crop.intersected(whole) : whole;
+    const auto device = deviceSize(); const auto shown = source.size().scaled(device, Qt::KeepAspectRatio);
+    m_surface->setView(source, QRect(QPoint((device.width() - shown.width()) / 2, (device.height() - shown.height()) / 2), shown), Qt::black);
+}
 QSize ClipViewer::deviceSize() const { const auto ratio = devicePixelRatioF(); return {qRound(width() * ratio), qRound(height() * ratio)}; }
 void ClipViewer::resizeEvent(QResizeEvent*) {
     m_top->setGeometry(0, 0, width(), 56); m_bottom->setGeometry(0, height() - 64, width(), 64);
     if (m_open && m_index >= 0) m_player.setPresentation(deviceSize());
+    placeSurface();
 }
 // Moved to a screen with another scale: the images are made again for its pixels.
 bool ClipViewer::event(QEvent* event) {
-    if (event->type() == QEvent::DevicePixelRatioChange && m_open && m_index >= 0) { m_player.setPresentation(deviceSize()); update(); }
+    if (event->type() == QEvent::DevicePixelRatioChange && m_open && m_index >= 0) { m_player.setPresentation(deviceSize()); placeSurface(); update(); }
     return QWidget::event(event);
 }
 void ClipViewer::paintEvent(QPaintEvent*) {
@@ -211,8 +228,8 @@ void ClipViewer::keyPressEvent(QKeyEvent* event) {
     }
 }
 // A click on the picture plays or pauses; on the bars it belongs to their controls.
-void ClipViewer::mousePressEvent(QMouseEvent* event) { wake(); if (event->button() == Qt::LeftButton && m_ready && !childAt(event->position().toPoint())) m_player.setPlaying(!m_player.snapshot().playing); }
-void ClipViewer::mouseDoubleClickEvent(QMouseEvent* event) { if (event->button() == Qt::LeftButton && !childAt(event->position().toPoint())) finish(); }
+void ClipViewer::mousePressEvent(QMouseEvent* event) { wake(); if (const auto* under = childAt(event->position().toPoint()); event->button() == Qt::LeftButton && m_ready && (!under || under == m_surface)) m_player.setPlaying(!m_player.snapshot().playing); }
+void ClipViewer::mouseDoubleClickEvent(QMouseEvent* event) { if (const auto* under = childAt(event->position().toPoint()); event->button() == Qt::LeftButton && (!under || under == m_surface)) finish(); }
 // The wheel sets the volume wherever the pointer is: up for louder, down for quieter, five points a notch.
 void ClipViewer::wheelEvent(QWheelEvent* event) {
     m_wheel += event->angleDelta().y(); const int notches = m_wheel / 120; m_wheel -= notches * 120; event->accept(); wake();

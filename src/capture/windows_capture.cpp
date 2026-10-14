@@ -1,5 +1,6 @@
 #include "replay_engine.h"
 #include "core/replay_buffer.h"
+#include "platform/fine_wait.h"
 #include "platform/windows_audio.h"
 #include "platform/windows_video.h"
 #include <QFile>
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <stdexcept>
 #include <thread>
 extern "C" {
@@ -108,7 +110,7 @@ public:
     WindowsCapture(RecordingProfile profile, bool synthetic = false)
         : m_profile(std::move(profile)), m_synthetic(synthetic), m_buffer(qint64(m_profile.replay.durationSeconds) * 1000000, qint64(m_profile.replay.memoryLimitMiB) * 1048576) {}
     CaptureStats stats() const override {
-        QMutexLocker lock(&m_mutex); return {m_buffer.seconds(), m_buffer.bytes(), m_frames, m_encoder, m_warning};
+        QMutexLocker lock(&m_mutex); return {m_buffer.seconds(), m_buffer.bytes(), m_frames, m_encoder, m_warning, m_lost};
     }
     ExportTask prepareSave(const QString& path) const override {
         ReplaySnapshot snapshot; QList<Stream> streams;
@@ -119,7 +121,7 @@ public:
         const auto cleanup = qScopeGuard([this] {
             QMutexLocker lock(&m_mutex);
             m_buffer.clear(); m_streams.clear(); m_frames = 0;
-            m_encoder.clear(); m_warning.clear();
+            m_encoder.clear(); m_warning.clear(); m_lost = 0;
         });
         try {
             const auto& video = m_profile.video;
@@ -162,9 +164,15 @@ public:
             if (nativeVideo) for (int i = 0; i < 3; ++i) { av_frame_unref(frame.p); nativeVideo->read(frame.p); }
             const qint64 epoch = windowsClock100ns();
             const qint64 audioOffset = (epoch - audioEpoch) * 48000 / 10000000;
+            // An image taken late is still stamped on time: the wait must not add its own jitter.
+            const FineWait pause(true);
+            // Never more than a millisecond at a time, so that stopping is immediate.
+            const auto waitUntil = [&](qint64 deadline) { for (qint64 left; !stop && (left = deadline - (windowsClock100ns() - epoch)) > 0;) pause.waitTicks(std::min<qint64>(left, 10000)); };
             ready(m_encoder);
             qint64 audioPosition = 0;
             qint64 videoPosition = 0;
+            // Images encoded and images given up, second by second, over the last five.
+            std::deque<std::pair<int, int>> seconds{{0, 0}}; qint64 second = 0;
             auto encodeAudioUntil = [&](qint64 elapsed100ns) {
                 // Leave 120 ms for input callbacks and driver buffering; missing input is silence.
                 const qint64 available = std::max<qint64>(0, (elapsed100ns - 1200000) * 48000 / 10000000);
@@ -189,17 +197,26 @@ public:
             while (!stop) {
                 const qint64 pts = videoPosition;
                 const qint64 deadline = av_rescale_q(pts, encoder.p->time_base, AVRational{1, 10000000});
-                while (!stop && windowsClock100ns() - epoch < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                waitUntil(deadline);
                 if (stop) break;
                 frame.p->pts = pts; encode(encoder.p, frame.p, 0);
                 { QMutexLocker lock(&m_mutex); ++m_frames; }
                 encodeAudioUntil(windowsClock100ns() - epoch);
                 av_frame_unref(frame.p);
-                ++videoPosition;
+                ++videoPosition; ++seconds.back().first;
+                // An encoder that does not keep up must not slow time down: the images it had no
+                // time for are given up, and the picture stays in step with the sound.
+                const qint64 due = av_rescale_q(windowsClock100ns() - epoch, AVRational{1, 10000000}, encoder.p->time_base);
+                if (due > videoPosition) { seconds.back().second += int(due - videoPosition); videoPosition = due; }
+                if (const qint64 now = (windowsClock100ns() - epoch) / 10000000; now != second) {
+                    second = now; int encoded = 0, lost = 0; for (const auto& [kept, given] : seconds) { encoded += kept; lost += given; }
+                    { QMutexLocker lock(&m_mutex); m_lost = encoded + lost ? double(lost) / (encoded + lost) : 0; }
+                    seconds.emplace_back(0, 0); while (seconds.size() > 5) seconds.pop_front();
+                }
                 if (nativeVideo) {
                     // Read at the next output deadline, keeping the GPU queue bounded.
                     const auto nextDeadline = av_rescale_q(videoPosition, encoder.p->time_base, AVRational{1, 10000000});
-                    while (!stop && windowsClock100ns() - epoch < nextDeadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    waitUntil(nextDeadline);
                     if (stop) break;
                     nativeVideo->read(frame.p); continue;
                 }
@@ -216,23 +233,48 @@ private:
         else if (video.encoder == "auto") candidates = {video.codec + "_nvenc", video.codec + "_amf"};
         else if (video.encoder == "nvenc" || video.encoder == "amf") candidates = {video.codec + '_' + video.encoder};
         else throw std::runtime_error("Cette étape prend en charge NVIDIA NVENC et AMD AMF. Intel Quick Sync sera ajouté ensuite.");
+        const bool constantQuality = video.rateControl == "quality", thorough = video.effort == "thorough";
+        const qint64 bitrate = qint64(video.bitrateMbps) * 1000000;
+        const QByteArray quality = QByteArray::number(video.quality);
         QStringList errors;
         for (const auto& name : candidates) {
             const auto* codec = avcodec_find_encoder_by_name(name.toUtf8().constData()); if (!codec) { errors.append(name + ": absent"); continue; }
-            avcodec_free_context(&result.p); result.p = avcodec_alloc_context3(codec); if (!result.p) throw std::bad_alloc();
-            auto* context = result.p; context->width = video.width; context->height = video.height;
-            context->time_base = {1, video.fps}; context->framerate = {video.fps, 1}; context->gop_size = video.fps * 2;
-            context->max_b_frames = 0; context->pix_fmt = AVPixelFormat(first->format); context->bit_rate = qint64(video.bitrateMbps) * 1000000;
-            context->rc_max_rate = context->bit_rate; context->rc_buffer_size = int(context->bit_rate);
-            context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-            context->sample_aspect_ratio = {1, 1}; context->color_primaries = AVCOL_PRI_BT709; context->color_trc = AVCOL_TRC_BT709; context->colorspace = AVCOL_SPC_BT709;
-            if (first->hw_frames_ctx) context->hw_frames_ctx = av_buffer_ref(first->hw_frames_ctx);
-            AVDictionary* options = nullptr;
-            if (name.endsWith("nvenc")) { av_dict_set(&options, "preset", "p2", 0); av_dict_set(&options, "tune", "ull", 0); av_dict_set(&options, "rc", "cbr", 0); av_dict_set(&options, "zerolatency", "1", 0); }
-            if (name.endsWith("amf")) { av_dict_set(&options, "usage", "lowlatency", 0); av_dict_set(&options, "rc", "cbr", 0); }
-            const int status = avcodec_open2(context, codec, &options); av_dict_free(&options);
-            if (status >= 0) { QMutexLocker lock(&m_mutex); m_encoder = name; return; }
-            char message[AV_ERROR_MAX_STRING_SIZE]; av_strerror(status, message, sizeof(message)); errors.append(name + ": " + QString::fromUtf8(message));
+            const bool nvenc = name.endsWith("nvenc"), amf = name.endsWith("amf");
+            // Each step asks a little less of the GPU, down to what every card of the family accepts:
+            // B-frames used as references, then plain B-frames, then none. The buffer lives in memory,
+            // so nothing here is tuned for latency.
+            for (int step = nvenc && thorough ? 2 : amf ? 1 : 0; step >= 0; --step) {
+                avcodec_free_context(&result.p); result.p = avcodec_alloc_context3(codec); if (!result.p) throw std::bad_alloc();
+                auto* context = result.p; context->width = video.width; context->height = video.height;
+                context->time_base = {1, video.fps}; context->framerate = {video.fps, 1}; context->gop_size = video.fps * 2;
+                context->max_b_frames = 0; context->pix_fmt = AVPixelFormat(first->format);
+                context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+                context->sample_aspect_ratio = {1, 1}; context->color_primaries = AVCOL_PRI_BT709; context->color_trc = AVCOL_TRC_BT709; context->colorspace = AVCOL_SPC_BT709;
+                if (first->hw_frames_ctx) context->hw_frames_ctx = av_buffer_ref(first->hw_frames_ctx);
+                // The last resort on AMD is a plain constant bitrate, which every driver accepts.
+                const bool legacy = amf && step == 0, tuned = (nvenc || amf) && !legacy;
+                // A target lets hard scenes borrow from calm ones; a constant quality only knows its ceiling.
+                context->bit_rate = tuned && constantQuality ? 0 : bitrate;
+                context->rc_max_rate = tuned && !constantQuality ? bitrate * 3 / 2 : bitrate;
+                context->rc_buffer_size = int(tuned ? bitrate * 2 : bitrate);
+                AVDictionary* options = nullptr;
+                const auto set = [&options](const char* key, const char* value) { av_dict_set(&options, key, value, 0); };
+                if (nvenc) {
+                    set("preset", thorough ? "p5" : "p4"); set("tune", "hq"); set("rc", "vbr"); set("delay", "0");
+                    if (constantQuality) set("cq", quality.constData());
+                    if (step >= 1) context->max_b_frames = 2;
+                    if (step == 2) set("b_ref_mode", "middle");
+                } else if (legacy) {
+                    set("usage", "lowlatency"); set("rc", "cbr");
+                } else if (amf) {
+                    set("usage", "transcoding"); set("quality", thorough ? "quality" : "speed");
+                    if (constantQuality) { set("rc", "cqp"); for (const char* key : {"qp_i", "qp_p", "qp_b"}) set(key, quality.constData()); }
+                    else set("rc", "vbr_peak");
+                }
+                const int status = avcodec_open2(context, codec, &options); av_dict_free(&options);
+                if (status >= 0) { QMutexLocker lock(&m_mutex); m_encoder = name; return; }
+                char message[AV_ERROR_MAX_STRING_SIZE]; av_strerror(status, message, sizeof(message)); errors.append(name + ": " + QString::fromUtf8(message));
+            }
         }
         throw std::runtime_error((QStringLiteral("Aucun encodeur matériel disponible. Vérifiez le pilote GPU et le codec choisi.\n") + errors.join('\n')).toStdString());
     }
@@ -269,6 +311,7 @@ private:
     QList<Stream> m_streams;
     QString m_encoder, m_warning;
     quint64 m_frames = 0;
+    double m_lost = 0;
 };
 }
 std::shared_ptr<CaptureBackend> createCaptureBackend(const RecordingProfile& profile) { return std::make_shared<WindowsCapture>(profile); }

@@ -38,6 +38,8 @@ public:
     void setFolder(const QString& path);
     // Whether this build follows a repository for its updates, and the version it is.
     void setUpdates(bool followed, const QString& version);
+    // Whether this copy keeps its own shortcut in the Start menu.
+    void setStartMenu(bool managed);
     RecordingProfile& profile();
 signals:
     void checkUpdatesRequested();
@@ -67,11 +69,12 @@ private:
     QComboBox* m_profiles; Button* m_duplicate; QList<QWidget*> m_tabButtons; QStackedWidget* m_tabs; Banner* m_lock; QWidget* m_saveBar; QLabel* m_dirtyTitle; QLabel* m_dirtyDetail; Button* m_save;
     QComboBox* m_videoTarget; QLineEdit* m_gameName; QCheckBox* m_detectGame; QList<Tile*> m_presets; Button* m_advancedToggle; QWidget* m_advanced;
     QComboBox* m_resolution; QComboBox* m_fps; QComboBox* m_codec; QComboBox* m_encoder; QSpinBox* m_bitrate; QCheckBox* m_cursor;
+    QComboBox* m_rateControl; QComboBox* m_quality; QComboBox* m_effort; QLabel* m_bitrateLabel; QLabel* m_qualityLabel;
     QSlider* m_durationSlider; QSpinBox* m_duration; QComboBox* m_memory; QWidget* m_estimateCalm; QLabel* m_estimateCalmText; Bar* m_estimateCalmBar;
     QWidget* m_estimateWarn; QLabel* m_estimateWarnTitle; QLabel* m_estimateWarnLimit; Bar* m_estimateWarnBar; QLabel* m_estimateWarnText;
     Keycaps* m_hotkeyCaps; QKeySequenceEdit* m_hotkey; Button* m_hotkeyChange; QLabel* m_hotkeyHint;
     Tag* m_captureTag; Tag* m_qualityTag; Tag* m_replayTag;
     QVBoxLayout* m_lanes; QLabel* m_sourceNotes; QLineEdit* m_folder; QCheckBox* m_savedSound; QCheckBox* m_savedNotify;
-    QWidget* m_updateSection; QCheckBox* m_checkUpdates; QLabel* m_version;
+    QWidget* m_updateSection; QCheckBox* m_checkUpdates; QLabel* m_version; QCheckBox* m_closeToTray; QCheckBox* m_startMenu;
 };
 }

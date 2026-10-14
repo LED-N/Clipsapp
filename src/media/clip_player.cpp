@@ -1,48 +1,14 @@
 #include "clip_player.h"
 #include "clip_reader.h"
 #include "audio_output.h"
+#include "platform/fine_wait.h"
 #include <QMutexLocker>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <thread>
 #include <vector>
-#ifdef Q_OS_WIN
-#include <windows.h>
-#endif
 namespace clipsapp {
-namespace {
-// Windows wakes a sleeping thread every 15.6 ms by default: too coarse to hand out an image
-// every 16.7 ms. A presentation waits on a high-resolution timer instead, which holds its
-// precision whatever the rest of the system asks for, and costs nothing once released.
-class FineWait {
-public:
-    explicit FineWait(bool wanted) {
-#ifdef Q_OS_WIN
-        // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, Windows 10 1803 and later.
-        if (wanted) m_timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002, TIMER_ALL_ACCESS);
-#else
-        Q_UNUSED(wanted);
-#endif
-    }
-    ~FineWait() {
-#ifdef Q_OS_WIN
-        if (m_timer) CloseHandle(m_timer);
-#endif
-    }
-    void wait(int milliseconds) const {
-#ifdef Q_OS_WIN
-        LARGE_INTEGER due; due.QuadPart = -10000LL * milliseconds;
-        if (m_timer && SetWaitableTimer(m_timer, &due, 0, nullptr, nullptr, FALSE)) { WaitForSingleObject(m_timer, 100); return; }
-#endif
-        std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
-    }
-private:
-#ifdef Q_OS_WIN
-    HANDLE m_timer = nullptr;
-#endif
-};
-}
 float applyGain(float* stereo, int frames, float from, float to) {
     if (frames <= 0 || (from == 1.f && to == 1.f)) return to;
     const float step = (to - from) / float(frames); float gain = from;
@@ -58,12 +24,13 @@ ClipPlayer::ClipPlayer(QObject* parent, bool audioEnabled) : QObject(parent), m_
 }
 ClipPlayer::~ClipPlayer() { close(); }
 PlayerSnapshot ClipPlayer::snapshot() const { QMutexLocker lock(&m_mutex); return m_snapshot; }
-void ClipPlayer::setPresentation(QSize box) {
-    { QMutexLocker lock(&m_mutex); if (m_presentation == box) return; const bool live = !m_presentation.isEmpty() && !box.isEmpty() && m_snapshot.loaded; m_presentation = box; if (!live) return;
+void ClipPlayer::setPresentation(QSize box, bool whole) {
+    { QMutexLocker lock(&m_mutex); if (m_presentation == box && m_whole == whole) return; const bool live = !m_presentation.isEmpty() && !box.isEmpty() && m_snapshot.loaded; m_presentation = box; m_whole = whole; if (!live) return;
       // Another screen, another scale: the clip being shown is redrawn at the new size, where it is.
       ++m_revision; m_snapshot.loading = true; }
     m_wake.wakeAll(); m_timer.start();
 }
+void ClipPlayer::setFrameSink(std::function<void(const GpuFrame&)> sink) { QMutexLocker lock(&m_mutex); m_sink = std::move(sink); }
 void ClipPlayer::close() {
     { QMutexLocker lock(&m_mutex); m_stop = true; m_decodeCancel = true; m_wake.wakeAll(); }
     if (m_thread.joinable()) m_thread.join(); m_timer.stop();
@@ -101,9 +68,17 @@ void ClipPlayer::setEdit(const ClipEdit& edit) {
 }
 void ClipPlayer::run(QString path) {
     try {
-        ClipReader reader(path); const auto info = reader.info(); QSize presentation;
-        { QMutexLocker lock(&m_mutex); m_snapshot.info = info; m_edit = defaultEdit(info); presentation = m_presentation; }
+        std::function<void(const GpuFrame&)> sink; { QMutexLocker lock(&m_mutex); sink = m_sink; }
+        ClipReader reader(path, true, false, bool(sink)); const auto info = reader.info(); QSize presentation; bool whole = false;
+        { QMutexLocker lock(&m_mutex); m_snapshot.info = info; m_edit = defaultEdit(info); presentation = m_presentation; whole = m_whole; }
         const FineWait pause(!presentation.isEmpty());
+        // The image due at a time: handed to the window when it stayed on the card, and only when it
+        // changes; drawn from memory otherwise.
+        GpuFrame handed; bool direct = false;
+        const auto picture = [&](qint64 at) -> QImage {
+            if (sink) { if (const auto frame = reader.gpuFrameAt(at)) { direct = true; if (frame != handed) { handed = frame; sink(frame); } } if (direct) return {}; }
+            return reader.frameAt(at);
+        };
         std::unique_ptr<AudioOutput> output;
         bool playing = false, prepared = false, anchored = false;
         quint64 serial = 0;
@@ -124,11 +99,11 @@ void ClipPlayer::run(QString path) {
         };
         while (!m_stop) {
             ClipEdit edit; bool requestedPlaying; quint64 requestedSerial, revision; qint64 requested;
-            { QMutexLocker lock(&m_mutex); edit = m_edit; requestedPlaying = m_playing; requestedSerial = m_seekSerial; requested = m_requestedMs; revision = m_revision; if (!presentation.isEmpty() && !m_presentation.isEmpty()) presentation = m_presentation; }
+            { QMutexLocker lock(&m_mutex); edit = m_edit; requestedPlaying = m_playing; requestedSerial = m_seekSerial; requested = m_requestedMs; revision = m_revision; if (!presentation.isEmpty() && !m_presentation.isEmpty()) { presentation = m_presentation; whole = m_whole; } }
             if (prepared && playing) position = clock();
             const bool audioSelectionChanged = reader.setAudioTracks(edit.tracks);
             FrameOutput frames;
-            if (!presentation.isEmpty()) { frames.box = presentation; frames.fit = true; if (edit.crop.isValid() && edit.crop != QRect(QPoint(), info.size)) frames.crop = edit.crop; }
+            if (!presentation.isEmpty()) { frames.box = presentation; frames.fit = true; if (!whole && edit.crop.isValid() && edit.crop != QRect(QPoint(), info.size)) frames.crop = edit.crop; }
             const bool outputChanged = reader.setFrameOutput(frames);
             if (requestedSerial != serial || requestedPlaying != playing || audioSelectionChanged || outputChanged) {
                 if (requestedSerial != serial) position = requested;
@@ -138,12 +113,13 @@ void ClipPlayer::run(QString path) {
             }
             { QMutexLocker lock(&m_mutex); if (m_seekSerial != serial || m_stop) continue; m_decodeCancel = false; }
             // The image that is due goes out first: converting the next ones must not hold it back.
-            if (prepared && playing) { const auto due = reader.frameAt(position); QMutexLocker lock(&m_mutex); if (m_seekSerial == serial) { m_snapshot.image = due; m_snapshot.positionMs = position; } }
+            if (prepared && playing) { const auto due = picture(position); QMutexLocker lock(&m_mutex); if (m_seekSerial == serial) { m_snapshot.image = due; m_snapshot.positionMs = position; } }
             // Paused scrubbing needs one accurate image, without priming all
             // audio tracks or decoding another 150 ms of video. While playing, images are
             // decoded only as far ahead as about 96 Mio of them allow: nine at 720p, three in 4K.
             const auto size = reader.frameSize(); const qint64 frameBytes = std::max<qint64>(1, qint64(size.width()) * size.height() * 4);
-            const qint64 ahead = std::min<qint64>(150, qint64(std::ceil(std::clamp<qint64>(96LL * 1024 * 1024 / frameBytes, 3, 9) * 1000.0 / std::max(1.0, info.fps))));
+            // On the card an image is a surface of the decoder, of which only a few may wait: four ahead.
+            const qint64 ahead = reader.direct() ? qint64(std::ceil(4 * 1000.0 / std::max(1.0, info.fps))) : std::min<qint64>(150, qint64(std::ceil(std::clamp<qint64>(96LL * 1024 * 1024 / frameBytes, 3, 9) * 1000.0 / std::max(1.0, info.fps))));
             reader.readUntil(std::min(info.durationMs, position + (playing ? 150 : 1)), m_decodeCancel, !playing, playing ? std::min(info.durationMs, position + ahead) : -1, position);
             if (m_stop) break;
             if (m_decodeCancel) continue;
@@ -167,9 +143,9 @@ void ClipPlayer::run(QString path) {
                 QMutexLocker lock(&m_mutex);
                 if (m_seekSerial == serial && m_playing == requestedPlaying) m_playing = false;
             }
-            const auto image = reader.frameAt(position);
+            const auto image = picture(position);
             { QMutexLocker lock(&m_mutex); if (m_seekSerial != serial) continue; m_snapshot.image = image; m_snapshot.positionMs = position;
-              m_snapshot.loaded = true; m_snapshot.loading = m_seekSerial != serial || m_playing != playing; m_snapshot.playing = playing; }
+              m_snapshot.loaded = true; m_snapshot.loading = m_seekSerial != serial || m_playing != playing; m_snapshot.playing = playing; m_snapshot.direct = direct; }
             if (!playing) {
                 QMutexLocker lock(&m_mutex); if (!m_stop && m_revision == revision) m_wake.wait(&m_mutex);
             } else pause.wait(presentation.isEmpty() ? 5 : 1);

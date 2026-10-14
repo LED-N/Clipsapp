@@ -1,0 +1,2 @@
+// The icon Windows shows for the executable, its shortcuts and its taskbar button.
+IDI_ICON1 ICON "clipsapp.ico"

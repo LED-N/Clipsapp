@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(Clipsapp VERSION 0.8.0 LANGUAGES CXX)
+project(Clipsapp VERSION 0.8.1 LANGUAGES CXX)
 
 # The GitHub repository whose releases the published application follows for its updates,
 # written "owner/name". Left empty, the application never looks for updates.
@@ -19,7 +19,9 @@ add_library(clipsapp_core STATIC
     src/core/audio_routing.cpp src/core/audio_routing.h
     src/core/game_identity.cpp src/core/game_identity.h
     src/core/update.cpp src/core/update.h
+    src/core/track_mix.cpp src/core/track_mix.h
     src/platform/game_detection.cpp src/platform/game_detection.h
+    src/platform/start_menu.cpp src/platform/start_menu.h
     src/media/clip_edit.cpp src/media/clip_edit.h
 )
 target_include_directories(clipsapp_core PUBLIC src)
@@ -55,12 +57,14 @@ add_library(clipsapp_editor STATIC
     src/media/clip_player.cpp src/media/clip_player.h
     src/media/clip_exporter.cpp src/media/clip_exporter.h
     src/media/clip_analysis.cpp src/media/clip_analysis.h
+    src/media/gpu_video.cpp src/media/gpu_video.h
     src/media/audio_output.h ${CLIPSAPP_AUDIO_OUTPUT}
+    src/platform/fine_wait.h
 )
 target_link_libraries(clipsapp_editor PUBLIC clipsapp_core Qt6::Gui PRIVATE clipsapp_media)
 if(WIN32)
     target_compile_definitions(clipsapp_editor PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-    target_link_libraries(clipsapp_editor PRIVATE ole32 uuid mmdevapi winmm)
+    target_link_libraries(clipsapp_editor PRIVATE ole32 uuid mmdevapi winmm d3d11 dxgi dxguid)
 endif()
 
 set(CLIPSAPP_APP_SOURCES
@@ -82,6 +86,7 @@ set(CLIPSAPP_APP_SOURCES
     src/ui/layout_keys.cpp src/ui/layout_keys.h
     src/ui/update_service.cpp src/ui/update_service.h
     src/ui/video_canvas.cpp src/ui/video_canvas.h
+    src/ui/video_surface.cpp src/ui/video_surface.h
     src/ui/clip_timeline.cpp src/ui/clip_timeline.h
     src/ui/clip_feedback.cpp src/ui/clip_feedback.h
     src/platform/source_catalog.h ${CLIPSAPP_PLATFORM_SOURCE}
@@ -92,6 +97,17 @@ qt_add_executable(clipsapp src/main.cpp ${CLIPSAPP_APP_SOURCES})
 target_link_libraries(clipsapp PRIVATE clipsapp_core clipsapp_editor Qt6::Widgets Qt6::Concurrent Qt6::Network)
 if(WIN32)
     target_link_libraries(clipsapp PRIVATE winmm)
+    # The icon of the executable: what Explorer, the Start menu and the taskbar show for it.
+    enable_language(RC)
+    # Compiled on its own, without the include folders of the application: windres hands them to
+    # its preprocessor unquoted, and starts that preprocessor by its full path. Both fail as soon
+    # as a path holds a space, which the folder of the project may.
+    add_library(clipsapp_icon OBJECT resources/clipsapp.rc)
+    set_target_properties(clipsapp_icon PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+    if(MINGW)
+        set_source_files_properties(resources/clipsapp.rc PROPERTIES COMPILE_OPTIONS "--preprocessor=gcc;--preprocessor-arg=-E;--preprocessor-arg=-xc;--preprocessor-arg=-DRC_INVOKED")
+    endif()
+    target_sources(clipsapp PRIVATE $<TARGET_OBJECTS:clipsapp_icon>)
 endif()
 target_compile_definitions(clipsapp PRIVATE CLIPSAPP_VERSION="${PROJECT_VERSION}" CLIPSAPP_UPDATE_REPOSITORY="${CLIPSAPP_UPDATE_REPOSITORY}")
 if(WIN32)
@@ -148,6 +164,10 @@ if(BUILD_TESTING)
         qt_add_executable(clipsapp_memory_probe tests/memory_probe.cpp ${CLIPSAPP_APP_SOURCES})
         target_compile_definitions(clipsapp_memory_probe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN CLIPSAPP_VERSION="${PROJECT_VERSION}")
         target_link_libraries(clipsapp_memory_probe PRIVATE clipsapp_editor clipsapp_media Qt6::Widgets Qt6::Concurrent Qt6::Network ole32 uuid user32 mmdevapi winmm)
+        qt_add_executable(clipsapp_preview_probe tests/preview_probe.cpp ${CLIPSAPP_APP_SOURCES})
+        target_compile_definitions(clipsapp_preview_probe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN CLIPSAPP_VERSION="${PROJECT_VERSION}")
+        target_link_libraries(clipsapp_preview_probe PRIVATE clipsapp_editor clipsapp_media Qt6::Widgets Qt6::Concurrent Qt6::Network ole32 uuid user32 mmdevapi winmm)
+        set_target_properties(clipsapp_preview_probe PROPERTIES WIN32_EXECUTABLE FALSE)
         qt_add_executable(clipsapp_application_mix_probe tests/application_mix_probe.cpp src/platform/windows_audio.cpp src/capture/audio_stream.cpp)
         target_compile_definitions(clipsapp_application_mix_probe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
         target_link_libraries(clipsapp_application_mix_probe PRIVATE clipsapp_editor clipsapp_media ole32 uuid mmdevapi)

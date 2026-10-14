@@ -2,6 +2,7 @@
 #include "core/config.h"
 #include "platform/source_catalog.h"
 #include <QWidget>
+class QCheckBox;
 class QComboBox;
 class QHBoxLayout;
 class QKeySequenceEdit;
@@ -18,6 +19,9 @@ public:
     void setCatalog(const SourceCatalog& catalog);
     void refresh();
     int step() const { return m_step; }
+    // Whether this copy keeps its own shortcut in the Start menu, and whether the user wants it.
+    void setStartMenu(bool managed);
+    bool startMenuWanted() const;
 signals:
     void chooseFolderRequested();
     void finished(bool startReplay);
@@ -27,6 +31,6 @@ private:
     AppConfig& m_config; SourceCatalog m_catalog; int m_step = 0;
     QLabel* m_progress; QList<QWidget*> m_steps; QList<QLabel*> m_summaries; QList<QWidget*> m_bodies; QList<Button*> m_changes;
     QLabel* m_folder; QHBoxLayout* m_screens; QList<Tile*> m_targets; QComboBox* m_windows; Button* m_targetNext;
-    Keycaps* m_caps; Keycaps* m_capsSummary; QKeySequenceEdit* m_hotkey; Button* m_start;
+    Keycaps* m_caps; Keycaps* m_capsSummary; QKeySequenceEdit* m_hotkey; Button* m_start; QCheckBox* m_startMenu;
 };
 }

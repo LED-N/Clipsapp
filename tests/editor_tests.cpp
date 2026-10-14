@@ -1,5 +1,8 @@
 #include <QtTest>
+#include <QAction>
 #include <QCheckBox>
+#include <QMenu>
+#include <QSystemTrayIcon>
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
@@ -10,6 +13,7 @@
 #include <QListWidget>
 #include <QPushButton>
 #include <QAbstractButton>
+#include <QAbstractScrollArea>
 #include <QDialog>
 #include <QLabel>
 #include <QLineEdit>
@@ -120,6 +124,18 @@ private slots:
         QVERIFY(qAbs(amplitude(mixed, 330) - 0.06) < 0.01); QVERIFY(qAbs(amplitude(mixed, 440) - 0.15) < 0.01); QVERIFY(amplitude(mixed, 550) < 0.005);
         reader.seek(1700); reader.readUntil(1850, m_stop); QVERIFY(!reader.frameAt(1700).isNull());
     }
+    void soundStaysContinuousWhenAFileStampsItsAudioPacketsUnevenly() {
+        // Some recorders date each audio packet at its arrival, five milliseconds early or late,
+        // while the sound inside is continuous. Played at those dates it would crackle.
+        const auto uneven = m_directory.filePath("uneven.mp4"); QProcess process;
+        process.start(QDir(QCoreApplication::applicationDirPath()).filePath("ffmpeg.exe"), {"-nostdin", "-v", "error", "-i", m_source, "-map", "0", "-c", "copy", "-bsf:a", "setts=pts=PTS+240*sin(N*1.7):dts=DTS+240*sin(N*1.7)", uneven});
+        QVERIFY(process.waitForFinished(15000)); QVERIFY2(process.exitCode() == 0, process.readAllStandardError().constData());
+        ClipReader reader(uneven, false); auto edit = defaultEdit(reader.info()); QCOMPARE(edit.tracks.size(), 3);
+        const auto mixed = samples(reader, {edit.tracks.first()}); QVERIFY(qAbs(amplitude(mixed, 330) - 0.12) < 0.015);
+        // A 330 Hz tone of this level never moves by more than 0.006 between two samples: a hole or a doubled block does.
+        float jump = 0; for (size_t sample = 2; sample < mixed.size(); sample += 2) jump = std::max(jump, std::abs(mixed[sample] - mixed[sample - 2]));
+        QVERIFY2(jump < 0.03f, qPrintable(QString::number(jump)));
+    }
     void playbackPausesSeeksEndsAtTrimBoundaryAndReleasesTheClip() {
         ClipPlayer player(nullptr, false); player.load(m_source);
         QTRY_VERIFY_WITH_TIMEOUT(player.snapshot().loaded || !player.snapshot().error.isEmpty(), 5000);
@@ -164,6 +180,26 @@ private slots:
         ClipReader output(path, false); QCOMPARE(output.info().audio.size(), 1); QCOMPARE(output.info().audio.first().name, QString("Micro"));
         const auto sound = samples(output, defaultEdit(output.info()).tracks); QVERIFY(amplitude(sound, 330) > 0.1); QVERIFY(amplitude(sound, 440) < 0.002);
         QCOMPARE(digest(m_source), m_digest);
+    }
+    void editorStartsFromTheUsualLevelsAndAnExportIsNotMixedTwice() {
+        const TrackMix mix{{mixKey("Micro"), 0.7}, {mixKey("discord"), 1.3}};
+        ClipEditor editor; editor.setAttribute(Qt::WA_DontShowOnScreen); editor.resize(1050, 740); editor.show(); editor.setDefaultMix(mix); editor.openClip(m_source);
+        auto* micro = editor.findChild<QSlider*>("track-volume-0"); QTRY_VERIFY_WITH_TIMEOUT((micro = editor.findChild<QSlider*>("track-volume-0")) && micro->isEnabled(), 5000);
+        // Micro, Jeu, Discord: each track opens at its usual level, a track without one as it was recorded.
+        QCOMPARE(micro->value(), 70); QCOMPARE(editor.findChild<QSlider*>("track-volume-1")->value(), 100); QCOMPARE(editor.findChild<QSlider*>("track-volume-2")->value(), 130);
+        // The usual levels can be exported, but they are not a change the user made to this clip.
+        auto* exportButton = editor.findChild<QPushButton*>("export-clip"); auto* keep = editor.findChild<QPushButton*>("keep-mix"); auto* state = editor.findChild<QWidget*>("editor-state");
+        QVERIFY(exportButton->isEnabled()); QVERIFY(state->isHidden()); QVERIFY(keep->isHidden());
+        QSignalSpy chosen(&editor, &ClipEditor::mixChosen);
+        editor.findChild<QSlider*>("track-volume-1")->setValue(85); QVERIFY(!state->isHidden()); QVERIFY(!keep->isHidden()); keep->click(); QCOMPARE(chosen.size(), 1);
+        const auto kept = chosen.first().first().value<TrackMix>(); QCOMPARE(kept.value(mixKey("Jeu")), 0.85); QCOMPARE(kept.value(mixKey("Micro")), 0.7); QCOMPARE(kept.value(mixKey("Discord")), 1.3);
+        editor.setDefaultMix(kept); QVERIFY(keep->isHidden()); QVERIFY(state->isHidden()); QVERIFY(exportButton->isEnabled());
+        editor.suspend();
+        // What an export writes says its sound was mixed: read again, it keeps the levels it has.
+        QVERIFY(!m_info.mixed); auto edit = defaultEdit(m_info, mix); QCOMPARE(edit.tracks[0].volume, 0.7); edit.separateTracks = true;
+        const auto output = exported(edit, "usual-levels.mp4"); QVERIFY(!output.isEmpty());
+        ClipReader reader(output, false); QVERIFY(reader.info().mixed); QCOMPARE(reader.info().audio.size(), 3); QCOMPARE(reader.info().audio.first().name, QString("Micro"));
+        for (const auto& track : defaultEdit(reader.info(), mix).tracks) QCOMPARE(track.volume, 1.0);
     }
     void editorOnlyExportsChangesAndAdaptsToZeroOneOrManyAudioTracks() {
         ClipEditor editor; editor.setAttribute(Qt::WA_DontShowOnScreen); editor.resize(1050, 740); editor.show(); editor.openClip(m_source);
@@ -526,14 +562,72 @@ private slots:
         // Ten minutes at this bitrate do not fit under the default ceiling: the estimate says so.
         window.findChild<QSpinBox*>("replay-duration")->setValue(600); QVERIFY(!window.findChild<QWidget*>("memory-warning")->isHidden());
         QVERIFY(window.grab().save(previewPath("settings-capture.png")));
-        window.findChild<QPushButton*>("settings-tab-1")->click(); QVERIFY(window.findChild<QWidget*>("audio-lane-0")); QVERIFY(window.grab().save(previewPath("settings-audio.png")));
+        window.findChild<QPushButton*>("settings-tab-1")->click(); QVERIFY(window.findChild<QWidget*>("audio-lane-0"));
+        // Each track has its usual level in the clips; it is a setting like the others, saved or given back with them.
+        auto* usual = window.findChild<QSlider*>("track-mix-0"); QVERIFY(usual); QCOMPARE(usual->value(), 100); QVERIFY(!usual->toolTip().isEmpty()); usual->setValue(70);
+        QCOMPARE(window.findChild<QLabel*>("settings-dirty")->text(), QStringLiteral("4 modifications non enregistrées"));
+        QTest::qWait(50); QVERIFY(window.grab().save(previewPath("settings-audio.png")));
         window.findChild<QPushButton*>("settings-tab-2")->click(); QVERIFY(window.grab().save(previewPath("settings-files.png")));
         // "Annuler" gives the saved settings back; nothing was written meanwhile.
         window.findChild<QPushButton*>("settings-revert")->click(); QCOMPARE(fps->currentData().toInt(), 60); QVERIFY(saveBar->isHidden()); QVERIFY(!window.isWindowModified());
-        AppConfig stored; QVERIFY(ConfigStore(configPath).load(stored, error)); QCOMPARE(stored.activeProfile()->video.fps, 60);
+        // The lanes are drawn again with the settings given back; the ones they replace go with the next event.
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete); QCOMPARE(window.findChild<QSlider*>("track-mix-0")->value(), 100);
+        AppConfig stored; QVERIFY(ConfigStore(configPath).load(stored, error)); QCOMPARE(stored.activeProfile()->video.fps, 60); QVERIFY(stored.defaultMix.isEmpty());
+        window.findChild<QSlider*>("track-mix-0")->setValue(70); window.findChild<QSlider*>("track-mix-2")->setValue(130); window.findChild<QPushButton*>("settings-save")->click();
+        QVERIFY(ConfigStore(configPath).load(stored, error)); QCOMPARE(stored.defaultMix, (TrackMix{{mixKey("Micro"), 0.7}, {mixKey("Discord"), 1.3}}));
+        window.findChild<QSlider*>("track-mix-0")->setValue(100); window.findChild<QSlider*>("track-mix-2")->setValue(100); window.findChild<QPushButton*>("settings-save")->click();
+        QVERIFY(ConfigStore(configPath).load(stored, error)); QVERIFY(stored.defaultMix.isEmpty());
         window.findChild<QPushButton*>("quality-2")->click(); window.findChild<QPushButton*>("settings-save")->click(); QVERIFY(saveBar->isHidden());
         QVERIFY(ConfigStore(configPath).load(stored, error)); QCOMPARE(stored.activeProfile()->video.height, 1440); QCOMPARE(stored.activeProfile()->video.bitrateMbps, 50);
-        window.close();
+        // The last preset holds a constant quality: its level appears, the bitrate turns into a ceiling and the estimate into a maximum.
+        auto* mode = window.findChild<QComboBox*>("rate-control"); auto* level = window.findChild<QComboBox*>("quality-level"); QVERIFY(mode); QVERIFY(level); QVERIFY(level->isHidden());
+        QCOMPARE(stored.activeProfile()->video.rateControl, QString("bitrate")); QVERIFY(window.findChild<QWidget*>("memory-warning")->isHidden());
+        window.findChild<QPushButton*>("quality-3")->click(); QVERIFY(window.findChild<QPushButton*>("quality-3")->isChecked()); QVERIFY(!window.findChild<QPushButton*>("quality-2")->isChecked());
+        QCOMPARE(mode->currentData().toString(), QString("quality")); QCOMPARE(level->currentData().toInt(), 14); QVERIFY(!level->isHidden()); QVERIFY(!window.findChild<QWidget*>("memory-warning")->isHidden());
+        for (const auto& name : {"rate-control", "quality-level", "effort", "bitrate", "fps"}) QVERIFY(!window.findChild<QWidget*>(name)->toolTip().isEmpty());
+        window.findChild<QPushButton*>("settings-tab-0")->click(); window.findChild<QPushButton*>("advanced-toggle")->click(); QTest::qWait(50);
+        for (auto* area : window.findChildren<QAbstractScrollArea*>()) if (area->isVisible() && area->findChild<QWidget*>("effort")) area->verticalScrollBar()->setValue(area->verticalScrollBar()->maximum());
+        QTest::qWait(50); QVERIFY(window.grab().save(previewPath("settings-quality.png")));
+        // The estimate is a range that follows the level, with what the ceiling allows at most.
+        auto* memory = window.findChild<QComboBox*>("replay-memory"); memory->setCurrentIndex(memory->findData(2048)); QVERIFY(window.findChild<QWidget*>("memory-warning")->isHidden());
+        auto* estimate = window.findChild<QLabel*>("memory-estimate"); const auto nearLossless = estimate->text(); QVERIFY2(nearLossless.contains(QStringLiteral(" à ")) && nearLossless.contains(QStringLiteral("433 au plus")), qPrintable(nearLossless));
+        level->setCurrentIndex(level->findData(20)); QVERIFY(estimate->text() != nearLossless); QVERIFY(estimate->text().contains(QStringLiteral("433 au plus")));
+        QTest::qWait(50); QVERIFY(window.grab().save(previewPath("settings-quality-range.png"))); level->setCurrentIndex(level->findData(14));
+        window.findChild<QComboBox*>("effort")->setCurrentIndex(1); window.findChild<QPushButton*>("settings-save")->click();
+        QVERIFY(ConfigStore(configPath).load(stored, error)); QCOMPARE(stored.activeProfile()->video.rateControl, QString("quality")); QCOMPARE(stored.activeProfile()->video.quality, 14);
+        QCOMPARE(stored.activeProfile()->video.bitrateMbps, 200); QCOMPARE(stored.activeProfile()->video.effort, QString("thorough"));
+        // Back on a target bitrate, the level leaves the page and the preset is recognised again.
+        mode->setCurrentIndex(0); window.findChild<QSpinBox*>("bitrate")->setValue(50); QVERIFY(level->isHidden()); QVERIFY(window.findChild<QPushButton*>("quality-2")->isChecked());
+        window.findChild<QPushButton*>("settings-revert")->click(); QVERIFY(saveBar->isHidden()); window.close();
+    }
+    void closingTheWindowLeavesTheApplicationBehindItsIconUntilQuit() {
+        QTemporaryDir directory; const auto configPath = directory.filePath("config"); QString error;
+        // The first time, a real Windows notification says where the window went: here it has been said.
+        { auto config = AppConfig::defaults(); config.trayNoticeShown = true; QVERIFY2(ConfigStore(configPath).save(config, error), qPrintable(error)); }
+        MainWindow window(configPath); window.setAttribute(Qt::WA_DontShowOnScreen); window.show();
+        auto* tray = window.findChild<QSystemTrayIcon*>(); QVERIFY(tray); auto* menu = window.findChild<QMenu*>("tray-menu"); QVERIFY(menu);
+        if (!QSystemTrayIcon::isSystemTrayAvailable()) QSKIP("No notification area on this system.");
+        // A window that was never on screen has no icon to hide behind. The test keeps it off screen
+        // and only lifts the mark, so that the icon comes with the next refresh of the settings.
+        QVERIFY(!tray->isVisible()); window.setAttribute(Qt::WA_DontShowOnScreen, false);
+        window.setPage(MainWindow::Settings); window.findChild<QPushButton*>("settings-tab-2")->click();
+        auto* sound = window.findChild<QCheckBox*>("clip-saved-sound"); sound->setChecked(!sound->isChecked()); window.findChild<QPushButton*>("settings-save")->click(); QVERIFY(tray->isVisible());
+        QStringList entries; for (const auto* action : menu->actions()) if (!action->isSeparator()) entries.append(action->text());
+        QCOMPARE(entries, QStringList({QStringLiteral("Ouvrir Clipsapp"), QStringLiteral("Sauvegarder le clip"), QStringLiteral("Démarrer le replay"), QStringLiteral("Quitter Clipsapp")}));
+        QVERIFY(!menu->actions().at(2)->isEnabled());
+        // Closing hides the window and ends nothing; unsaved settings are not asked about, they are still there.
+        sound->setChecked(!sound->isChecked()); QVERIFY(!window.close()); QVERIFY(window.isHidden()); QVERIFY(tray->isVisible());
+        window.setAttribute(Qt::WA_DontShowOnScreen); emit tray->activated(QSystemTrayIcon::Context); QVERIFY(window.isHidden());
+        emit tray->activated(QSystemTrayIcon::Trigger); QVERIFY(window.isVisible()); QVERIFY(!window.findChild<QWidget*>("savebar")->isHidden());
+        window.findChild<QPushButton*>("settings-revert")->click(); window.setAttribute(Qt::WA_DontShowOnScreen, false);
+        QVERIFY(!window.close()); QVERIFY(window.isHidden());
+        // "Quitter", in the menu of the icon, is what ends the application: the icon leaves with it.
+        menu->actions().last()->trigger(); QVERIFY(!tray->isVisible());
+        // With the setting off, the window closes as any other.
+        window.setAttribute(Qt::WA_DontShowOnScreen); window.show(); window.setAttribute(Qt::WA_DontShowOnScreen, false);
+        auto* keep = window.findChild<QCheckBox*>("close-to-tray"); QVERIFY(keep->isChecked()); keep->setChecked(false); window.findChild<QPushButton*>("settings-save")->click();
+        QVERIFY(window.close()); QVERIFY(!tray->isVisible());
+        AppConfig stored; QVERIFY(ConfigStore(configPath).load(stored, error)); QVERIFY(!stored.closeToTray);
     }
     void presentationImagesAreTheCroppedResultAtTheSizeOfTheScreen() {
         // The reader hands out the region asked for, fitted to the box: no pixel is rescaled when it is drawn.

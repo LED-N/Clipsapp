@@ -5,6 +5,7 @@
 #include <QStandardPaths>
 #include <QUuid>
 #include <algorithm>
+#include <cmath>
 
 namespace clipsapp {
 QString newId() { return QUuid::createUuid().toString(QUuid::WithoutBraces); }
@@ -62,11 +63,23 @@ const RecordingProfile* AppConfig::activeProfile() const {
     for (const auto& profile : profiles) if (profile.id == activeProfileId) return &profile;
     return nullptr;
 }
-double estimatedBufferMiB(const RecordingProfile& profile) {
+namespace {
+double bufferMiB(const RecordingProfile& profile, double videoMbps) {
     QSet<QString> activeTracks;
     for (const auto& source : profile.sources) if (source.enabled) activeTracks.insert(source.trackId);
-    const double bitrate = profile.video.bitrateMbps * 1000000.0 + activeTracks.size() * 192000.0;
+    const double bitrate = videoMbps * 1000000.0 + activeTracks.size() * 192000.0;
     return bitrate * profile.replay.durationSeconds / 8.0 / 1048576.0;
+}
+}
+double estimatedBufferMiB(const RecordingProfile& profile) { return bufferMiB(profile, profile.video.bitrateMbps); }
+BufferRange usualBufferMiB(const RecordingProfile& profile) {
+    const auto& video = profile.video; const double ceiling = estimatedBufferMiB(profile);
+    if (video.rateControl != "quality") return {ceiling, ceiling};
+    // Measured at level 20 in 1440p at 60 FPS: 56 Mbit/s on a calm game, 91 on a busy one, and
+    // twice as much every 5.5 levels down. Other sizes follow the three-quarter power of the
+    // number of pixels per second, the usual rule for video. An order of magnitude, not a promise.
+    const double scale = std::pow(double(video.width) * video.height * video.fps / (2560.0 * 1440 * 60), 0.75) * std::pow(2.0, (20 - video.quality) / 5.5);
+    return {std::min(ceiling, bufferMiB(profile, 56 * scale)), std::min(ceiling, bufferMiB(profile, 91 * scale))};
 }
 QStringList AppConfig::validationErrors() const {
     QStringList errors;
@@ -78,10 +91,13 @@ QStringList AppConfig::validationErrors() const {
         if (profile.id.isEmpty() || profileIds.contains(profile.id)) errors << QStringLiteral("Identifiant de profil absent ou dupliqué.");
         profileIds.insert(profile.id);
         if (profile.name.trimmed().isEmpty()) errors << QStringLiteral("Un profil doit avoir un nom.");
-        if (profile.video.fps != 30 && profile.video.fps != 60) errors << prefix + QStringLiteral("La fréquence doit être de 30 ou 60 FPS.");
+        if (!QList<int>{30, 60, 120, 144}.contains(profile.video.fps)) errors << prefix + QStringLiteral("La fréquence doit être de 30, 60, 120 ou 144 FPS.");
         const auto& v = profile.video;
         if (!((v.width == 1920 && v.height == 1080) || (v.width == 2560 && v.height == 1440) || (v.width == 3840 && v.height == 2160))) errors << prefix + QStringLiteral("Résolution non prise en charge.");
-        if (v.bitrateMbps < 5 || v.bitrateMbps > 150) errors << prefix + QStringLiteral("Le débit doit être compris entre 5 et 150 Mbit/s.");
+        if (v.bitrateMbps < 5 || v.bitrateMbps > 300) errors << prefix + QStringLiteral("Le débit doit être compris entre 5 et 300 Mbit/s.");
+        if (v.rateControl != "bitrate" && v.rateControl != "quality") errors << prefix + QStringLiteral("Mode de débit inconnu.");
+        if (v.quality < 10 || v.quality > 30) errors << prefix + QStringLiteral("Le niveau de qualité doit être compris entre 10 et 30.");
+        if (v.effort != "fast" && v.effort != "thorough") errors << prefix + QStringLiteral("Effort d'encodage inconnu.");
         if (v.codec != "h264" && v.codec != "hevc") errors << prefix + QStringLiteral("Codec inconnu.");
         if (!QStringList{"auto", "nvenc", "amf", "qsv", "vaapi"}.contains(v.encoder)) errors << prefix + QStringLiteral("Encodeur inconnu.");
         if (profile.replay.durationSeconds < 15 || profile.replay.durationSeconds > 600) errors << prefix + QStringLiteral("La durée doit être comprise entre 15 et 600 secondes.");
@@ -112,12 +128,14 @@ QJsonObject AppConfig::toJson() const {
         for (const auto& s : p.sources) sources.append(QJsonObject{{"id", s.id}, {"name", s.name}, {"kind", sourceKindKey(s.kind)}, {"targetId", s.targetId}, {"targetLabel", s.targetLabel}, {"trackId", s.trackId}, {"enabled", s.enabled}, {"excludedApplications", QJsonArray::fromStringList(s.excludedApplications)}, {"excludeSeparateApplications", s.excludeSeparateApplications}});
         profileArray.append(QJsonObject{
             {"id", p.id}, {"name", p.name}, {"gameName", p.gameName}, {"detectGame", p.detectGame},
-            {"video", QJsonObject{{"targetId", p.video.targetId}, {"targetLabel", p.video.targetLabel}, {"width", p.video.width}, {"height", p.video.height}, {"fps", p.video.fps}, {"bitrateMbps", p.video.bitrateMbps}, {"codec", p.video.codec}, {"encoder", p.video.encoder}, {"captureCursor", p.video.captureCursor}}},
+            {"video", QJsonObject{{"targetId", p.video.targetId}, {"targetLabel", p.video.targetLabel}, {"width", p.video.width}, {"height", p.video.height}, {"fps", p.video.fps}, {"bitrateMbps", p.video.bitrateMbps}, {"rateControl", p.video.rateControl}, {"quality", p.video.quality}, {"effort", p.video.effort}, {"codec", p.video.codec}, {"encoder", p.video.encoder}, {"captureCursor", p.video.captureCursor}}},
             {"replay", QJsonObject{{"durationSeconds", p.replay.durationSeconds}, {"memoryLimitMiB", p.replay.memoryLimitMiB}, {"hotkey", p.replay.hotkey}}},
             {"tracks", tracks}, {"sources", sources}
         });
     }
-    return {{"schemaVersion", 1}, {"audioRoutingVersion", 2}, {"libraryPath", libraryPath}, {"activeProfileId", activeProfileId}, {"profiles", profileArray}, {"clipSavedSound", clipSavedSound}, {"clipSavedNotification", clipSavedNotification}, {"playbackVolume", playbackVolume}, {"checkUpdates", checkUpdates}, {"discord", QJsonObject{{"limitBytes", discordLimitBytes}, {"codec", discordCodec}, {"autoResize", discordAutoResize}}}};
+    const auto levels = [](const TrackMix& mix) { QJsonObject object; for (auto track = mix.cbegin(); track != mix.cend(); ++track) object.insert(track.key(), track.value()); return object; };
+    QJsonArray history; for (const auto& exported : mixHistory) history.append(levels(exported));
+    return {{"mix", QJsonObject{{"levels", levels(defaultMix)}, {"history", history}, {"declined", levels(mixDeclined)}}}, {"schemaVersion", 1}, {"audioRoutingVersion", 2}, {"libraryPath", libraryPath}, {"activeProfileId", activeProfileId}, {"profiles", profileArray}, {"clipSavedSound", clipSavedSound}, {"clipSavedNotification", clipSavedNotification}, {"playbackVolume", playbackVolume}, {"checkUpdates", checkUpdates}, {"closeToTray", closeToTray}, {"trayNoticeShown", trayNoticeShown}, {"startMenuShortcut", startMenuShortcut}, {"discord", QJsonObject{{"limitBytes", discordLimitBytes}, {"codec", discordCodec}, {"autoResize", discordAutoResize}}}};
 }
 bool AppConfig::fromJson(const QJsonObject& object, AppConfig& result, QString& error) {
     if (object.value("schemaVersion").toInt(-1) != 1) { error = QStringLiteral("Version du fichier de configuration non prise en charge."); return false; }
@@ -126,7 +144,12 @@ bool AppConfig::fromJson(const QJsonObject& object, AppConfig& result, QString& 
     candidate.activeProfileId = object.value("activeProfileId").toString();
     candidate.clipSavedSound = object.value("clipSavedSound").toBool(true); candidate.clipSavedNotification = object.value("clipSavedNotification").toBool(true);
     candidate.playbackVolume = std::clamp(object.value("playbackVolume").toInt(100), 0, 100); candidate.checkUpdates = object.value("checkUpdates").toBool(true);
+    candidate.closeToTray = object.value("closeToTray").toBool(true); candidate.trayNoticeShown = object.value("trayNoticeShown").toBool(false); candidate.startMenuShortcut = object.value("startMenuShortcut").toBool(false);
     const auto discord = object.value("discord").toObject(); candidate.discordLimitBytes = discord.value("limitBytes").toInteger(20000000); candidate.discordCodec = discord.value("codec").toString("h264"); candidate.discordAutoResize = discord.value("autoResize").toBool(true);
+    // A level outside what the editor allows is not a setting: the track goes back to its recorded level.
+    const auto levels = [](const QJsonValue& value) { TrackMix mix; const auto object = value.toObject(); for (auto track = object.constBegin(); track != object.constEnd(); ++track) { const double level = track.value().toDouble(-1); if (level >= 0 && level <= 2 && !mixKey(track.key()).isEmpty()) mix.insert(mixKey(track.key()), level); } return mix; };
+    const auto mix = object.value("mix").toObject(); candidate.defaultMix = levels(mix.value("levels")); candidate.mixDeclined = levels(mix.value("declined"));
+    for (const auto& exported : mix.value("history").toArray()) rememberExport(candidate.mixHistory, levels(exported));
     if (candidate.discordLimitBytes < 100000 || candidate.discordLimitBytes > 10000000000LL || !QStringList{"h264", "hevc", "av1"}.contains(candidate.discordCodec)) { error = QStringLiteral("Réglages de partage Discord invalides."); return false; }
     for (const auto& value : object.value("profiles").toArray()) {
         const auto obj = value.toObject();
@@ -137,6 +160,7 @@ bool AppConfig::fromJson(const QJsonObject& object, AppConfig& result, QString& 
         p.video.targetId = v.value("targetId").toString(); p.video.targetLabel = v.value("targetLabel").toString();
         p.video.width = v.value("width").toInt(1920); p.video.height = v.value("height").toInt(1080);
         p.video.fps = v.value("fps").toInt(60); p.video.bitrateMbps = v.value("bitrateMbps").toInt(25);
+        p.video.rateControl = v.value("rateControl").toString("bitrate"); p.video.quality = v.value("quality").toInt(20); p.video.effort = v.value("effort").toString("fast");
         p.video.codec = v.value("codec").toString("h264"); p.video.encoder = v.value("encoder").toString("auto");
         p.video.captureCursor = v.value("captureCursor").toBool(false);
         const auto r = obj.value("replay").toObject();

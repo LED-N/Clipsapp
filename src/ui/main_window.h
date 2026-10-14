@@ -47,6 +47,10 @@ public:
     void manageStartMenu(const QString& programsDirectory);
     // Brings the window back from the notification area, as when the application is started again.
     void surface();
+    // The window of the application: closing it for good, from its icon or from an update, ends the program.
+    void quitWhenClosed();
+    // As "Quitter" in the menu of the icon: settings left unsaved are asked about first.
+    void quit();
 protected:
     void closeEvent(QCloseEvent* event) override;
     void showEvent(QShowEvent* event) override;
@@ -124,6 +128,6 @@ private:
     bool m_firstLaunch = false, m_relaunch = false;
     UpdateService* m_updates; Button* m_updateButton;
     QSystemTrayIcon* m_tray; QAction* m_traySave; QAction* m_trayToggle;
-    QString m_programs; bool m_quitting = false; TrackMix m_mixAsked;
+    QString m_programs; bool m_quitting = false, m_quitOnClose = false; TrackMix m_mixAsked;
 };
 }

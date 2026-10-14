@@ -24,7 +24,8 @@ int main(int argc, char** argv) {
     parser.addOption({"data-dir", QStringLiteral("Dossier de configuration alternatif"), "directory"});
     parser.addOption({"smoke-test", QStringLiteral("Vérifier le démarrage et la sauvegarde, puis quitter")});
     parser.addOption({"previews-dir", QStringLiteral("Dossier des captures de l'interface en mode smoke-test"), "directory"});
-    parser.addOption({"updated-from", QStringLiteral("Version remplacée par une mise à jour qui vient d'être installée"), "version"}); parser.process(application);
+    parser.addOption({"updated-from", QStringLiteral("Version remplacée par une mise à jour qui vient d'être installée"), "version"});
+    parser.addOption({"quit", QStringLiteral("Fermer la copie de Clipsapp en cours, comme « Quitter » dans le menu de son icône")}); parser.process(application);
     const bool smoke = parser.isSet("smoke-test");
     if (smoke && !parser.isSet("data-dir")) { std::fprintf(stderr, "Smoke tests require --data-dir to isolate settings.\n"); return 2; }
     const QString configDirectory = parser.isSet("data-dir") ? QDir(parser.value("data-dir")).absolutePath() : QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
@@ -47,7 +48,8 @@ int main(int argc, char** argv) {
     QLocalServer running; running.setSocketOptions(QLocalServer::UserAccessOption);
     if (!smoke) {
         QLocalSocket other; other.connectToServer(instance);
-        if (other.waitForConnected(300)) { other.write("show"); other.waitForBytesWritten(300); return 0; }
+        if (other.waitForConnected(300)) { other.write(parser.isSet("quit") ? "quit" : "show"); other.waitForBytesWritten(300); return 0; }
+        if (parser.isSet("quit")) return 0;
         running.listen(instance);
     }
     int code = 0; bool relaunch = false;
@@ -55,7 +57,16 @@ int main(int argc, char** argv) {
         clipsapp::MainWindow window(configDirectory);
         if (smoke) window.setAttribute(Qt::WA_DontShowOnScreen, true);
         else window.manageStartMenu(QStandardPaths::writableLocation(QStandardPaths::ApplicationsLocation));
-        QObject::connect(&running, &QLocalServer::newConnection, &window, [&running, &window] { while (auto* asking = running.nextPendingConnection()) asking->deleteLater(); window.surface(); });
+        // The copy started again says what it wants: to see the window, or the application to end.
+        QObject::connect(&running, &QLocalServer::newConnection, &window, [&running, &window] {
+            while (auto* asking = running.nextPendingConnection()) {
+                if (!asking->bytesAvailable()) asking->waitForReadyRead(200);
+                const bool quit = asking->readAll() == "quit"; asking->deleteLater();
+                if (quit) window.quit(); else window.surface();
+            }
+        });
+        // The application lasts as long as its window, even hidden behind its icon: not as long as the last window on screen.
+        if (!smoke) { application.setQuitOnLastWindowClosed(false); window.quitWhenClosed(); }
         window.show();
         if (!smoke && published) {
             window.followUpdates(QStringLiteral(CLIPSAPP_UPDATE_REPOSITORY));

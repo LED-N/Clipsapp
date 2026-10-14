@@ -118,7 +118,7 @@ MainWindow::MainWindow(QString configDirectory, QWidget* parent, ClipTrashOperat
     m_traySave = trayMenu->addAction(QStringLiteral("Sauvegarder le clip")); connect(m_traySave, &QAction::triggered, this, [this] { saveReplay(); });
     m_trayToggle = trayMenu->addAction(QString()); connect(m_trayToggle, &QAction::triggered, this, [this] { toggleCapture(); });
     trayMenu->addSeparator();
-    connect(trayMenu->addAction(QStringLiteral("Quitter Clipsapp")), &QAction::triggered, this, [this] { m_quitting = true; close(); });
+    connect(trayMenu->addAction(QStringLiteral("Quitter Clipsapp")), &QAction::triggered, this, [this] { quit(); });
     m_tray->setContextMenu(trayMenu);
 
     auto* root = new QWidget; setCentralWidget(root); auto* vertical = new QVBoxLayout(root); vertical->setContentsMargins(0, 0, 0, 0); vertical->setSpacing(0);
@@ -617,6 +617,8 @@ void MainWindow::manageStartMenu(const QString& programsDirectory) {
     // leads to another copy of the application is that copy's own, and is left alone.
     QString error; if (!m_programs.isEmpty() && m_saved.startMenuShortcut && !m_firstLaunch && !startMenuShortcutWorks(m_programs)) setStartMenuShortcut(m_programs, QCoreApplication::applicationFilePath(), true, error);
 }
+void MainWindow::quitWhenClosed() { m_quitOnClose = true; }
+void MainWindow::quit() { m_quitting = true; close(); }
 void MainWindow::surface() {
     setWindowState(windowState() & ~Qt::WindowMinimized); show(); raise(); activateWindow();
 }
@@ -655,6 +657,8 @@ void MainWindow::closeEvent(QCloseEvent* event) {
         if (choice <= 0 || (choice == 2 && !saveConfig(false))) { event->ignore(); return; }
     }
     m_tray->hide(); event->accept();
+    // A window hidden behind its icon is not counted by Qt when it closes: the application ends here.
+    if (m_quitOnClose) QCoreApplication::quit();
 }
 QJsonObject MainWindow::smokeReport() const {
     const auto& catalog = m_settings->catalog();

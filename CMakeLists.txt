@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(Clipsapp VERSION 0.8.1 LANGUAGES CXX)
+project(Clipsapp VERSION 0.8.2 LANGUAGES CXX)
 
 # The GitHub repository whose releases the published application follows for its updates,
 # written "owner/name". Left empty, the application never looks for updates.

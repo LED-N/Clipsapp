@@ -1,5 +1,15 @@
 # Journal des versions
 
+## 0.8.2
+
+**Correction**
+
+- **« Quitter » ferme vraiment Clipsapp** : en 0.8.1, quitter depuis l'icône de la zone de notification laissait le programme tourner en arrière-plan, sans fenêtre ni icône, avec son replay s'il était actif. Si cela vous est arrivé, fermez « Clipsapp » une fois dans le Gestionnaire des tâches, ou redémarrez le PC.
+
+**Nouveauté**
+
+- `Clipsapp.exe --quit` ferme la copie de Clipsapp en cours, comme « Quitter » dans le menu de son icône.
+
 ## 0.8.1
 
 **Nouveautés**

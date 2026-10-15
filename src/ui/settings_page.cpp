@@ -1,8 +1,13 @@
 #include "settings_page.h"
 #include "source_dialog.h"
+#include "clip_feedback.h"
 #include "widgets.h"
+#include "core/game_identity.h"
+#include <QCursor>
 #include <QDir>
+#include <QFileDialog>
 #include <QFileInfo>
+#include <QMenu>
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QJsonArray>
@@ -28,6 +33,16 @@ const Quality qualities[]{{"Légère", 1920, 1080, 30, 12, 0}, {"Équilibrée", 
 struct Level { int value; const char* name; };
 const Level levels[]{{26, "Légère"}, {23, "Bonne"}, {20, "Haute"}, {17, "Très haute"}, {14, "Quasi sans perte"}};
 QString help(const char* text) { return QStringLiteral("<qt>%1</qt>").arg(QString::fromUtf8(text).toHtmlEscaped()); }
+// A setting whose choices each do something of their own: what it is, then each choice on its
+// line, its name in bold, and what is worth knowing beyond them.
+struct Choice { const char* name; const char* effect; };
+QString choices(const char* intro, std::initializer_list<Choice> items, const char* outro = nullptr) {
+    const auto text = [](const char* value) { return QString::fromUtf8(value).toHtmlEscaped(); };
+    QString html = QStringLiteral("<qt><p style='margin:0'>%1</p>").arg(text(intro));
+    for (const auto& item : items) html += QStringLiteral("<p style='margin:6px 0 0 0'><b>%1</b><br>%2</p>").arg(text(item.name), text(item.effect));
+    if (outro) html += QStringLiteral("<p style='margin:6px 0 0 0; color:#A1AABA'>%1</p>").arg(text(outro));
+    return html + QStringLiteral("</qt>");
+}
 QString grouped(int value) { return QLocale(QLocale::French, QLocale::France).toString(value); }
 class Swatch final : public QWidget {
 public:
@@ -55,7 +70,7 @@ SettingsPage::SettingsPage(AppConfig& config, const QString& settingsPath, QWidg
     top->addWidget(label(QStringLiteral("Profil"), "lbl")); m_profiles = new ChoiceBox; m_profiles->setObjectName("profiles"); m_profiles->setFixedWidth(180); top->addWidget(m_profiles);
     m_duplicate = new Button(QStringLiteral("copy"), QStringLiteral("Dupliquer")); m_duplicate->setToolTip(QStringLiteral("Créer un profil à partir de celui-ci")); top->addWidget(m_duplicate); head->addLayout(top);
     auto* tabRow = new QHBoxLayout; tabRow->setSpacing(26); m_tabs = new QStackedWidget;
-    const QList<QPair<QString, QString>> tabs{{QStringLiteral("monitor"), QStringLiteral("Capture")}, {QStringLiteral("speaker"), QStringLiteral("Audio")}, {QStringLiteral("folder"), QStringLiteral("Fichiers et alertes")}};
+    const QList<QPair<QString, QString>> tabs{{QStringLiteral("monitor"), QStringLiteral("Capture")}, {QStringLiteral("speaker"), QStringLiteral("Audio")}, {QStringLiteral("toggle"), QStringLiteral("Général")}};
     for (int index = 0; index < tabs.size(); ++index) {
         auto* tab = new TabButton(tabs[index].first, tabs[index].second); tab->setObjectName(QStringLiteral("settings-tab-%1").arg(index)); tab->setChecked(index == 0); tabRow->addWidget(tab); m_tabButtons.append(tab);
         connect(tab, &QPushButton::clicked, this, [this, index] { showTab(index); });
@@ -64,7 +79,7 @@ SettingsPage::SettingsPage(AppConfig& config, const QString& settingsPath, QWidg
     auto* lockHost = new QVBoxLayout; lockHost->setContentsMargins(24, 16, 24, 0);
     m_lock = new Banner(Banner::Info, QStringLiteral("lock")); m_lock->setObjectName("settings-locked"); m_lock->setTexts(QStringLiteral("Le replay utilise ce profil"), QStringLiteral("Les réglages restent en lecture seule jusqu'à l'arrêt du replay. Rien n'est perdu."));
     auto* stop = new Button(QStringLiteral("stop"), QStringLiteral("Arrêter le replay pour modifier")); m_lock->actions()->addWidget(stop); m_lock->hide(); lockHost->addWidget(m_lock); layout->addLayout(lockHost);
-    m_tabs->addWidget(buildCaptureTab()); m_tabs->addWidget(buildAudioTab()); m_tabs->addWidget(buildFilesTab(settingsPath)); layout->addWidget(m_tabs, 1);
+    m_tabs->addWidget(buildCaptureTab()); m_tabs->addWidget(buildAudioTab()); m_tabs->addWidget(buildGeneralTab(settingsPath)); layout->addWidget(m_tabs, 1);
 
     m_saveBar = new QFrame; m_saveBar->setObjectName("savebar"); m_saveBar->setFixedHeight(60); m_saveBar->setStyleSheet(QStringLiteral("QFrame#savebar { background: #14181E; border: none; border-top: 1px solid #3B4553; }"));
     auto* bar = new QHBoxLayout(m_saveBar); bar->setContentsMargins(24, 0, 24, 0); bar->setSpacing(10);
@@ -114,32 +129,45 @@ QWidget* SettingsPage::buildCaptureTab() {
     m_resolution = new ChoiceBox; m_resolution->addItem(QStringLiteral("1080p · 1920 × 1080"), "1920x1080"); m_resolution->addItem(QStringLiteral("1440p · 2560 × 1440"), "2560x1440"); m_resolution->addItem(QStringLiteral("4K · 3840 × 2160"), "3840x2160");
     m_fps = new ChoiceBox; m_fps->setObjectName("fps"); for (const int rate : {30, 60, 120, 144}) m_fps->addItem(QStringLiteral("%1 FPS").arg(rate), rate);
     m_codec = new ChoiceBox; m_codec->addItem(QStringLiteral("H.264 · compatible"), "h264"); m_codec->addItem(QStringLiteral("HEVC · plus compact"), "hevc");
-    m_encoder = new ChoiceBox; m_encoder->addItem(QStringLiteral("Automatique"), "auto"); m_encoder->addItem("NVIDIA NVENC", "nvenc");
+    m_encoder = new ChoiceBox; m_encoder->setObjectName("encoder"); m_encoder->addItem(QStringLiteral("Automatique"), "auto"); m_encoder->addItem("NVIDIA NVENC", "nvenc");
 #ifdef Q_OS_WIN
     m_encoder->addItem("AMD AMF", "amf");
 #else
     m_encoder->addItem("VAAPI · AMD / Intel", "vaapi");
 #endif
-    m_encoder->addItem("Intel Quick Sync", "qsv");
     m_rateControl = new ChoiceBox; m_rateControl->setObjectName("rate-control"); m_rateControl->addItem(QStringLiteral("Débit cible"), "bitrate"); m_rateControl->addItem(QStringLiteral("Qualité constante"), "quality");
     m_bitrate = new QSpinBox; m_bitrate->setObjectName("bitrate"); m_bitrate->setRange(5, 300); m_bitrate->setSuffix(QStringLiteral(" Mbit/s")); m_bitrate->setButtonSymbols(QAbstractSpinBox::NoButtons); m_bitrate->setFont(monoFont(13));
     m_quality = new ChoiceBox; m_quality->setObjectName("quality-level"); for (const auto& level : levels) m_quality->addItem(QString::fromUtf8(level.name), level.value);
     m_effort = new ChoiceBox; m_effort->setObjectName("effort"); m_effort->addItem(QStringLiteral("Rapide · léger pour le GPU"), "fast"); m_effort->addItem(QStringLiteral("Soigné · compresse mieux"), "thorough");
     m_cursor = new Toggle(QStringLiteral("Masqué dans les clips")); auto* cursorHost = new QWidget; cursorHost->setFixedHeight(32); auto* cursorLayout = new QHBoxLayout(cursorHost); cursorLayout->setContentsMargins(0, 0, 0, 0); cursorLayout->addWidget(m_cursor);
     // Every advanced setting explains itself where the pointer rests, on its name as on its field.
-    const auto place = [grid](int row, int column, const QString& title, QWidget* widget, const char* text) {
-        auto* name = label(title, "lbl"); name->setToolTip(help(text)); widget->setToolTip(help(text));
+    const auto place = [grid](int row, int column, const QString& title, QWidget* widget, const QString& tip) {
+        auto* name = label(title, "lbl"); name->setToolTip(tip); widget->setToolTip(tip);
         auto* layout = new QVBoxLayout; layout->setSpacing(6); layout->addWidget(name); layout->addWidget(widget); grid->addLayout(layout, row, column); return name;
     };
-    place(0, 0, QStringLiteral("Résolution"), m_resolution, "Taille de l'image enregistrée. Un écran plus grand ou plus petit est mis à cette taille par la carte graphique.");
-    place(0, 1, QStringLiteral("Fréquence"), m_fps, "Nombre d'images par seconde. Plus il y en a, plus le mouvement est fluide : 120 ou 144 FPS suivent un écran rapide. À débit égal, chaque image reçoit moins de données, et la carte graphique travaille davantage ; si elle ne suit pas, la barre du replay le signale.");
-    place(1, 0, QStringLiteral("Codec"), m_codec, "H.264 se lit partout. HEVC garde la même qualité avec moins de données, mais certains logiciels et navigateurs ne le lisent pas.");
-    place(1, 1, QStringLiteral("Encodeur"), m_encoder, "Puce qui compresse la vidéo pendant le jeu. « Automatique » prend celle de votre carte graphique.");
-    place(2, 0, QStringLiteral("Mode de débit"), m_rateControl, "Débit cible : le poids des clips et la mémoire du replay sont prévisibles. Qualité constante : chaque scène reçoit ce qu'il lui faut ; une scène chargée pèse plus, une scène calme moins.");
-    m_bitrateLabel = place(2, 1, QStringLiteral("Débit vidéo"), m_bitrate, "Quantité de données par seconde de vidéo. Plus haut, l'image est plus fidèle, les clips plus lourds et le replay demande plus de mémoire. En qualité constante, c'est le plafond des scènes les plus chargées.");
-    place(3, 0, QStringLiteral("Effort d'encodage"), m_effort, "Rapide : sollicite le moins la carte graphique pendant le jeu. Soigné : compresse mieux à débit égal, ce qui se voit surtout aux débits modestes ; la carte graphique travaille davantage.");
-    m_qualityLabel = place(3, 1, QStringLiteral("Niveau de qualité"), m_quality, "Fidélité visée pour chaque image, en qualité constante. « Quasi sans perte » reste très proche de l'écran et donne des clips lourds, que vous pourrez toujours compresser au moment du partage.");
-    place(4, 0, QStringLiteral("Curseur"), cursorHost, "Affiche ou masque le pointeur de la souris dans les clips.");
+    place(0, 0, QStringLiteral("Résolution"), m_resolution, help("Taille de l'image enregistrée. Un écran plus grand ou plus petit est mis à cette taille par la carte graphique."));
+    place(0, 1, QStringLiteral("Fréquence"), m_fps, help("Nombre d'images par seconde. Plus il y en a, plus le mouvement est fluide : 120 ou 144 FPS suivent un écran rapide. À débit égal, chaque image reçoit moins de données, et la carte graphique travaille davantage ; si elle ne suit pas, la barre du replay le signale."));
+    place(1, 0, QStringLiteral("Codec"), m_codec, choices("Format de la vidéo enregistrée.", {
+        {"H.264 · compatible", "Se lit partout : navigateurs, téléphones, Discord, logiciels de montage."},
+        {"HEVC · plus compact", "Même qualité avec moins de données. Certains logiciels et navigateurs ne le lisent pas."}}));
+    place(1, 1, QStringLiteral("Encodeur"), m_encoder, choices("Puce de la carte graphique qui compresse la vidéo pendant le jeu.", {
+        {"Automatique", "Celle de votre carte graphique, NVIDIA ou AMD."},
+        {"NVIDIA NVENC", "Cartes GeForce et RTX."},
+        {"AMD AMF", "Cartes Radeon."}}));
+    place(2, 0, QStringLiteral("Mode de débit"), m_rateControl, choices("Comment la quantité de données est répartie dans la vidéo.", {
+        {"Débit cible", "Le poids des clips et la mémoire du replay sont prévisibles."},
+        {"Qualité constante", "Chaque scène reçoit ce qu'il lui faut : une scène chargée pèse plus, une scène calme moins."}}));
+    m_bitrateLabel = place(2, 1, QStringLiteral("Débit vidéo"), m_bitrate, choices("Quantité de données par seconde de vidéo. Plus haut, l'image est plus fidèle, les clips plus lourds et le replay demande plus de mémoire.", {
+        {"En débit cible", "Le débit visé par toute la vidéo."},
+        {"En qualité constante", "Le plafond des scènes les plus chargées."}}));
+    place(3, 0, QStringLiteral("Effort d'encodage"), m_effort, choices("Travail que la carte graphique consacre à compresser chaque image.", {
+        {"Rapide", "Sollicite le moins la carte graphique pendant le jeu."},
+        {"Soigné", "Compresse mieux à débit égal, ce qui se voit surtout aux débits modestes. La carte graphique travaille davantage."}}));
+    m_qualityLabel = place(3, 1, QStringLiteral("Niveau de qualité"), m_quality, choices("Fidélité visée pour chaque image, en qualité constante.", {
+        {"Légère, Bonne", "Clips légers : les détails fins sont adoucis."},
+        {"Haute, Très haute", "Un bon équilibre pour garder ses clips."},
+        {"Quasi sans perte", "Très proche de l'écran, pour retravailler les clips. Ils sont lourds : vous pourrez les compresser au moment du partage."}}));
+    place(4, 0, QStringLiteral("Curseur"), cursorHost, help("Affiche ou masque le pointeur de la souris dans les clips."));
     grid->setColumnStretch(0, 1); grid->setColumnStretch(1, 1); body->addWidget(m_advanced); m_advanced->hide(); left->addStretch();
 
     right->addWidget(section(QStringLiteral("Replay"), body, &m_replayTag));
@@ -161,7 +189,30 @@ QWidget* SettingsPage::buildCaptureTab() {
     m_hotkey = new QKeySequenceEdit; m_hotkey->setObjectName("replay-hotkey"); m_hotkey->setMaximumSequenceLength(1); m_hotkey->hide(); hotkeyRow->addWidget(m_hotkey);
     m_hotkeyChange = new Button(QStringLiteral("Changer"), Button::Secondary, Button::Small); hotkeyRow->addWidget(m_hotkeyChange); hotkeyRow->addStretch();
     auto* hotkeyGroup = new QVBoxLayout; hotkeyGroup->setSpacing(6); hotkeyGroup->addWidget(label(QStringLiteral("Raccourci pour sauvegarder"), "lbl")); hotkeyGroup->addLayout(hotkeyRow);
-    m_hotkeyHint = label(QStringLiteral("Fonctionne même quand le jeu est au premier plan."), "hint", true); hotkeyGroup->addWidget(m_hotkeyHint); body->addLayout(hotkeyGroup); right->addStretch();
+    m_hotkeyHint = label(QStringLiteral("Fonctionne même quand le jeu est au premier plan."), "hint", true); hotkeyGroup->addWidget(m_hotkeyHint); body->addLayout(hotkeyGroup);
+    // Screenshots take what the replay captures, with a shortcut of their own.
+    right->addWidget(section(QStringLiteral("Screenshots"), body));
+    auto* shotRow = new QHBoxLayout; shotRow->setSpacing(12); m_shotCaps = new Keycaps; shotRow->addWidget(m_shotCaps);
+    m_shotKey = new QKeySequenceEdit; m_shotKey->setObjectName("screenshot-hotkey"); m_shotKey->setMaximumSequenceLength(1); m_shotKey->hide(); shotRow->addWidget(m_shotKey);
+    m_shotChange = new Button(QStringLiteral("Changer"), Button::Secondary, Button::Small); m_shotChange->setObjectName("screenshot-hotkey-change"); shotRow->addWidget(m_shotChange); shotRow->addStretch();
+    auto* shotGroup = new QVBoxLayout; shotGroup->setSpacing(6); shotGroup->addWidget(label(QStringLiteral("Raccourci pour un screenshot"), "lbl")); shotGroup->addLayout(shotRow);
+    m_shotHint = label({}, "hint", true); shotGroup->addWidget(m_shotHint); body->addLayout(shotGroup);
+    const auto shotHint = [this](bool editing) { m_shotHint->setText(editing ? QStringLiteral("Appuyez sur la nouvelle combinaison de touches.") : QStringLiteral("L'écran ou la fenêtre choisis plus haut, en qualité native, dans le dossier « Screenshots ». Fonctionne que le replay tourne ou non.")); };
+    shotHint(false);
+    connect(m_shotChange, &QPushButton::clicked, this, [this, shotHint] {
+        const bool editing = m_shotKey->isVisible();
+        m_shotKey->setVisible(!editing); m_shotCaps->setVisible(editing); m_shotChange->setText(editing ? QStringLiteral("Changer") : QStringLiteral("Terminer")); shotHint(!editing);
+        if (!editing) m_shotKey->setFocus();
+    });
+    connect(m_shotKey, &QKeySequenceEdit::keySequenceChanged, this, [this] { m_shotCaps->setSequence(m_shotKey->keySequence()); if (m_shotKey->isVisible() && !m_shotKey->keySequence().isEmpty()) m_shotChange->click(); changed(); });
+    // Where a saved clip goes ends what the replay does: it sits under it.
+    right->addWidget(section(QStringLiteral("Dossier des clips et captures d'écran"), body));
+    auto* folderRow = new QHBoxLayout; folderRow->setSpacing(12); m_folder = new QLineEdit; m_folder->setObjectName("libraryPath"); m_folder->addAction(icon(QStringLiteral("folder")), QLineEdit::LeadingPosition); folderRow->addWidget(m_folder, 1);
+    auto* browse = new Button(QStringLiteral("Parcourir…")); browse->setObjectName("library-browse"); folderRow->addWidget(browse); body->addLayout(folderRow);
+    body->addWidget(label(QStringLiteral("Un sous-dossier par jeu suffit pour classer. Les captures d'écran vont dans « Screenshots », les copies Discord dans « Partage Discord ». Formats lus : MP4, MKV, WebM, MOV, AVI ; PNG, JPEG, WebP, BMP."), "hint", true));
+    connect(browse, &QPushButton::clicked, this, &SettingsPage::chooseFolderRequested);
+    connect(m_folder, &QLineEdit::textChanged, this, [this] { changed(); });
+    right->addStretch();
 
     connect(m_advancedToggle, &QPushButton::clicked, this, [this] { m_advanced->setVisible(!m_advanced->isVisible()); m_advancedToggle->setIconName(m_advanced->isVisible() ? QStringLiteral("down") : QStringLiteral("next")); });
     connect(m_gameName, &QLineEdit::textChanged, this, [this] { changed(); });
@@ -189,19 +240,46 @@ QWidget* SettingsPage::buildAudioTab() {
     m_lanes = new QVBoxLayout; m_lanes->setSpacing(10); layout->addLayout(m_lanes);
     auto* dashed = new DashedButton(QStringLiteral("plus"), QStringLiteral("Ajouter une source ou une piste")); layout->addWidget(dashed);
     auto* notes = new QHBoxLayout; notes->setSpacing(8); notes->addWidget(new IconLabel(QStringLiteral("info"), tk::text2, 14), 0, Qt::AlignTop); m_sourceNotes = label({}, "hint", true); notes->addWidget(m_sourceNotes, 1); layout->addLayout(notes); layout->addStretch();
+    // The levels of a game's clips, learnt from its exports or kept from the editor: listed, to be forgotten.
+    m_gameMixHost = new QWidget; auto* gameMixLayout = new QVBoxLayout(m_gameMixHost); gameMixLayout->setContentsMargins(0, 8, 0, 0); gameMixLayout->setSpacing(8);
+    gameMixLayout->addWidget(label(QStringLiteral("Volumes par jeu"), "h2"));
+    gameMixLayout->addWidget(label(QStringLiteral("Les clips de ces jeux s'ouvrent avec leurs propres volumes ; les pistes qui n'y figurent pas gardent leur volume habituel. Oublier un jeu le ramène aux volumes habituels."), "hint", true));
+    auto* gameMixWell = card("well"); gameMixWell->setObjectName("game-mixes"); m_gameMixes = new QVBoxLayout(gameMixWell); m_gameMixes->setContentsMargins(1, 4, 1, 4); m_gameMixes->setSpacing(0); gameMixLayout->addWidget(gameMixWell);
+    layout->insertWidget(layout->count() - 1, m_gameMixHost); m_gameMixHost->hide();
     connect(refresh, &QPushButton::clicked, this, [this] { collect(); refreshCatalog(); populateSources(); emit notice(QStringLiteral("Sources audio actualisées"), {}); });
     connect(add, &QPushButton::clicked, this, [this] { editSource(-1); }); connect(dashed, &QPushButton::clicked, this, [this] { editSource(-1); });
     return scrolled(content);
 }
-QWidget* SettingsPage::buildFilesTab(const QString& settingsPath) {
+QWidget* SettingsPage::buildGeneralTab(const QString& settingsPath) {
     auto* content = new QWidget; auto* outer = new QHBoxLayout(content); outer->setContentsMargins(24, 16, 24, 16);
     auto* column = new QWidget; column->setMaximumWidth(820); auto* layout = new QVBoxLayout(column); layout->setContentsMargins(0, 0, 0, 0); layout->setSpacing(16); outer->addWidget(column, 1); outer->addStretch(0);
-    QVBoxLayout* body; layout->addWidget(section(QStringLiteral("Dossier des clips"), body));
-    auto* row = new QHBoxLayout; row->setSpacing(12); m_folder = new QLineEdit; m_folder->setObjectName("libraryPath"); m_folder->addAction(icon(QStringLiteral("folder")), QLineEdit::LeadingPosition); row->addWidget(m_folder, 1);
-    auto* browse = new Button(QStringLiteral("Parcourir…")); row->addWidget(browse); body->addLayout(row);
-    body->addWidget(label(QStringLiteral("Un sous-dossier par jeu suffit pour classer. Les copies Discord vont dans « Partage Discord ». Formats lus : MP4, MKV, WebM, MOV, AVI."), "hint", true));
-    layout->addWidget(section(QStringLiteral("Après chaque sauvegarde"), body)); body->setSpacing(12);
-    m_savedSound = new Toggle(QStringLiteral("Jouer un son bref")); m_savedSound->setObjectName("clip-saved-sound"); body->addWidget(m_savedSound);
+    QVBoxLayout* body; layout->addWidget(section(QStringLiteral("Après chaque sauvegarde"), body)); body->setSpacing(12);
+    // A sound for each kind of saving, each with its level, heard as chosen: the game usually covers
+    // it, so it is tried here first.
+    const auto soundRow = [this, body](const QString& text, const QString& name, QCheckBox*& toggle, QWidget*& options, QComboBox*& choice, QSlider*& volume, QLabel*& percent) {
+        toggle = new Toggle(text); toggle->setObjectName(name); body->addWidget(toggle);
+        options = new QWidget; auto* row = new QHBoxLayout(options); row->setContentsMargins(46, 0, 0, 0); row->setSpacing(12);
+        choice = new ChoiceBox; choice->setObjectName(name + QStringLiteral("-choice")); choice->setFixedWidth(200);
+        for (const auto& cue : clipSavedSounds()) choice->addItem(cue.name, cue.id);
+        row->addWidget(choice);
+        auto* quiet = new IconLabel(QStringLiteral("speaker"), tk::text2, 14); quiet->setToolTip(QStringLiteral("Volume du son")); row->addWidget(quiet);
+        volume = new QSlider(Qt::Horizontal); volume->setObjectName(name + QStringLiteral("-volume")); volume->setRange(0, 100); volume->setPageStep(10); volume->setMinimumWidth(140); volume->setAccessibleName(QStringLiteral("Volume : ") + text);
+        row->addWidget(volume, 1);
+        percent = monoLabel(QStringLiteral("50 %"), 12, tk::text2); percent->setFixedWidth(44); percent->setAlignment(Qt::AlignRight | Qt::AlignVCenter); row->addWidget(percent);
+        auto* listen = new Button(QStringLiteral("play"), QStringLiteral("Écouter"), Button::Secondary, Button::Small); listen->setObjectName(name + QStringLiteral("-preview")); row->addWidget(listen);
+        body->addWidget(options);
+        auto* sound = choice; auto* level = volume; auto* shown = percent;
+        const auto preview = [sound, level] { playClipSavedSound(sound->currentData().toString(), level->value()); };
+        connect(listen, &QPushButton::clicked, this, preview);
+        // A sound picked, or a level let go of, is heard at once.
+        connect(sound, &QComboBox::activated, this, preview);
+        connect(level, &QSlider::sliderReleased, this, preview);
+        connect(level, &QSlider::valueChanged, this, [this, shown](int value) { shown->setText(QStringLiteral("%1 %").arg(value)); changed(); });
+        connect(sound, &QComboBox::currentIndexChanged, this, [this] { changed(); });
+        connect(toggle, &QCheckBox::toggled, options, &QWidget::setEnabled);
+    };
+    soundRow(QStringLiteral("Jouer un son pour un clip"), QStringLiteral("clip-saved-sound"), m_savedSound, m_soundOptions, m_sound, m_soundVolume, m_soundPercent);
+    soundRow(QStringLiteral("Jouer un son pour un screenshot"), QStringLiteral("screenshot-sound"), m_shotSound, m_shotSoundOptions, m_shotSoundChoice, m_shotVolume, m_shotPercent);
 #ifdef Q_OS_WIN
     m_savedNotify = new Toggle(QStringLiteral("Afficher une notification Windows"));
 #else
@@ -213,6 +291,27 @@ QWidget* SettingsPage::buildFilesTab(const QString& settingsPath) {
     body->addWidget(label(QStringLiteral("Le replay continue de tourner, sans fenêtre ouverte. Un clic sur l'icône, près de l'horloge, rouvre Clipsapp ; un clic droit propose de sauvegarder un clip ou de quitter."), "hint", true));
     // Shown only where the application manages its shortcut: a build under test has none.
     m_startMenu = new Toggle(QStringLiteral("Afficher Clipsapp dans le menu Démarrer")); m_startMenu->setObjectName("start-menu"); m_startMenu->hide(); body->addWidget(m_startMenu);
+    // Nothing here starts by itself unless the user asks: both settings are off at first.
+    layout->addWidget(section(QStringLiteral("Démarrage automatique"), body)); body->setSpacing(12);
+#ifdef Q_OS_WIN
+    m_loginStart = new Toggle(QStringLiteral("Lancer Clipsapp à l'ouverture de la session Windows"));
+#else
+    m_loginStart = new Toggle(QStringLiteral("Lancer Clipsapp à l'ouverture de la session"));
+#endif
+    m_loginStart->setObjectName("login-start"); body->addWidget(m_loginStart);
+    m_loginHint = label(QStringLiteral("Clipsapp s'ouvre discrètement, dans la zone de notification, si sa fenêtre peut s'y ranger."), "hint", true); body->addWidget(m_loginHint);
+    m_loginStart->hide(); m_loginHint->hide();
+    m_autoReplay = new ChoiceBox; m_autoReplay->setObjectName("auto-replay"); m_autoReplay->setFixedWidth(320);
+    m_autoReplay->addItem(QStringLiteral("Désactivé · je le démarre moi-même"), "off"); m_autoReplay->addItem(QStringLiteral("Dès le lancement de Clipsapp"), "launch"); m_autoReplay->addItem(QStringLiteral("Quand un de mes jeux est ouvert"), "games");
+    body->addLayout(field(QStringLiteral("Replay automatique"), m_autoReplay));
+    m_autoHint = label({}, "hint", true); m_autoHint->setObjectName("auto-replay-hint"); body->addWidget(m_autoHint);
+    m_gamesHost = new QWidget; auto* gamesLayout = new QVBoxLayout(m_gamesHost); gamesLayout->setContentsMargins(0, 0, 0, 0); gamesLayout->setSpacing(8);
+    auto* gamesWell = card("well"); gamesWell->setObjectName("replay-games"); m_games = new QVBoxLayout(gamesWell); m_games->setContentsMargins(1, 4, 1, 4); m_games->setSpacing(0); gamesLayout->addWidget(gamesWell);
+    m_gamesEmpty = label(QStringLiteral("Aucun jeu choisi : ajoutez ceux dont l'ouverture démarre le replay."), "hint", true); m_gamesEmpty->setContentsMargins(12, 8, 12, 8); m_games->addWidget(m_gamesEmpty);
+    auto* addGame = new Button(QStringLiteral("plus"), QStringLiteral("Ajouter un jeu"), Button::Secondary, Button::Small); addGame->setObjectName("add-replay-game"); gamesLayout->addWidget(addGame, 0, Qt::AlignLeft);
+    body->addWidget(m_gamesHost); m_gamesHost->hide();
+    connect(addGame, &QPushButton::clicked, this, [this] { chooseGame(); });
+    connect(m_autoReplay, &QComboBox::currentIndexChanged, this, [this] { changed(); populateGames(); });
     // Shown only in a build that follows a repository: without one there is nothing to check.
     m_updateSection = section(QStringLiteral("Mises à jour"), body); body->setSpacing(10); m_updateSection->hide(); layout->addWidget(m_updateSection);
     m_checkUpdates = new Toggle(QStringLiteral("Vérifier au lancement si une nouvelle version existe")); m_checkUpdates->setObjectName("check-updates"); body->addWidget(m_checkUpdates);
@@ -223,13 +322,85 @@ QWidget* SettingsPage::buildFilesTab(const QString& settingsPath) {
     layout->addWidget(section(QStringLiteral("Sur ce PC"), body)); body->setSpacing(10);
     body->addWidget(label(QStringLiteral("Clipsapp fonctionne sans compte, sans publicité et sans télémétrie. Vos clips et vos réglages ne quittent pas cet ordinateur."), nullptr, true));
     auto* pathRow = new QHBoxLayout; pathRow->setSpacing(12); auto* path = new ElideLabel(QDir::toNativeSeparators(settingsPath), "small", Qt::ElideMiddle); path->setFont(monoFont(12)); pathRow->addWidget(path, 1);
-    auto* openFolder = new Button(QStringLiteral("folder"), QStringLiteral("Ouvrir le dossier"), Button::Secondary, Button::Small); pathRow->addWidget(openFolder); body->addLayout(pathRow); layout->addStretch();
-    connect(browse, &QPushButton::clicked, this, &SettingsPage::chooseFolderRequested); connect(openFolder, &QPushButton::clicked, this, &SettingsPage::openSettingsFolderRequested);
-    connect(m_folder, &QLineEdit::textChanged, this, [this] { changed(); });
-    for (auto* toggle : {m_savedSound, m_savedNotify, m_checkUpdates, m_closeToTray, m_startMenu}) connect(toggle, &QCheckBox::toggled, this, [this] { changed(); });
+    auto* openFolder = new Button(QStringLiteral("folder"), QStringLiteral("Ouvrir le dossier"), Button::Secondary, Button::Small); pathRow->addWidget(openFolder); body->addLayout(pathRow);
+    // The journal stays here too. A diagnostic is what a report of a problem needs, copied on purpose.
+    auto* journalRow = new QHBoxLayout; journalRow->setSpacing(12);
+    journalRow->addWidget(label(QStringLiteral("Un journal de ce que fait Clipsapp est gardé dans le sous-dossier « logs », 2 Mo au plus. Rien n'est envoyé : « Copier le diagnostic » le met dans le presse-papiers, sans le nom de votre dossier personnel, pour le joindre à un signalement."), "hint", true), 1);
+    auto* diagnostic = new Button(QStringLiteral("copy"), QStringLiteral("Copier le diagnostic"), Button::Secondary, Button::Small); diagnostic->setObjectName("copy-diagnostic"); journalRow->addWidget(diagnostic, 0, Qt::AlignTop); body->addLayout(journalRow); layout->addStretch();
+    connect(openFolder, &QPushButton::clicked, this, &SettingsPage::openSettingsFolderRequested);
+    connect(diagnostic, &QPushButton::clicked, this, &SettingsPage::copyDiagnosticRequested);
+    for (auto* toggle : {m_savedSound, m_shotSound, m_savedNotify, m_checkUpdates, m_closeToTray, m_startMenu, m_loginStart}) connect(toggle, &QCheckBox::toggled, this, [this] { changed(); });
     return scrolled(content);
 }
 void SettingsPage::setStartMenu(bool managed) { m_startMenu->setVisible(managed); }
+void SettingsPage::setLoginStart(bool managed) { m_loginStart->setVisible(managed); m_loginHint->setVisible(managed); }
+void SettingsPage::addReplayGame(const QString& executable) {
+    const auto path = QDir::fromNativeSeparators(executable.trimmed());
+    if (path.isEmpty() || m_config.replayGames.contains(path, Qt::CaseInsensitive) || m_config.replayGames.size() >= 64) return;
+    m_config.replayGames.append(path); populateGames(); changed();
+}
+void SettingsPage::chooseGame() {
+    // The programs that have a window open now come first: a game is usually running when it is added.
+    QMenu menu(this); menu.setObjectName("replay-game-menu"); QSet<QString> offered;
+    for (const auto& target : SourceCatalog::discover().videoTargets) {
+        if (!target.id.startsWith(QLatin1String("window:"))) continue;
+        const auto path = target.id.mid(7).section('|', 0, 0); const auto identity = path.toCaseFolded();
+        if (offered.contains(identity) || m_config.replayGames.contains(path, Qt::CaseInsensitive)) continue;
+        offered.insert(identity);
+        const auto title = target.id.section('|', 1); const auto name = gameNameFromApplication(path, title);
+        auto* action = menu.addAction(icon(QStringLiteral("window")), QStringLiteral("%1 · %2").arg(name.isEmpty() ? title : name, QFileInfo(path).fileName()));
+        connect(action, &QAction::triggered, this, [this, path] { addReplayGame(path); });
+    }
+    if (offered.isEmpty()) menu.addAction(QStringLiteral("Aucune autre application ouverte"))->setEnabled(false);
+    menu.addSeparator();
+    connect(menu.addAction(icon(QStringLiteral("folder")), QStringLiteral("Choisir le programme du jeu…")), &QAction::triggered, this, [this] {
+#ifdef Q_OS_WIN
+        const auto path = QFileDialog::getOpenFileName(this, QStringLiteral("Programme du jeu"), QString(), QStringLiteral("Programmes (*.exe)"));
+#else
+        const auto path = QFileDialog::getOpenFileName(this, QStringLiteral("Programme du jeu"));
+#endif
+        addReplayGame(path);
+    });
+    auto* button = findChild<QWidget*>("add-replay-game"); menu.exec(button ? button->mapToGlobal(QPoint(0, button->height() + 4)) : QCursor::pos());
+}
+void SettingsPage::populateGameMixes() {
+    while (auto* child = m_gameMixes->takeAt(0)) { if (child->widget()) { child->widget()->hide(); child->widget()->deleteLater(); } delete child; }
+    m_gameMixHost->setVisible(!m_config.gameMixes.isEmpty());
+    int index = 0;
+    for (auto game = m_config.gameMixes.cbegin(); game != m_config.gameMixes.cend(); ++game, ++index) {
+        // Tracks are kept by their folded name: the profile gives back the way it is written.
+        QStringList levels;
+        for (auto track = game->cbegin(); track != game->cend(); ++track) {
+            QString name = track.key(); for (const auto& known : m_config.profiles) for (const auto& candidate : known.tracks) if (mixKey(candidate.name) == track.key()) name = candidate.name;
+            levels << QStringLiteral("%1 %2 %").arg(name).arg(qRound(track.value() * 100));
+        }
+        auto* row = new QWidget; row->setObjectName(QStringLiteral("game-mix-%1").arg(index)); row->setFixedHeight(48); auto* rowLayout = new QHBoxLayout(row); rowLayout->setContentsMargins(12, 0, 8, 0); rowLayout->setSpacing(10);
+        rowLayout->addWidget(new IconBox(QStringLiteral("speaker")));
+        auto* texts = new QVBoxLayout; texts->setSpacing(0); texts->addStretch(); texts->addWidget(new ElideLabel(game.key(), "strong")); texts->addWidget(new ElideLabel(levels.join(QStringLiteral(" · ")), "small")); texts->addStretch(); rowLayout->addLayout(texts, 1);
+        auto* forget = new Button(QStringLiteral("undo"), QStringLiteral("Oublier"), Button::Ghost, Button::Small); forget->setObjectName(QStringLiteral("forget-game-mix-%1").arg(index)); forget->setToolTip(QStringLiteral("Les clips %1 reprennent les volumes habituels").arg(game.key())); rowLayout->addWidget(forget);
+        const auto name = game.key(); connect(forget, &QPushButton::clicked, this, [this, name] { m_config.gameMixes.remove(name); m_config.gameMixHistory.remove(name); populateGameMixes(); changed(); });
+        m_gameMixes->addWidget(row);
+    }
+}
+void SettingsPage::populateGames() {
+    const auto mode = m_autoReplay->currentData().toString();
+    m_autoHint->setText(mode == QLatin1String("launch") ? QStringLiteral("Le replay démarre avec Clipsapp. Il enregistre l'écran choisi dans Capture, ou l'écran principal si c'est une fenêtre qui y est choisie.")
+        : mode == QLatin1String("games") ? QStringLiteral("Le replay démarre à l'ouverture d'un de ces jeux et s'arrête 30 secondes après sa fermeture. Il enregistre l'écran choisi dans Capture, ou l'écran principal si c'est une fenêtre qui y est choisie.")
+        : QStringLiteral("Le replay démarre quand vous le lancez, depuis la barre du haut ou l'icône près de l'horloge."));
+    m_gamesHost->setVisible(mode == QLatin1String("games"));
+    while (m_games->count() > 1) { auto* child = m_games->takeAt(1); if (child->widget()) { child->widget()->hide(); child->widget()->deleteLater(); } delete child; }
+    m_gamesEmpty->setVisible(m_config.replayGames.isEmpty());
+    for (int index = 0; index < m_config.replayGames.size(); ++index) {
+        const auto path = m_config.replayGames[index]; const auto name = gameNameFromApplication(path, {});
+        auto* row = new QWidget; row->setObjectName(QStringLiteral("replay-game-%1").arg(index)); row->setFixedHeight(48); auto* rowLayout = new QHBoxLayout(row); rowLayout->setContentsMargins(12, 0, 8, 0); rowLayout->setSpacing(10);
+        rowLayout->addWidget(new IconBox(QStringLiteral("app")));
+        auto* texts = new QVBoxLayout; texts->setSpacing(0); texts->addStretch(); texts->addWidget(new ElideLabel(name.isEmpty() ? QFileInfo(path).completeBaseName() : name, "strong"));
+        texts->addWidget(new ElideLabel(QDir::toNativeSeparators(path), "small", Qt::ElideMiddle)); texts->addStretch(); rowLayout->addLayout(texts, 1);
+        auto* remove = new Button(QStringLiteral("x"), QString(), Button::Ghost, Button::Small); remove->setObjectName(QStringLiteral("remove-replay-game-%1").arg(index)); remove->setToolTip(QStringLiteral("Ne plus démarrer le replay avec ce jeu")); remove->setAccessibleName(remove->toolTip()); rowLayout->addWidget(remove);
+        connect(remove, &QPushButton::clicked, this, [this, path] { m_config.replayGames.removeAll(path); populateGames(); changed(); });
+        m_games->addWidget(row);
+    }
+}
 void SettingsPage::setUpdates(bool followed, const QString& version) { m_updateSection->setVisible(followed); m_version->setText(QStringLiteral("Version installée : %1").arg(version)); }
 void SettingsPage::showTab(int index) { if (index < 0 || index >= m_tabs->count()) return; m_tabs->setCurrentIndex(index); for (int tab = 0; tab < m_tabButtons.size(); ++tab) static_cast<QPushButton*>(m_tabButtons[tab])->setChecked(tab == index); }
 int SettingsPage::currentTab() const { return m_tabs->currentIndex(); }
@@ -283,7 +454,11 @@ void SettingsPage::load() {
     if (memoryIndex < 0) { memoryIndex = 0; while (memoryIndex < m_memory->count() && m_memory->itemData(memoryIndex).toInt() < p.replay.memoryLimitMiB) ++memoryIndex; m_memory->insertItem(memoryIndex, grouped(p.replay.memoryLimitMiB) + QStringLiteral(" Mio"), p.replay.memoryLimitMiB); }
     m_memory->setCurrentIndex(memoryIndex); m_hotkey->setKeySequence(QKeySequence::fromString(p.replay.hotkey, QKeySequence::PortableText)); updateHotkey();
     setFolder(m_config.libraryPath); m_savedSound->setChecked(m_config.clipSavedSound); m_savedNotify->setChecked(m_config.clipSavedNotification); m_checkUpdates->setChecked(m_config.checkUpdates);
+    m_sound->setCurrentIndex(std::max(0, m_sound->findData(m_config.clipSavedSoundId))); m_soundVolume->setValue(m_config.clipSavedSoundVolume); m_soundPercent->setText(QStringLiteral("%1 %").arg(m_config.clipSavedSoundVolume)); m_soundOptions->setEnabled(m_config.clipSavedSound);
+    m_shotSound->setChecked(m_config.screenshotSound); m_shotSoundChoice->setCurrentIndex(std::max(0, m_shotSoundChoice->findData(m_config.screenshotSoundId))); m_shotVolume->setValue(m_config.screenshotSoundVolume); m_shotPercent->setText(QStringLiteral("%1 %").arg(m_config.screenshotSoundVolume)); m_shotSoundOptions->setEnabled(m_config.screenshotSound);
+    m_shotKey->setKeySequence(QKeySequence::fromString(m_config.screenshotHotkey, QKeySequence::PortableText)); m_shotCaps->setSequence(m_shotKey->keySequence()); populateGameMixes();
     m_closeToTray->setChecked(m_config.closeToTray); m_startMenu->setChecked(m_config.startMenuShortcut);
+    m_loginStart->setChecked(m_config.launchAtLogin); m_autoReplay->setCurrentIndex(std::max(0, m_autoReplay->findData(m_config.autoReplay))); populateGames();
     populateSources(); m_loading = false; updateEstimate(); updateQuality(); refreshDirty();
     bool preset = false; for (auto* tile : m_presets) preset |= tile->isChecked();
     if (!preset && !m_advanced->isVisible()) { m_advanced->show(); m_advancedToggle->setIconName(QStringLiteral("down")); }
@@ -299,7 +474,11 @@ void SettingsPage::collect() {
     p.replay.durationSeconds = m_duration->value(); p.replay.memoryLimitMiB = m_memory->currentData().toInt(); p.replay.hotkey = m_hotkey->keySequence().toString(QKeySequence::PortableText);
     m_config.libraryPath = QDir::fromNativeSeparators(m_folder->text().trimmed());
     m_config.clipSavedSound = m_savedSound->isChecked(); m_config.clipSavedNotification = m_savedNotify->isChecked(); m_config.checkUpdates = m_checkUpdates->isChecked();
+    m_config.clipSavedSoundId = m_sound->currentData().toString(); m_config.clipSavedSoundVolume = m_soundVolume->value();
+    m_config.screenshotSound = m_shotSound->isChecked(); m_config.screenshotSoundId = m_shotSoundChoice->currentData().toString(); m_config.screenshotSoundVolume = m_shotVolume->value();
+    m_config.screenshotHotkey = m_shotKey->keySequence().toString(QKeySequence::PortableText);
     m_config.closeToTray = m_closeToTray->isChecked(); m_config.startMenuShortcut = m_startMenu->isChecked();
+    m_config.launchAtLogin = m_loginStart->isChecked(); m_config.autoReplay = m_autoReplay->currentData().toString();
 }
 void SettingsPage::updateHotkey() { m_hotkeyCaps->setSequence(m_hotkey->keySequence()); if (m_hotkey->isVisible() && !m_hotkey->keySequence().isEmpty()) m_hotkeyChange->click(); }
 void SettingsPage::updateQuality() {
@@ -421,9 +600,14 @@ void SettingsPage::refreshDirty() {
     note(m_config.activeProfileId != m_saved.activeProfileId && saved, QStringLiteral("profil actif"));
     note(m_config.libraryPath != m_saved.libraryPath, QStringLiteral("dossier des clips"));
     note(m_config.clipSavedSound != m_saved.clipSavedSound || m_config.clipSavedNotification != m_saved.clipSavedNotification, QStringLiteral("alertes"));
+    note(m_config.clipSavedSoundId != m_saved.clipSavedSoundId || m_config.clipSavedSoundVolume != m_saved.clipSavedSoundVolume, QStringLiteral("son de sauvegarde"));
+    note(m_config.screenshotSound != m_saved.screenshotSound || m_config.screenshotSoundId != m_saved.screenshotSoundId || m_config.screenshotSoundVolume != m_saved.screenshotSoundVolume, QStringLiteral("son des screenshots"));
+    note(m_config.screenshotHotkey != m_saved.screenshotHotkey, QStringLiteral("raccourci des screenshots"));
+    note(m_config.gameMixes != m_saved.gameMixes, QStringLiteral("volumes par jeu"));
     note(m_config.checkUpdates != m_saved.checkUpdates, QStringLiteral("mises à jour"));
     note(!sameMix(m_config.defaultMix, m_saved.defaultMix), QStringLiteral("volumes habituels"));
     note(m_config.closeToTray != m_saved.closeToTray, QStringLiteral("fermeture de la fenêtre")); note(m_config.startMenuShortcut != m_saved.startMenuShortcut, QStringLiteral("menu Démarrer"));
+    note(m_config.launchAtLogin != m_saved.launchAtLogin, QStringLiteral("lancement avec la session")); note(m_config.autoReplay != m_saved.autoReplay || m_config.replayGames != m_saved.replayGames, QStringLiteral("replay automatique"));
     if (!count && m_config.toJson() != m_saved.toJson()) { count = 1; groups.append(QStringLiteral("réglages")); }
     m_captureTag->setVisible(capture); m_qualityTag->setVisible(quality); m_replayTag->setVisible(replay);
     m_dirtyTitle->setText(count > 1 ? QStringLiteral("%1 modifications non enregistrées").arg(count) : QStringLiteral("1 modification non enregistrée"));

@@ -143,7 +143,7 @@ void ClipViewer::updatePlayer() {
     const auto state = m_player.snapshot();
     if (!state.error.isEmpty()) { if (m_message != state.error) { m_message = state.error; m_image = {}; update(); setControlsVisible(true); } return; }
     if (state.loaded && !m_ready) {
-        m_ready = true; m_frame = state.info.size; m_current = m_edit && validateEdit(state.info, *m_edit).isEmpty() ? *m_edit : defaultEdit(state.info, m_mix);
+        m_ready = true; m_frame = state.info.size; m_current = m_edit && validateEdit(state.info, *m_edit).isEmpty() ? *m_edit : defaultEdit(state.info, m_mixFor ? m_mixFor(state.info.path) : m_mix);
         m_player.setEdit(m_current); if (m_start > m_current.startMs) m_player.seek(m_start);
         { QSignalBlocker blocker(m_seek); m_seek->setRange(0, int(std::max<qint64>(1, m_current.endMs - m_current.startMs))); }
         m_total->setText(clock(m_current.endMs - m_current.startMs)); m_player.setPlaying(true); emit viewed(currentPath()); return;

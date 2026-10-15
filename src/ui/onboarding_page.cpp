@@ -36,7 +36,7 @@ OnboardingPage::OnboardingPage(AppConfig& config, QWidget* parent) : QWidget(par
     auto* intro = new QVBoxLayout; intro->setSpacing(6); m_progress = caption({}); m_progress->setStyleSheet(QStringLiteral("color: #6FE3B4;")); intro->addWidget(m_progress);
     intro->addWidget(label(QStringLiteral("Bienvenue dans Clipsapp"), "display")); auto* lead = label(QStringLiteral("Quatre choix, puis le replay peut tourner. Vos clips restent sur ce PC."), "t2"); lead->setFont(uiFont(14)); intro->addWidget(lead);
     layout->addLayout(intro); layout->addSpacing(10);
-    const QStringList titles{QStringLiteral("Dossier des clips"), QStringLiteral("Ce que vous capturez"), QStringLiteral("Les sons"), QStringLiteral("Raccourci de sauvegarde")};
+    const QStringList titles{QStringLiteral("Dossier des clips et captures d'écran"), QStringLiteral("Ce que vous capturez"), QStringLiteral("Les sons"), QStringLiteral("Raccourci de sauvegarde")};
     QList<QVBoxLayout*> bodies; QList<QHBoxLayout*> heads;
     for (int index = 0; index < 4; ++index) {
         auto* frame = new StepFrame(index + 1); auto* frameLayout = new QVBoxLayout(frame); frameLayout->setContentsMargins(56, 14, 16, 14); frameLayout->setSpacing(12);

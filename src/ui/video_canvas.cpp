@@ -168,14 +168,14 @@ QRect VideoCanvas::dragged() const {
     return rect.intersected(bounds);
 }
 void VideoCanvas::mousePressEvent(QMouseEvent* event) {
-    if (!m_tool || !isEnabled() || m_image.isNull() || event->button() != Qt::LeftButton) return;
+    if (!m_tool || !isEnabled() || !hasPicture() || event->button() != Qt::LeftButton) return;
     const auto kind = hit(event->position());
     if (kind == Drag::Draw && !displayRect().contains(event->position())) return;
     m_drag = kind; m_start = m_crop; m_anchor = m_current = sourcePoint(event->position()); refresh();
 }
 void VideoCanvas::mouseMoveEvent(QMouseEvent* event) {
     if (m_drag != Drag::None) { m_current = sourcePoint(event->position()); refresh(); return; }
-    if (!m_tool || !isEnabled() || m_image.isNull()) return;
+    if (!m_tool || !isEnabled() || !hasPicture()) return;
     const auto kind = hit(event->position());
     point(kind == Drag::Move ? Qt::SizeAllCursor : kind == Drag::TopLeft || kind == Drag::BottomRight ? Qt::SizeFDiagCursor : kind == Drag::TopRight || kind == Drag::BottomLeft ? Qt::SizeBDiagCursor : Qt::CrossCursor);
 }

@@ -110,7 +110,7 @@ public:
     WindowsCapture(RecordingProfile profile, bool synthetic = false)
         : m_profile(std::move(profile)), m_synthetic(synthetic), m_buffer(qint64(m_profile.replay.durationSeconds) * 1000000, qint64(m_profile.replay.memoryLimitMiB) * 1048576) {}
     CaptureStats stats() const override {
-        QMutexLocker lock(&m_mutex); return {m_buffer.seconds(), m_buffer.bytes(), m_frames, m_encoder, m_warning, m_lost};
+        QMutexLocker lock(&m_mutex); return {m_buffer.seconds(), m_buffer.bytes(), m_frames, m_encoder, m_warning, m_lost, m_silent};
     }
     ExportTask prepareSave(const QString& path) const override {
         ReplaySnapshot snapshot; QList<Stream> streams;
@@ -121,7 +121,7 @@ public:
         const auto cleanup = qScopeGuard([this] {
             QMutexLocker lock(&m_mutex);
             m_buffer.clear(); m_streams.clear(); m_frames = 0;
-            m_encoder.clear(); m_warning.clear(); m_lost = 0;
+            m_encoder.clear(); m_warning.clear(); m_lost = 0; m_silent.clear();
         });
         try {
             const auto& video = m_profile.video;
@@ -210,7 +210,8 @@ public:
                 if (due > videoPosition) { seconds.back().second += int(due - videoPosition); videoPosition = due; }
                 if (const qint64 now = (windowsClock100ns() - epoch) / 10000000; now != second) {
                     second = now; int encoded = 0, lost = 0; for (const auto& [kept, given] : seconds) { encoded += kept; lost += given; }
-                    { QMutexLocker lock(&m_mutex); m_lost = encoded + lost ? double(lost) / (encoded + lost) : 0; }
+                    QStringList silent; for (const auto& item : audio) for (const auto& input : item->sources) if (!input->unavailable().isEmpty()) silent.append(input->source().name);
+                    { QMutexLocker lock(&m_mutex); m_lost = encoded + lost ? double(lost) / (encoded + lost) : 0; m_silent = silent; }
                     seconds.emplace_back(0, 0); while (seconds.size() > 5) seconds.pop_front();
                 }
                 if (nativeVideo) {
@@ -232,7 +233,7 @@ private:
         if (m_synthetic) candidates = {"libopenh264"};
         else if (video.encoder == "auto") candidates = {video.codec + "_nvenc", video.codec + "_amf"};
         else if (video.encoder == "nvenc" || video.encoder == "amf") candidates = {video.codec + '_' + video.encoder};
-        else throw std::runtime_error("Cette étape prend en charge NVIDIA NVENC et AMD AMF. Intel Quick Sync sera ajouté ensuite.");
+        else throw std::runtime_error("Encodeur inconnu : choisissez Automatique, NVIDIA NVENC ou AMD AMF dans les réglages.");
         const bool constantQuality = video.rateControl == "quality", thorough = video.effort == "thorough";
         const qint64 bitrate = qint64(video.bitrateMbps) * 1000000;
         const QByteArray quality = QByteArray::number(video.quality);
@@ -312,6 +313,7 @@ private:
     QString m_encoder, m_warning;
     quint64 m_frames = 0;
     double m_lost = 0;
+    QStringList m_silent;
 };
 }
 std::shared_ptr<CaptureBackend> createCaptureBackend(const RecordingProfile& profile) { return std::make_shared<WindowsCapture>(profile); }

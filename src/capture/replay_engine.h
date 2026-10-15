@@ -8,8 +8,9 @@
 #include <memory>
 
 namespace clipsapp {
-// "lost" is the share of images the encoder had no time for, over the last seconds.
-struct CaptureStats { double seconds = 0; qint64 bytes = 0; quint64 videoFrames = 0; QString encoder, warning; double lost = 0; };
+// "lost" is the share of images the encoder had no time for, over the last seconds. "silent" names
+// the audio sources whose device is missing: their tracks are silent until it comes back.
+struct CaptureStats { double seconds = 0; qint64 bytes = 0; quint64 videoFrames = 0; QString encoder, warning; double lost = 0; QStringList silent; };
 struct ExportResult { QString path, error; double seconds = 0; };
 using ExportTask = std::function<ExportResult()>;
 class CaptureBackend {

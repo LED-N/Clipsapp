@@ -30,7 +30,7 @@ protected:
 private:
     void refill();
     void accept();
-    QLabel* m_title; QLineEdit* m_field; QListWidget* m_list; QList<QPair<QString, int>> m_games; QPoint m_anchor;
+    QLabel* m_title; QLineEdit* m_field; QListWidget* m_list; QList<QPair<QString, int>> m_games; QPoint m_anchor; bool m_images = false;
 };
 
 class LibraryPage final : public QWidget {
@@ -38,11 +38,16 @@ class LibraryPage final : public QWidget {
 public:
     enum Filter { All, Favorites, Game };
     enum Sort { Recent, Oldest, ByName, Largest };
-    explicit LibraryPage(ThumbnailCache* cache, QWidget* parent = nullptr);
+    // The same page lists the clips, or the screenshots.
+    enum Kind { Clips, Screenshots };
+    explicit LibraryPage(ThumbnailCache* cache, Kind kind = Clips, QWidget* parent = nullptr);
+    Kind kind() const { return m_kind; }
+    // What the empty list of screenshots shows: the shortcut that takes one.
+    void setScreenshotHint(const QKeySequence& hotkey);
     void setItems(QList<LibraryItem> items, qint64 limitBytes);
     void setFilter(Filter filter, const QString& game = {});
-    void setLibraryPath(const QString& path) { m_path = path; refresh(); }
-    void setLoading(bool loading) { m_loading = loading; refresh(); }
+    void setLibraryPath(const QString& path) { if (path == m_path) return; m_path = path; refresh(); }
+    void setLoading(bool loading) { if (loading == m_loading) return; m_loading = loading; refresh(); }
     void setBusy(bool trashing, bool sharing);
     void setReplayHint(const QKeySequence& hotkey, int seconds, bool canStart, bool running);
     QStringList selectedPaths() const;
@@ -75,7 +80,7 @@ private:
     void view(const QString& path);
     void toggleFavorite();
     const LibraryItem* item(const QString& path) const;
-    ThumbnailCache* m_cache; QList<LibraryItem> m_items; qint64 m_limit = 20000000; Filter m_filter = All; QString m_game, m_path; Sort m_sort = Recent;
+    Kind m_kind; ThumbnailCache* m_cache; QList<LibraryItem> m_items; qint64 m_limit = 20000000; Filter m_filter = All; QString m_game, m_path; Sort m_sort = Recent;
     bool m_loading = false, m_trashing = false, m_sharing = false; QString m_sortName = QStringLiteral("Plus récents");
     QLabel* m_title; QLabel* m_subtitle; QWidget* m_search; QLineEdit* m_searchField; Button* m_sortButton;
     QStackedWidget* m_stack; ClipListView* m_list; LibraryRowDelegate* m_rows; QWidget* m_empty; QWidget* m_noMatch; Keycaps* m_keys; QLabel* m_emptyText; Button* m_startReplay;

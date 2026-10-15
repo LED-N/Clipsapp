@@ -1,5 +1,38 @@
 # Journal des versions
 
+## 0.8.3
+
+**Nouveautés**
+
+- **Screenshots** : un raccourci (**Ctrl + Alt + F11** par défaut) prend l'écran ou la fenêtre du replay en qualité native, que le replay tourne ou non. Les images sont rangées par jeu, comme les clips, dans le dossier « Screenshots » de la bibliothèque, et ont leur propre catégorie sous « Clips », avec favoris, recherche, renommage et classement. Un clic ou **Espace** les affiche en plein écran ; les **flèches gauche et droite** passent à l'image précédente ou suivante. Un éditeur permet de les recadrer, d'y **dessiner** (pinceau, flèche, cadre, ellipse ; six couleurs, trois épaisseurs, annuler avec Ctrl + Z) et d'enregistrer le résultat dans une copie à côté de l'originale, qui ne change pas. Elles se copient aussi pour être collées dans Discord, ou se mettent à la corbeille. Un son, au choix et réglable, confirme chaque screenshot.
+- **Screenshot depuis l'éditeur de clips** : le bouton appareil photo, sur l'image, garde l'image affichée en qualité d'origine, avec le cadrage choisi, parmi les screenshots du jeu.
+- **Volumes par jeu** : Clipsapp retient vos volumes jeu par jeu. Si vous baissez souvent le son du jeu sur ARC Raiders, il vous propose de l'appliquer à tous les clips ARC Raiders, sans toucher à ceux des autres jeux. Le bouton « Garder ces volumes » de l'éditeur les garde pour le jeu du clip ; la liste et un bouton « Oublier » sont dans **Réglages → Audio**.
+- **Démarrage automatique**, dans **Réglages → Général**, désactivé tant que vous ne le choisissez pas :
+  - **Lancer Clipsapp à l'ouverture de la session Windows**. Il s'ouvre discrètement, dans la zone de notification.
+  - **Replay automatique** : dès le lancement de Clipsapp, ou seulement quand un de vos jeux est ouvert. Les jeux se choisissent parmi les applications ouvertes, ou par leur programme. Le replay s'arrête 30 secondes après la fermeture du dernier jeu, pour laisser le temps de sauvegarder la fin. Arrêté à la main pendant une partie, il ne redémarre pas avant la prochaine ouverture du jeu. Il enregistre l'écran choisi dans Capture, ou l'écran principal si c'est une fenêtre qui y est choisie.
+- **Quoi de neuf** : au premier lancement après une mise à jour, une fenêtre présente ce qu'apporte la nouvelle version. Un clic sur le numéro de version, en bas à gauche, la rouvre, avec les notes des versions précédentes.
+- **Les clips ajoutés, renommés ou supprimés dans l'Explorateur** apparaissent ou disparaissent aussitôt dans Clipsapp, sans rien actualiser.
+- **Désinstallation en un double-clic** : `Desinstaller Clipsapp.bat`, dans le dossier de Clipsapp, ferme l'application, retire son raccourci du menu Démarrer et son lancement avec Windows, puis supprime le dossier. Il propose de garder vos réglages pour une prochaine installation. Vos clips ne sont jamais touchés ; s'ils sont rangés dans le dossier de Clipsapp, le script s'arrête sans rien supprimer.
+- **Copier le diagnostic**, dans **Réglages → Général** : Clipsapp tient un petit journal sur votre PC, et ce bouton le copie avec la description de la machine, pour le joindre à un signalement. Le nom de votre dossier personnel en est retiré, et rien n'est envoyé.
+
+**Améliorations**
+
+- **Un micro débranché n'arrête plus le replay** : sa piste reste silencieuse, la barre du replay le signale, et le son revient dès que le micro est rebranché. Une source qui suit le périphérique par défaut suit aussi ses changements. Il en va de même pour une sortie audio, et pour une application dont le son ne peut pas être suivi.
+- **Bibliothèque plus rapide à l'ouverture** : les miniatures et la durée des clips sont gardées d'un lancement à l'autre ; un clip n'est lu qu'une fois.
+- Après un plantage, Clipsapp le signale au lancement suivant et garde un rapport sur le PC.
+- **Son de sauvegarde au choix** : sept sons (deux notes, carillon, pièce, goutte, bulle, déclencheur photo, bip), un volume réglable et un bouton « Écouter » pour les essayer, dans **Réglages → Général**.
+- **Réglages réorganisés** : le dossier des clips, renommé « Dossier des clips et captures d'écran », rejoint l'onglet **Capture**, sous le replay ; l'onglet « Fichiers et alertes » devient **Général**. Les infobulles des réglages à plusieurs choix (codec, encodeur, mode de débit, effort, niveau de qualité) présentent chaque choix sur sa ligne, son nom en gras.
+- **Dossier de Clipsapp épuré** : il ne contient plus que `Clipsapp.exe`, le script de désinstallation et un dossier `runtime` qui regroupe tout le reste. La mise à jour depuis la 0.8.2 fait le rangement d'elle-même. Le README reste sur la page GitHub ; le journal des versions s'ouvre depuis Clipsapp.
+- **Réglages rangés dans un seul dossier** : `%LOCALAPPDATA%\Clipsapp` au lieu de `%LOCALAPPDATA%\Clipsapp\Clipsapp`. Ils y sont déplacés au premier lancement, sans rien perdre.
+
+**Corrections et retraits**
+
+- **Le recadrage à la souris refonctionne** dans l'éditeur : depuis l'affichage direct de la 0.8.1, on ne pouvait plus tracer ni redimensionner le cadre sur l'image, seulement le régler par les valeurs précises.
+- **Les boutons et les bandeaux de l'éditeur restent à leur place** : « Cadrer / Résultat » pouvaient se retrouver dans la barre du replay, et le bandeau d'un clip exporté passer sous l'image.
+- La barre latérale n'affiche plus les jeux que sous la catégorie ouverte, Clips ou Screenshots.
+- Intel Quick Sync n'est plus proposé : il renvoyait une erreur au démarrage du replay. Un profil qui l'avait choisi passe en « Automatique » (NVIDIA ou AMD).
+- Un message d'avertissement de Qt revenait dans le journal après l'ouverture de l'éditeur (« must be a top level window »).
+
 ## 0.8.2
 
 **Correction**

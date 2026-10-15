@@ -21,4 +21,7 @@ bool sameMix(const TrackMix& left, const TrackMix& right);
 std::optional<TrackMix> suggestedMix(const QList<TrackMix>& history, const TrackMix& current, const TrackMix& declined);
 // Keeps the few exports the proposal is drawn from.
 void rememberExport(QList<TrackMix>& history, const TrackMix& levels);
+// The usual levels of the clips of a game: those set for that game, and for the tracks it does not
+// name, the usual levels of every clip. A clip without a game has the usual levels.
+TrackMix mixForGame(const TrackMix& general, const QMap<QString, TrackMix>& games, const QString& game);
 }

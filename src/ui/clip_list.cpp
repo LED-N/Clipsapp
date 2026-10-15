@@ -144,7 +144,9 @@ void LibraryRowDelegate::paint(QPainter* painter, const QStyleOptionViewItem& op
     if (hovered && !(meta && meta->failed)) {
         const bool over = l.play.contains(QPointF(m_view->hoverPosition()));
         painter->setPen(Qt::NoPen); painter->setBrush(over ? tk::accent : QColor(12, 14, 18, 214)); painter->drawEllipse(l.play);
-        paintIcon(*painter, QStringLiteral("play"), QRectF(l.play.center().x() - 7, l.play.center().y() - 8, 16, 16), over ? tk::onAccent : tk::text);
+        // A picture is not played: it is seen larger.
+        if (m_images) paintIcon(*painter, QStringLiteral("expand"), QRectF(l.play.center().x() - 8, l.play.center().y() - 8, 16, 16), over ? tk::onAccent : tk::text);
+        else paintIcon(*painter, QStringLiteral("play"), QRectF(l.play.center().x() - 7, l.play.center().y() - 8, 16, 16), over ? tk::onAccent : tk::text);
     }
     // Name, favourite star, "Nouveau", then one line of facts.
     const auto nameFont = uiFont(14, QFont::DemiBold); const QFontMetrics nameMetrics(nameFont); const bool favorite = index.data(ClipRole::Favorite).toBool(), fresh = index.data(ClipRole::Fresh).toBool();
@@ -158,17 +160,20 @@ void LibraryRowDelegate::paint(QPainter* painter, const QStyleOptionViewItem& op
     if (meta && meta->failed) { painter->setPen(tk::danger); painter->drawText(metaLine, Qt::AlignVCenter | Qt::AlignLeft, QStringLiteral("Impossible de lire ce fichier")); }
     else {
         QStringList facts; if (m_showGame) facts.append(index.data(ClipRole::Game).toString());
-        if (meta) { facts << QStringLiteral("%1p").arg(meta->size.height()) << QStringLiteral("%1 FPS").arg(qRound(meta->fps)) << (meta->tracks == 0 ? QStringLiteral("sans son") : meta->tracks == 1 ? QStringLiteral("1 piste") : QStringLiteral("%1 pistes").arg(meta->tracks)); }
+        if (meta && m_images) facts << QStringLiteral("%1 × %2").arg(meta->size.width()).arg(meta->size.height());
+        else if (meta) { facts << QStringLiteral("%1p").arg(meta->size.height()) << QStringLiteral("%1 FPS").arg(qRound(meta->fps)) << (meta->tracks == 0 ? QStringLiteral("sans son") : meta->tracks == 1 ? QStringLiteral("1 piste") : QStringLiteral("%1 pistes").arg(meta->tracks)); }
         painter->setPen(tk::text2); const auto text = facts.join(QStringLiteral(" · ")); painter->drawText(metaLine, Qt::AlignVCenter | Qt::AlignLeft, QFontMetrics(painter->font()).elidedText(text, Qt::ElideRight, int(l.text.width())));
         if (!known) { painter->setPen(Qt::NoPen); painter->setBrush(tk::raised); const double after = l.text.left() + (text.isEmpty() ? 0 : QFontMetrics(painter->font()).horizontalAdvance(text) + 10); painter->drawRoundedRect(QRectF(after, middle + 7, std::min(120.0, std::max(0.0, l.text.right() - after)), 10), 4, 4); }
     }
     painter->setFont(monoFont(12)); painter->setPen(tk::text); painter->drawText(QRectF(l.size.left(), middle - 20, l.size.width(), 16), Qt::AlignVCenter | Qt::AlignLeft, formatBytes(index.data(ClipRole::Bytes).toLongLong()));
-    const auto fit = index.data(ClipRole::FitText).toString(); const auto fitSize = Tag::measure(fit);
-    Tag::paint(*painter, QRectF(l.size.left(), middle, std::min<double>(fitSize.width(), l.size.width()), 20), fit, index.data(ClipRole::FitOk).toBool() ? Tag::Ok : Tag::Neutral);
+    if (const auto fit = index.data(ClipRole::FitText).toString(); !fit.isEmpty()) {
+        const auto fitSize = Tag::measure(fit);
+        Tag::paint(*painter, QRectF(l.size.left(), middle, std::min<double>(fitSize.width(), l.size.width()), 20), fit, index.data(ClipRole::FitOk).toBool() ? Tag::Ok : Tag::Neutral);
+    }
     if (hovered) {
         const QPointF pointer(m_view->hoverPosition());
-        if (!l.compact) paintRowButton(painter, l.edit, QStringLiteral("cut"), QStringLiteral("Éditer"), l.edit.contains(pointer));
-        paintRowButton(painter, l.share, QStringLiteral("share"), {}, l.share.contains(pointer)); paintRowButton(painter, l.more, QStringLiteral("more"), {}, l.more.contains(pointer));
+        if (!l.compact) paintRowButton(painter, l.edit, m_images ? QStringLiteral("crop") : QStringLiteral("cut"), QStringLiteral("Éditer"), l.edit.contains(pointer));
+        paintRowButton(painter, l.share, m_images ? QStringLiteral("copy") : QStringLiteral("share"), {}, l.share.contains(pointer)); paintRowButton(painter, l.more, QStringLiteral("more"), {}, l.more.contains(pointer));
     } else {
         painter->setFont(monoFont(12)); painter->setPen(tk::text2);
         painter->drawText(l.time, Qt::AlignVCenter | Qt::AlignRight, index.data(ClipRole::Detail).toString());

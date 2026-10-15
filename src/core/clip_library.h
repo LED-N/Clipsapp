@@ -10,7 +10,15 @@
 namespace clipsapp {
 struct ClipEntry { QString path; QString name; QString game; QString format; qint64 size = 0; QDateTime modified; };
 struct LibraryScan { QList<ClipEntry> clips; QString warning; };
+// The clips under a folder, the folder of the screenshots left aside.
 LibraryScan scanLibrary(const QString& directory, bool sharingOnly = false);
+// Screenshots live in their own folder of the library, one sub-folder per game as the clips do.
+QString screenshotsDirectory(const QString& libraryPath);
+bool isImageFile(const QString& path);
+// The pictures under the folder of the screenshots: PNG, JPEG, WebP and BMP.
+LibraryScan scanImages(const QString& directory);
+// The name of a file the application saves: the game, the moment, and a short mark that keeps two names apart.
+QString capturedFileName(const QString& gameFolder, const QString& suffix);
 struct ClipTrashResult { QStringList removed, errors; };
 using ClipTrashOperation = std::function<bool(const QString&, QString&)>;
 ClipTrashResult trashClips(const QStringList& paths, ClipTrashOperation operation = {});

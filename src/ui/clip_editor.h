@@ -67,6 +67,8 @@ signals:
     void failed(const QString& title, const QString& detail);
     // The levels of this clip are to become the usual ones.
     void mixChosen(const TrackMix& mix);
+    // The image at this moment of the clip, framed as the crop says, to keep among the screenshots.
+    void screenshotRequested(const QString& path, qint64 positionMs, const QRect& crop);
 protected:
     void resizeEvent(QResizeEvent* event) override;
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -114,7 +116,7 @@ private:
     QWidget* m_header; Button* m_back; ElideLabel* m_title; QLineEdit* m_titleEdit; Button* m_rename; Tag* m_gameTag; Tag* m_stateTag; QLabel* m_hint;
     Button* m_discord; Button* m_export; QWidget* m_exportBox; QLabel* m_exportLabel; QLabel* m_exportEta; Bar* m_progress; Button* m_cancelExport;
     Banner* m_banner; Banner* m_problem;
-    VideoCanvas* m_canvas; Segmented* m_mode; Button* m_fullScreen;
+    VideoCanvas* m_canvas; Segmented* m_mode; Button* m_fullScreen; Button* m_screenshot;
     QVBoxLayout* m_center; QWidget* m_transport; Button* m_play; QLabel* m_time; QLabel* m_total; QLabel* m_selection; QLabel* m_selectionCaption; Button* m_startHere; Button* m_endHere;
     ClipTimeline* m_timeline; QWidget* m_zoomControls; QSlider* m_zoom; QLabel* m_zoomLabel; QScrollBar* m_pan; QLabel* m_zoomHint;
     QList<QSlider*> m_volumes; QList<QAbstractButton*> m_mutes;

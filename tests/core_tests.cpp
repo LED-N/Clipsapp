@@ -14,6 +14,16 @@
 #include "core/update.h"
 #include "media/clip_edit.h"
 #include "platform/start_menu.h"
+#include "core/app_log.h"
+#include "core/auto_replay.h"
+#include "platform/crash_report.h"
+#include "platform/folder_watch.h"
+#include "platform/game_detection.h"
+#include "platform/login_start.h"
+#include "platform/uninstall.h"
+#include <QScopeGuard>
+#include <QSettings>
+#include <QSignalSpy>
 
 using namespace clipsapp;
 class CoreTests final : public QObject {
@@ -343,6 +353,216 @@ private slots:
         QVERIFY(write(directory.filePath("zip/Clipsapp-0.8.2/Clipsapp.exe"), "v3")); QCOMPARE(stagedRoot(directory.filePath("zip"), "Clipsapp.exe"), directory.filePath("zip/Clipsapp-0.8.2"));
         QVERIFY(write(directory.filePath("vide/lisezmoi.txt"), "rien")); QVERIFY(stagedRoot(directory.filePath("vide"), "Clipsapp.exe").isEmpty()); QVERIFY(!applyUpdate(directory.filePath("vide"), install.path(), "Clipsapp.exe", error));
         QCOMPARE(read(install.filePath("Clipsapp.exe")), QByteArray("v2 Clipsapp.exe"));
+    }
+    void startupSettingsAreOffAtFirstAndSurviveRestart() {
+        auto config = AppConfig::defaults(); QVERIFY(!config.launchAtLogin); QCOMPARE(config.autoReplay, QString("off")); QVERIFY(config.replayGames.isEmpty());
+        config.launchAtLogin = true; config.autoReplay = "games"; config.replayGames = {"D:/Games/Valorant/VALORANT.exe", "C:/Program Files/CS2/cs2.exe"};
+        AppConfig loaded; QString error; QVERIFY2(AppConfig::fromJson(config.toJson(), loaded, error), qPrintable(error));
+        QVERIFY(loaded.launchAtLogin); QCOMPARE(loaded.autoReplay, QString("games")); QCOMPARE(loaded.replayGames, config.replayGames);
+        // A game written twice, or with Windows separators, is one game.
+        auto json = config.toJson(); auto startup = json.value("startup").toObject(); startup.insert("games", QJsonArray{"C:\\Jeux\\jeu.exe", "C:/Jeux/jeu.exe", "  "}); json.insert("startup", startup);
+        QVERIFY(AppConfig::fromJson(json, loaded, error)); QCOMPARE(loaded.replayGames, QStringList({"C:/Jeux/jeu.exe"}));
+        // A file written before these settings existed starts nothing by itself.
+        json.remove("startup"); QVERIFY(AppConfig::fromJson(json, loaded, error)); QVERIFY(!loaded.launchAtLogin); QCOMPARE(loaded.autoReplay, QString("off"));
+        startup.insert("autoReplay", "toujours"); json.insert("startup", startup); QVERIFY(!AppConfig::fromJson(json, loaded, error));
+    }
+    void autoReplayStartsWithAGameStopsAfterItAndRespectsTheUser() {
+        using Action = AutoReplay::Action; AutoReplay policy; const qint64 grace = AutoReplay::graceMs;
+        // Off, nothing ever starts; at launch, the replay starts once.
+        QCOMPARE(policy.launched(), Action::None); QCOMPARE(policy.tick(true, false, 0), Action::None);
+        policy.setMode("launch"); QCOMPARE(policy.launched(), Action::Start); QCOMPARE(policy.tick(true, false, 0), Action::None);
+        policy.setMode("games"); QCOMPARE(policy.launched(), Action::None);
+        // A game opens: the replay starts, and runs as long as the game does.
+        QCOMPARE(policy.tick(false, false, 0), Action::None); QCOMPARE(policy.tick(true, false, 1000), Action::Start); policy.started(true);
+        QCOMPARE(policy.tick(true, true, 4000), Action::None);
+        // Closed, the game leaves the replay running a little, so that its end can still be saved.
+        QCOMPARE(policy.tick(false, true, 10000), Action::None); QCOMPARE(policy.tick(false, true, 10000 + grace - 1), Action::None);
+        // Opened again meanwhile, nothing stops.
+        QCOMPARE(policy.tick(true, true, 10000 + grace), Action::None); QCOMPARE(policy.tick(false, true, 50000), Action::None); QCOMPARE(policy.tick(false, true, 50000 + grace), Action::Stop);
+        QVERIFY(!policy.automatic()); QCOMPARE(policy.tick(false, false, 50000 + grace + 3000), Action::None);
+        // Stopped by the user while the game runs: it stays stopped until the game closes and opens again.
+        QCOMPARE(policy.tick(true, false, 100000), Action::Start); policy.started(true); policy.stoppedByUser();
+        QCOMPARE(policy.tick(true, false, 103000), Action::None); QVERIFY(policy.held());
+        QCOMPARE(policy.tick(false, false, 106000), Action::None); QVERIFY(!policy.held()); QCOMPARE(policy.tick(true, false, 109000), Action::Start);
+        // A replay that fails is not started again in a loop.
+        policy.failed(); QCOMPARE(policy.tick(true, false, 112000), Action::None);
+        // A replay the user started is the user's to stop, game or not.
+        QCOMPARE(policy.tick(false, false, 115000), Action::None); policy.started(false);
+        QCOMPARE(policy.tick(false, true, 118000), Action::None); QCOMPARE(policy.tick(false, true, 118000 + 2 * grace), Action::None);
+        // Leaving the mode while an automatic replay runs leaves it running.
+        policy.started(true); policy.setMode("off"); QCOMPARE(policy.tick(false, true, 300000), Action::None); QCOMPARE(policy.tick(false, true, 300000 + 2 * grace), Action::None);
+    }
+    void runningProgramsAreFoundByTheirFullPath() {
+        const auto self = QCoreApplication::applicationFilePath();
+        QCOMPARE(runningPrograms({self}), QStringList({self}));
+        QCOMPARE(runningPrograms({QDir::toNativeSeparators(self).toUpper(), "C:/Absent/" + QFileInfo(self).fileName()}), QStringList({QDir::toNativeSeparators(self).toUpper()}));
+        QVERIFY(runningPrograms({}).isEmpty());
+    }
+    void journalStaysSmallKeepsThePreviousFileAndFoldsRepeats() {
+        QTemporaryDir directory; LogFile log(directory.filePath("logs"), 2000);
+        log.write("INFO", "Clipsapp démarre."); for (int index = 0; index < 50; ++index) log.write("WARN", "Le même avertissement");
+        log.write("INFO", "Ligne\nsur deux lignes");
+        auto lines = log.tail(10); QCOMPARE(lines.size(), 5);
+        QVERIFY(lines[0].endsWith("INFO   Clipsapp démarre.")); QVERIFY(lines[1].endsWith("Le même avertissement")); QVERIFY(lines[2].contains("répété 49 fois")); QVERIFY(lines[3].endsWith("Ligne")); QVERIFY(lines[4].trimmed() == "sur deux lignes");
+        // Past its size, the file becomes the previous one; the one before that goes.
+        for (int index = 0; index < 100; ++index) log.write("INFO", QStringLiteral("Message %1").arg(index));
+        QVERIFY(QFileInfo(log.currentPath()).size() <= 2000); QVERIFY(QFileInfo(log.previousPath()).size() <= 2000); QCOMPARE(QDir(directory.filePath("logs")).entryList(QDir::Files).size(), 2);
+        lines = log.tail(3); QCOMPARE(lines.size(), 3); QVERIFY(lines.last().endsWith("Message 99")); QVERIFY(lines.first().endsWith("Message 97"));
+        // What is shared does not carry the name of the account.
+        const auto home = QDir::homePath(); QCOMPARE(withoutHome(home + "/Videos/Clipsapp/a.mp4"), QString("~/Videos/Clipsapp/a.mp4")); QCOMPARE(withoutHome(QDir::toNativeSeparators(home) + "\\x"), QString("~\\x"));
+    }
+    void loginStartIsAddedRepairedAndRemoved() {
+#ifdef Q_OS_WIN
+        // A key of the tests' own, never the one Windows reads at the opening of the session.
+        const QString location = "HKEY_CURRENT_USER\\Software\\Clipsapp-tests\\Run"; QString error;
+        const auto cleanup = qScopeGuard([] { QSettings("HKEY_CURRENT_USER\\Software", QSettings::NativeFormat).remove("Clipsapp-tests"); });
+        QSettings(location, QSettings::NativeFormat).setValue("Voisin", "C:/voisin.exe");
+        QVERIFY(!loginStartWorks(location));
+        QVERIFY2(setLoginStart(location, QCoreApplication::applicationFilePath(), true, error), qPrintable(error)); QVERIFY(loginStartWorks(location));
+        QCOMPARE(QSettings(location, QSettings::NativeFormat).value("Clipsapp").toString(), loginStartCommand(QCoreApplication::applicationFilePath()));
+        QVERIFY(loginStartCommand("C:/Mes jeux/Clipsapp/Clipsapp.exe") == QStringLiteral("\"C:\\Mes jeux\\Clipsapp\\Clipsapp.exe\" --autostart"));
+        // A folder that moved leaves an entry that starts nothing.
+        QVERIFY(setLoginStart(location, "C:/Absent/Clipsapp.exe", true, error)); QVERIFY(!loginStartWorks(location));
+        QVERIFY(setLoginStart(location, QCoreApplication::applicationFilePath(), false, error)); QVERIFY(!loginStartWorks(location));
+        QSettings run(location, QSettings::NativeFormat); QVERIFY(!run.contains("Clipsapp")); QCOMPARE(run.value("Voisin").toString(), QString("C:/voisin.exe"));
+#else
+        QSKIP("The session of Linux is checked on Linux.");
+#endif
+    }
+    void uninstallRemovesOnlyThisCopysTracesAndNeverTheClips() {
+#ifdef Q_OS_WIN
+        QTemporaryDir directory; QString error;
+        const auto install = directory.filePath("Clipsapp"), executable = install + "/Clipsapp.exe", other = directory.filePath("Autre copie/Clipsapp.exe");
+        for (const auto& path : {executable, other}) { QVERIFY(QDir().mkpath(QFileInfo(path).absolutePath())); QFile file(path); QVERIFY(file.open(QIODevice::WriteOnly)); file.write("exe"); }
+        const auto programs = directory.filePath("Programs"), config = directory.filePath("AppData/Clipsapp"); const QString location = "HKEY_CURRENT_USER\\Software\\Clipsapp-tests\\Run";
+        const auto cleanup = qScopeGuard([] { QSettings("HKEY_CURRENT_USER\\Software", QSettings::NativeFormat).remove("Clipsapp-tests"); });
+        auto settings = AppConfig::defaults(); const auto saveLibrary = [&](const QString& library) { settings.libraryPath = library; QString failure; return ConfigStore(config).save(settings, failure); };
+        QVERIFY(setStartMenuShortcut(programs, executable, true, error)); QVERIFY(setLoginStart(location, executable, true, error));
+        // Clips kept inside the folder about to be deleted: nothing is touched, and the script stops.
+        QVERIFY(saveLibrary(install + "/Mes clips"));
+        auto result = removeTraces({install, executable, config, programs, location, false});
+        QCOMPARE(result.code, int(UninstallClipsInside)); QVERIFY(startMenuShortcutWorks(programs)); QVERIFY(loginStartWorks(location)); QVERIFY(QFile::exists(config + "/settings.json"));
+        // Kept settings stay where they are; the shortcut and the session start go.
+        QVERIFY(saveLibrary(directory.filePath("Vidéos/Clipsapp")));
+        result = removeTraces({install, executable, config, programs, location, true});
+        QCOMPARE(result.code, int(UninstallDone)); QVERIFY(!QFileInfo::exists(startMenuShortcut(programs))); QVERIFY(loginStartProgram(location).isEmpty()); QVERIFY(QFile::exists(config + "/settings.json"));
+        // Those of another copy stay; settings not kept go, with the empty folder of the publisher above them.
+        QVERIFY(setStartMenuShortcut(programs, other, true, error)); QVERIFY(setLoginStart(location, other, true, error));
+        result = removeTraces({install, executable, config, programs, location, false});
+        QCOMPARE(result.code, int(UninstallDone)); QVERIFY(startMenuShortcutWorks(programs)); QCOMPARE(loginStartProgram(location), QDir::toNativeSeparators(other));
+        QVERIFY(!QFileInfo::exists(config)); QVERIFY(QFileInfo::exists(directory.filePath("AppData")));
+        // Nothing left to remove is not a failure.
+        QCOMPARE(removeTraces({install, executable, config, programs, location, false}).code, int(UninstallDone));
+#else
+        QSKIP("The uninstall script is a Windows one.");
+#endif
+    }
+    void eachGameKeepsItsOwnLevelsOverTheUsualOnes() {
+        const TrackMix general{{"micro", 1.2}, {"jeu", 0.9}}; const QMap<QString, TrackMix> games{{"ARC Raiders", TrackMix{{"jeu", 0.5}}}};
+        const auto arc = mixForGame(general, games, "ARC Raiders"); QCOMPARE(arc.value("jeu"), 0.5); QCOMPARE(arc.value("micro"), 1.2);
+        QCOMPARE(mixForGame(general, games, "EA SPORTS FC 27"), general); QCOMPARE(mixForGame(general, games, {}), general);
+        // Saved and read again, with what each game learns from and what it refused.
+        auto config = AppConfig::defaults(); config.gameMixes = games; config.gameMixHistory.insert("ARC Raiders", {TrackMix{{"jeu", 0.5}}, TrackMix{{"jeu", 0.45}}}); config.gameMixDeclined.insert("EA SPORTS FC 27", TrackMix{{"jeu", 0.7}});
+        AppConfig loaded; QString error; QVERIFY2(AppConfig::fromJson(config.toJson(), loaded, error), qPrintable(error));
+        QCOMPARE(loaded.gameMixes, config.gameMixes); QCOMPARE(loaded.gameMixHistory.value("ARC Raiders").size(), 2); QCOMPARE(loaded.gameMixDeclined.value("EA SPORTS FC 27").value("jeu"), 0.7);
+        QVERIFY(!loaded.gameMixHistory.contains("EA SPORTS FC 27"));
+    }
+    void screenshotSettingsRoundTripAndNeverShareTheReplayShortcut() {
+        auto config = AppConfig::defaults(); QCOMPARE(config.screenshotHotkey, QString("Ctrl+Alt+F11")); QVERIFY(config.screenshotSound); QCOMPARE(config.screenshotSoundId, QString("shutter"));
+        config.screenshotHotkey = "Ctrl+Shift+S"; config.screenshotSound = false; config.screenshotSoundId = "chime"; config.screenshotSoundVolume = 35;
+        AppConfig loaded; QString error; QVERIFY2(AppConfig::fromJson(config.toJson(), loaded, error), qPrintable(error));
+        QCOMPARE(loaded.screenshotHotkey, QString("Ctrl+Shift+S")); QVERIFY(!loaded.screenshotSound); QCOMPARE(loaded.screenshotSoundId, QString("chime")); QCOMPARE(loaded.screenshotSoundVolume, 35);
+        // One shortcut cannot save a clip and take a screenshot.
+        config.screenshotHotkey = config.profiles.first().replay.hotkey; QVERIFY(!config.validationErrors().isEmpty());
+        // A file from before screenshots, whose replay already uses their default, still loads: they take another.
+        auto json = AppConfig::defaults().toJson(); json.remove("screenshots"); auto profiles = json.value("profiles").toArray(); auto profile = profiles.first().toObject(); auto replay = profile.value("replay").toObject();
+        replay.insert("hotkey", "Ctrl+Alt+F11"); profile.insert("replay", replay); profiles.replace(0, profile); json.insert("profiles", profiles);
+        QVERIFY2(AppConfig::fromJson(json, loaded, error), qPrintable(error)); QCOMPARE(loaded.screenshotHotkey, QString("Ctrl+Alt+F12"));
+    }
+    void screenshotsAreListedApartFromTheClips() {
+        QTemporaryDir directory; const auto write = [&directory](const QString& name) { QDir().mkpath(QFileInfo(directory.filePath(name)).absolutePath()); QFile file(directory.filePath(name)); return file.open(QIODevice::WriteOnly) && file.write("x") == 1; };
+        for (const auto& name : {"ARC Raiders/clip.mp4", "Screenshots/ARC Raiders/vue.png", "Screenshots/Photo.JPG", "Screenshots/ARC Raiders/notes.txt", "Screenshots/ARC Raiders/vidéo.mp4"}) QVERIFY(write(name));
+        const auto clips = scanLibrary(directory.path()); QCOMPARE(clips.clips.size(), 1); QCOMPARE(clips.clips.first().name, QString("clip"));
+        QCOMPARE(screenshotsDirectory(directory.path()), directory.filePath("Screenshots"));
+        auto images = scanImages(screenshotsDirectory(directory.path())).clips; QCOMPARE(images.size(), 2);
+        std::sort(images.begin(), images.end(), [](const auto& left, const auto& right) { return left.name < right.name; });
+        QCOMPARE(images[0].name, QString("Photo")); QCOMPARE(images[0].game, QString("Non classé")); QCOMPARE(images[1].game, QString("ARC Raiders")); QCOMPARE(images[1].format, QString("PNG"));
+        QVERIFY(isImageFile("a.webp")); QVERIFY(isImageFile("B.JPEG")); QVERIFY(!isImageFile("c.mp4"));
+        const auto name = capturedFileName("ARC Raiders", "png"); QVERIFY(name.startsWith("ARC Raiders-20")); QVERIFY(name.endsWith(".png")); QVERIFY(name != capturedFileName("ARC Raiders", "png"));
+    }
+    void settingsComeUpOneFolderWithoutReplacingAnything() {
+        QTemporaryDir directory; const auto config = directory.filePath("Clipsapp"), earlier = config + "/Clipsapp";
+        const auto write = [](const QString& path, const QByteArray& content) { QDir().mkpath(QFileInfo(path).absolutePath()); QFile file(path); return file.open(QIODevice::WriteOnly) && file.write(content) == content.size(); };
+        const auto read = [](const QString& path) { QFile file(path); return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray("<absent>"); };
+        QVERIFY(write(earlier + "/settings.json", "réglages")); QVERIFY(write(earlier + "/library-tags.json", "classement")); QVERIFY(write(earlier + "/logs/clipsapp.log", "journal"));
+        adoptEarlierSettings(earlier, config);
+        QCOMPARE(read(config + "/settings.json"), QByteArray("réglages")); QCOMPARE(read(config + "/library-tags.json"), QByteArray("classement")); QCOMPARE(read(config + "/logs/clipsapp.log"), QByteArray("journal"));
+        QVERIFY(!QFileInfo::exists(earlier));
+        // Something already in the new folder stays; what could not come up waits in the old one.
+        QVERIFY(write(earlier + "/settings.json", "anciens")); QVERIFY(write(earlier + "/cache/index.json", "{}"));
+        adoptEarlierSettings(earlier, config);
+        QCOMPARE(read(config + "/settings.json"), QByteArray("réglages")); QCOMPARE(read(config + "/cache/index.json"), QByteArray("{}")); QCOMPARE(read(earlier + "/settings.json"), QByteArray("anciens"));
+        // Nothing to bring, or the same folder: nothing happens.
+        adoptEarlierSettings(directory.filePath("absent"), config); adoptEarlierSettings(config, config); QVERIFY(QFile::exists(config + "/settings.json"));
+        QVERIFY(defaultConfigDirectory().endsWith("/Clipsapp")); QVERIFY(!defaultConfigDirectory().endsWith("Clipsapp/Clipsapp"));
+    }
+    void quickSyncGoesBackToAutomaticAndTheSavedSoundRoundTrips() {
+        auto config = AppConfig::defaults(); QCOMPARE(config.clipSavedSoundId, QString("duo")); QCOMPARE(config.clipSavedSoundVolume, 50);
+        config.clipSavedSoundId = "chime"; config.clipSavedSoundVolume = 80;
+        auto json = config.toJson(); AppConfig loaded; QString error; QVERIFY2(AppConfig::fromJson(json, loaded, error), qPrintable(error));
+        QCOMPARE(loaded.clipSavedSoundId, QString("chime")); QCOMPARE(loaded.clipSavedSoundVolume, 80);
+        json.insert("clipSavedSoundVolume", 250); QVERIFY(AppConfig::fromJson(json, loaded, error)); QCOMPARE(loaded.clipSavedSoundVolume, 100);
+        // A profile saved with Intel Quick Sync, offered once and never working, still loads.
+        auto profiles = json.value("profiles").toArray(); auto profile = profiles.first().toObject(); auto video = profile.value("video").toObject();
+        video.insert("encoder", "qsv"); profile.insert("video", video); profiles.replace(0, profile); json.insert("profiles", profiles);
+        QVERIFY2(AppConfig::fromJson(json, loaded, error), qPrintable(error)); QCOMPARE(loaded.profiles.first().video.encoder, QString("auto"));
+        config.profiles.first().video.encoder = "qsv"; QVERIFY(!config.validationErrors().isEmpty());
+    }
+    void anUpdateToTheRuntimeFolderLeavesOnlyTheExecutableAtTheRoot() {
+        QTemporaryDir directory; const QDir install(directory.filePath("Clipsapp")), staged(directory.filePath("Clipsapp/.update/new"));
+        const auto write = [](const QString& path, const QByteArray& content) { QDir().mkpath(QFileInfo(path).absolutePath()); QFile file(path); return file.open(QIODevice::WriteOnly) && file.write(content) == content.size(); };
+        // 0.8.2, as published: everything beside the executable, its list at the root.
+        const QStringList flat{"Clipsapp.exe", "Qt6Core.dll", "platforms/qwindows.dll", "third_party/licenses/Qt-LGPL-3.0.txt", "README.md", "CHANGELOG.md"};
+        for (const auto& name : flat) QVERIFY(write(install.filePath(name), "0.8.2"));
+        QVERIFY(write(install.filePath("manifest.txt"), (flat.join('\n') + "\nmanifest.txt\n").toUtf8())); QVERIFY(write(install.filePath("mes notes.txt"), "à moi"));
+        QVERIFY(publishedCopy(install.path()));
+        const QStringList tidy{"Clipsapp.exe", "Desinstaller Clipsapp.bat", "runtime/Qt6Core.dll", "runtime/platforms/qwindows.dll", "runtime/licenses/Qt-LGPL-3.0.txt", "runtime/runtime.manifest"};
+        for (const auto& name : tidy) QVERIFY(write(staged.filePath(name), "0.8.3"));
+        QVERIFY(write(staged.filePath("runtime/manifest.txt"), (tidy.join('\n') + "\nruntime/manifest.txt\n").toUtf8()));
+        QString error; QVERIFY2(applyUpdate(staged.path(), install.path(), "Clipsapp.exe", error), qPrintable(error));
+        // Once the previous version is gone, the root keeps the executable, the script, "runtime", and what the user put there.
+        clearUpdateLeftovers(install.path()); QVERIFY(!QFileInfo::exists(updateWorkDirectory(install.path())));
+        QCOMPARE(install.entryList(QDir::AllEntries | QDir::Hidden | QDir::NoDotAndDotDot, QDir::Name | QDir::IgnoreCase), QStringList({"Clipsapp.exe", "Desinstaller Clipsapp.bat", "mes notes.txt", "runtime"}));
+        QVERIFY(publishedCopy(install.path())); QVERIFY(QFile::exists(install.filePath("runtime/platforms/qwindows.dll")));
+        // An update made by 0.8.2 set the files aside but left their folders: they go with its leftovers,
+        // unless something else is in them.
+        QTemporaryDir other; const QDir earlier(other.path());
+        QVERIFY(earlier.mkpath("platforms")); QVERIFY(write(earlier.filePath("tls/mon fichier.txt"), "à moi"));
+        QVERIFY(write(earlier.filePath(".update/old-1/manifest.txt"), "platforms/qwindows.dll\ntls/qschannelbackend.dll\nmanifest.txt\n"));
+        clearUpdateLeftovers(earlier.path());
+        QVERIFY(!QFileInfo::exists(earlier.filePath("platforms"))); QVERIFY(QFile::exists(earlier.filePath("tls/mon fichier.txt"))); QVERIFY(!QFileInfo::exists(earlier.filePath(".update")));
+    }
+    void folderWatcherSeesTheWholeTreeWithoutHoldingIt() {
+        QTemporaryDir directory; QVERIFY(QDir().mkpath(directory.filePath("Jeu")));
+        FolderWatcher watcher; QSignalSpy changes(&watcher, &FolderWatcher::changed); watcher.watch(directory.path()); QVERIFY(watcher.watching());
+        const auto touched = [&changes](const QString& path) { for (const auto& signal : changes) for (const auto& changed : signal.first().toStringList()) if (changed == path) return true; return false; };
+        QFile clip(directory.filePath("Jeu/clip.mp4")); QVERIFY(clip.open(QIODevice::WriteOnly)); clip.write("clip"); clip.close();
+        QTRY_VERIFY_WITH_TIMEOUT(touched("Jeu/clip.mp4"), 3000);
+        // The folders stay the user's: they can be renamed and removed while they are followed.
+        QVERIFY(QDir(directory.path()).rename("Jeu", "Autre jeu")); QTRY_VERIFY_WITH_TIMEOUT(touched("Autre jeu"), 3000);
+        QVERIFY(QDir(directory.filePath("Autre jeu")).removeRecursively()); QVERIFY(!QFileInfo::exists(directory.filePath("Autre jeu")));
+        // Asked again for the same folder, nothing restarts; another folder, or none, replaces it.
+        watcher.watch(directory.path()); QVERIFY(watcher.watching());
+        watcher.watch(QString()); QVERIFY(!watcher.watching()); watcher.watch(directory.filePath("absent")); QVERIFY(!watcher.watching());
+        // A folder created since is followed when asked again.
+        QVERIFY(QDir().mkpath(directory.filePath("absent"))); watcher.watch(directory.filePath("absent")); QVERIFY(watcher.watching());
+    }
+    void crashReportsAreAnnouncedOnce() {
+        QTemporaryDir directory; QVERIFY(unseenCrashReport(directory.path()).isEmpty());
+        QFile report(directory.filePath("crash-20261014-101500.dmp")); QVERIFY(report.open(QIODevice::WriteOnly)); report.write("MDMP"); report.close();
+        QCOMPARE(unseenCrashReport(directory.path()), report.fileName()); QVERIFY(unseenCrashReport(directory.path()).isEmpty());
+        QTest::qWait(20); QFile next(directory.filePath("crash-20261014-111500.dmp")); QVERIFY(next.open(QIODevice::WriteOnly)); next.write("MDMP"); next.close();
+        QCOMPARE(unseenCrashReport(directory.path()), next.fileName());
     }
 };
 QTEST_GUILESS_MAIN(CoreTests)

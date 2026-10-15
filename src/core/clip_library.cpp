@@ -11,6 +11,7 @@
 #include <QFile>
 #include <QSet>
 #include <QThread>
+#include <QUuid>
 #include <algorithm>
 
 namespace clipsapp {
@@ -133,27 +134,40 @@ ClipRename renameClipFile(const QString& path, const QString& name) {
     }
     return {{}, QStringLiteral("Impossible de renommer le clip : ") + error};
 }
-LibraryScan scanLibrary(const QString& directory, bool sharingOnly) {
+QString screenshotsDirectory(const QString& libraryPath) { return QDir(libraryPath).filePath(QStringLiteral("Screenshots")); }
+bool isImageFile(const QString& path) { return QStringList{"png", "jpg", "jpeg", "webp", "bmp"}.contains(QFileInfo(path).suffix().toLower()); }
+QString capturedFileName(const QString& gameFolder, const QString& suffix) {
+    return QStringLiteral("%1-%2-%3.%4").arg(gameFolder, QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd_HH-mm-ss-zzz")), QUuid::createUuid().toString(QUuid::Id128).left(8), suffix);
+}
+namespace {
+LibraryScan scanFiles(const QString& directory, const std::function<bool(const QFileInfo&, const QStringList&)>& wanted) {
     LibraryScan result;
     const QDir root(directory);
     if (!root.exists()) return result;
     QDirIterator it(directory, QDir::Files | QDir::NoSymLinks, QDirIterator::Subdirectories);
-    const QStringList extensions {"mp4", "mkv", "webm", "mov", "avi"};
     int visited = 0;
     while (it.hasNext()) {
         it.next();
         if (++visited > 50000 || result.clips.size() >= 10000) { result.warning = QStringLiteral("La bibliothèque est volumineuse. Affichage limité aux premiers fichiers trouvés."); break; }
         const QFileInfo info = it.fileInfo();
-        if (info.fileName().endsWith(".discord.mp4", Qt::CaseInsensitive) != sharingOnly) continue;
-        if (!extensions.contains(info.suffix().toLower())) continue;
         const auto relative = root.relativeFilePath(info.absoluteFilePath());
         const auto parts = relative.split('/');
+        if (!wanted(info, parts)) continue;
         const QString game = parts.size() > 1 ? parts.first() : QStringLiteral("Non classé");
         result.clips.append({info.absoluteFilePath(), info.completeBaseName(), game, info.suffix().toUpper(), info.size(), info.lastModified()});
     }
     std::sort(result.clips.begin(), result.clips.end(), [](const auto& left, const auto& right) { return left.modified > right.modified; });
     return result;
 }
+}
+LibraryScan scanLibrary(const QString& directory, bool sharingOnly) {
+    static const QStringList extensions{"mp4", "mkv", "webm", "mov", "avi"};
+    return scanFiles(directory, [sharingOnly](const QFileInfo& info, const QStringList& parts) {
+        if (!sharingOnly && parts.size() > 1 && parts.first().compare(QStringLiteral("Screenshots"), Qt::CaseInsensitive) == 0) return false;
+        return info.fileName().endsWith(".discord.mp4", Qt::CaseInsensitive) == sharingOnly && extensions.contains(info.suffix().toLower());
+    });
+}
+LibraryScan scanImages(const QString& directory) { return scanFiles(directory, [](const QFileInfo& info, const QStringList&) { return isImageFile(info.fileName()); }); }
 ClipTrashResult trashClips(const QStringList& paths, ClipTrashOperation operation) {
     ClipTrashResult result; QSet<QString> seen;
     if (!operation) operation = [](const QString& path, QString& error) {

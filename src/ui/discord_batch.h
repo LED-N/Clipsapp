@@ -3,11 +3,16 @@
 #include <QElapsedTimer>
 #include <QFutureWatcher>
 #include <QObject>
+#include <functional>
 #include <optional>
 namespace clipsapp {
 struct DiscordPrepared { ClipInfo info; QString error; };
 // The mix is the usual level of each track: a clip shared whole is given it, as in the editor.
-struct ShareOptions { QString directory; qint64 maxBytes = 20000000; QString codec = "h264"; bool autoResize = true; TrackMix mix; };
+// The usual levels of a clip come from its game: "clipMix" answers for each one, "mix" without it.
+struct ShareOptions {
+    QString directory; qint64 maxBytes = 20000000; QString codec = "h264"; bool autoResize = true; TrackMix mix; std::function<TrackMix(const QString&)> clipMix;
+    TrackMix mixOf(const QString& path) const { return clipMix ? clipMix(path) : mix; }
+};
 struct ShareJob {
     enum State { Pending, Running, Ready, Failed, Cancelled };
     QString source, name; State state = Pending; int progress = 0, batch = 0;

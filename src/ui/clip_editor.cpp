@@ -57,6 +57,10 @@ ClipEditor::ClipEditor(QWidget* parent) : QWidget(parent), m_player(this), m_exp
     m_canvas = new VideoCanvas; center->addWidget(m_canvas, 1);
     m_mode = new Segmented; m_mode->setObjectName("crop-mode"); m_mode->setDark(true); m_mode->addOption(QStringLiteral("Cadrer"), QStringLiteral("crop")); m_mode->addOption(QStringLiteral("Résultat"), QStringLiteral("eye"));
     auto* overlay = new QWidget; auto* overlayLayout = new QHBoxLayout(overlay); overlayLayout->setContentsMargins(0, 0, 0, 0); overlayLayout->setSpacing(6); overlayLayout->addWidget(m_mode);
+    // The image on screen, taken at the size of the clip, with its framing if one is set.
+    m_screenshot = new Button(QStringLiteral("camera"), QString(), Button::Secondary); m_screenshot->setObjectName("editor-screenshot"); m_screenshot->setFixedSize(34, 34);
+    m_screenshot->setToolTip(QStringLiteral("Screenshot de l'image affichée, en qualité d'origine, avec le cadrage choisi")); m_screenshot->setAccessibleName(QStringLiteral("Screenshot de l'image affichée")); overlayLayout->addWidget(m_screenshot);
+    connect(m_screenshot, &QPushButton::clicked, this, [this] { if (m_initialized) emit screenshotRequested(m_path, m_player.snapshot().positionMs, m_edit.crop); });
     m_fullScreen = new Button(QStringLiteral("expand"), QString(), Button::Secondary); m_fullScreen->setObjectName("editor-full-screen"); m_fullScreen->setFixedSize(34, 34);
     m_fullScreen->setToolTip(QStringLiteral("Voir le résultat en plein écran (F)")); m_fullScreen->setAccessibleName(QStringLiteral("Voir le résultat en plein écran")); overlayLayout->addWidget(m_fullScreen);
     m_canvas->setOverlay(overlay);
@@ -267,7 +271,13 @@ void ClipEditor::finishRename(bool commit) {
     const auto name = m_titleEdit->text().trimmed(); m_titleEdit->hide(); m_title->show(); m_rename->show();
     if (commit && !name.isEmpty() && name != QFileInfo(m_path).completeBaseName()) emit renameRequested(m_path, name);
 }
-void ClipEditor::setGame(const QString& game) { m_game = game; m_gameTag->setText(game); m_gameTag->setVisible(!game.isEmpty()); }
+void ClipEditor::setGame(const QString& game) {
+    m_game = game; m_gameTag->setText(game); m_gameTag->setVisible(!game.isEmpty());
+    // The usual volumes of a clip are those of its game: kept for it, they leave the other games as they are.
+    m_keepMix->setText(game.isEmpty() ? QStringLiteral("Garder ces volumes par défaut") : QStringLiteral("Garder ces volumes pour %1").arg(game));
+    m_keepMix->setToolTip(game.isEmpty() ? QStringLiteral("<qt>Les prochains clips s'ouvriront avec ces volumes, dans l'éditeur, en plein écran et dans les copies de partage. Les fichiers enregistrés ne sont pas modifiés.</qt>")
+        : QStringLiteral("<qt>Les clips %1 s'ouvriront avec ces volumes, dans l'éditeur, en plein écran et dans les copies de partage ; ceux des autres jeux ne changent pas. Les fichiers enregistrés ne sont pas modifiés.</qt>").arg(game.toHtmlEscaped()));
+}
 void ClipEditor::stopAnalysis() { if (m_analysisStop) *m_analysisStop = true; if (m_analysis) { delete m_analysis; m_analysis = nullptr; } }
 void ClipEditor::beginAnalysis() {
     m_analysisTasks.erase(std::remove_if(m_analysisTasks.begin(), m_analysisTasks.end(), [](const auto& task) { return task.isFinished(); }), m_analysisTasks.end());

@@ -84,6 +84,10 @@ BufferRange usualBufferMiB(const RecordingProfile& profile) {
 QStringList AppConfig::validationErrors() const {
     QStringList errors;
     if (libraryPath.trimmed().isEmpty() || !QDir::isAbsolutePath(libraryPath)) errors << QStringLiteral("Choisissez un dossier de clips avec un chemin absolu.");
+    if (!QStringList{"off", "launch", "games"}.contains(autoReplay)) errors << QStringLiteral("Mode de replay automatique inconnu.");
+    if (replayGames.size() > 64) errors << QStringLiteral("Le replay automatique suit 64 jeux au plus.");
+    if (gameMixes.size() > 200) errors << QStringLiteral("Les volumes habituels sont retenus pour 200 jeux au plus.");
+    if (screenshotSoundVolume < 0 || screenshotSoundVolume > 100) errors << QStringLiteral("Le volume du son des screenshots doit être compris entre 0 et 100.");
     if (profiles.isEmpty() || !activeProfile()) errors << QStringLiteral("Le profil actif est absent.");
     QSet<QString> profileIds;
     for (const auto& profile : profiles) {
@@ -99,9 +103,11 @@ QStringList AppConfig::validationErrors() const {
         if (v.quality < 10 || v.quality > 30) errors << prefix + QStringLiteral("Le niveau de qualité doit être compris entre 10 et 30.");
         if (v.effort != "fast" && v.effort != "thorough") errors << prefix + QStringLiteral("Effort d'encodage inconnu.");
         if (v.codec != "h264" && v.codec != "hevc") errors << prefix + QStringLiteral("Codec inconnu.");
-        if (!QStringList{"auto", "nvenc", "amf", "qsv", "vaapi"}.contains(v.encoder)) errors << prefix + QStringLiteral("Encodeur inconnu.");
+        if (!QStringList{"auto", "nvenc", "amf", "vaapi"}.contains(v.encoder)) errors << prefix + QStringLiteral("Encodeur inconnu.");
         if (profile.replay.durationSeconds < 15 || profile.replay.durationSeconds > 600) errors << prefix + QStringLiteral("La durée doit être comprise entre 15 et 600 secondes.");
         if (profile.replay.memoryLimitMiB < 128 || profile.replay.memoryLimitMiB > 8192) errors << prefix + QStringLiteral("La limite de mémoire doit être comprise entre 128 et 8192 Mio.");
+        // One key pressed, one thing done: a shortcut that saved a clip and took a screenshot would do both.
+        if (!screenshotHotkey.isEmpty() && profile.replay.hotkey.compare(screenshotHotkey, Qt::CaseInsensitive) == 0) errors << prefix + QStringLiteral("Le raccourci des screenshots doit être différent de celui du replay.");
         QSet<QString> trackIds;
         for (const auto& track : profile.tracks) {
             if (track.id.isEmpty() || trackIds.contains(track.id) || track.name.trimmed().isEmpty()) errors << prefix + QStringLiteral("Une piste audio est invalide.");
@@ -134,8 +140,13 @@ QJsonObject AppConfig::toJson() const {
         });
     }
     const auto levels = [](const TrackMix& mix) { QJsonObject object; for (auto track = mix.cbegin(); track != mix.cend(); ++track) object.insert(track.key(), track.value()); return object; };
-    QJsonArray history; for (const auto& exported : mixHistory) history.append(levels(exported));
-    return {{"mix", QJsonObject{{"levels", levels(defaultMix)}, {"history", history}, {"declined", levels(mixDeclined)}}}, {"schemaVersion", 1}, {"audioRoutingVersion", 2}, {"libraryPath", libraryPath}, {"activeProfileId", activeProfileId}, {"profiles", profileArray}, {"clipSavedSound", clipSavedSound}, {"clipSavedNotification", clipSavedNotification}, {"playbackVolume", playbackVolume}, {"checkUpdates", checkUpdates}, {"closeToTray", closeToTray}, {"trayNoticeShown", trayNoticeShown}, {"startMenuShortcut", startMenuShortcut}, {"discord", QJsonObject{{"limitBytes", discordLimitBytes}, {"codec", discordCodec}, {"autoResize", discordAutoResize}}}};
+    const auto historyOf = [&levels](const QList<TrackMix>& exports) { QJsonArray array; for (const auto& exported : exports) array.append(levels(exported)); return array; };
+    QSet<QString> named; for (auto it = gameMixes.cbegin(); it != gameMixes.cend(); ++it) named.insert(it.key());
+    for (auto it = gameMixHistory.cbegin(); it != gameMixHistory.cend(); ++it) named.insert(it.key());
+    for (auto it = gameMixDeclined.cbegin(); it != gameMixDeclined.cend(); ++it) named.insert(it.key());
+    QJsonObject games; for (const auto& game : named) games.insert(game, QJsonObject{{"levels", levels(gameMixes.value(game))}, {"history", historyOf(gameMixHistory.value(game))}, {"declined", levels(gameMixDeclined.value(game))}});
+    return {{"mix", QJsonObject{{"levels", levels(defaultMix)}, {"history", historyOf(mixHistory)}, {"declined", levels(mixDeclined)}, {"games", games}}},
+            {"screenshots", QJsonObject{{"hotkey", screenshotHotkey}, {"sound", screenshotSound}, {"soundId", screenshotSoundId}, {"soundVolume", screenshotSoundVolume}}}, {"schemaVersion", 1}, {"audioRoutingVersion", 2}, {"libraryPath", libraryPath}, {"activeProfileId", activeProfileId}, {"profiles", profileArray}, {"clipSavedSound", clipSavedSound}, {"clipSavedSoundId", clipSavedSoundId}, {"clipSavedSoundVolume", clipSavedSoundVolume}, {"clipSavedNotification", clipSavedNotification}, {"playbackVolume", playbackVolume}, {"checkUpdates", checkUpdates}, {"closeToTray", closeToTray}, {"trayNoticeShown", trayNoticeShown}, {"startMenuShortcut", startMenuShortcut}, {"startup", QJsonObject{{"atLogin", launchAtLogin}, {"autoReplay", autoReplay}, {"games", QJsonArray::fromStringList(replayGames)}}}, {"discord", QJsonObject{{"limitBytes", discordLimitBytes}, {"codec", discordCodec}, {"autoResize", discordAutoResize}}}};
 }
 bool AppConfig::fromJson(const QJsonObject& object, AppConfig& result, QString& error) {
     if (object.value("schemaVersion").toInt(-1) != 1) { error = QStringLiteral("Version du fichier de configuration non prise en charge."); return false; }
@@ -143,13 +154,27 @@ bool AppConfig::fromJson(const QJsonObject& object, AppConfig& result, QString& 
     candidate.libraryPath = object.value("libraryPath").toString();
     candidate.activeProfileId = object.value("activeProfileId").toString();
     candidate.clipSavedSound = object.value("clipSavedSound").toBool(true); candidate.clipSavedNotification = object.value("clipSavedNotification").toBool(true);
+    candidate.clipSavedSoundId = object.value("clipSavedSoundId").toString(QStringLiteral("duo")).left(32); candidate.clipSavedSoundVolume = std::clamp(object.value("clipSavedSoundVolume").toInt(50), 0, 100);
     candidate.playbackVolume = std::clamp(object.value("playbackVolume").toInt(100), 0, 100); candidate.checkUpdates = object.value("checkUpdates").toBool(true);
     candidate.closeToTray = object.value("closeToTray").toBool(true); candidate.trayNoticeShown = object.value("trayNoticeShown").toBool(false); candidate.startMenuShortcut = object.value("startMenuShortcut").toBool(false);
+    const auto startup = object.value("startup").toObject(); candidate.launchAtLogin = startup.value("atLogin").toBool(false); candidate.autoReplay = startup.value("autoReplay").toString("off");
+    for (const auto& game : startup.value("games").toArray()) if (const auto path = QDir::fromNativeSeparators(game.toString().trimmed()); !path.isEmpty() && !candidate.replayGames.contains(path, Qt::CaseInsensitive)) candidate.replayGames.append(path);
     const auto discord = object.value("discord").toObject(); candidate.discordLimitBytes = discord.value("limitBytes").toInteger(20000000); candidate.discordCodec = discord.value("codec").toString("h264"); candidate.discordAutoResize = discord.value("autoResize").toBool(true);
     // A level outside what the editor allows is not a setting: the track goes back to its recorded level.
     const auto levels = [](const QJsonValue& value) { TrackMix mix; const auto object = value.toObject(); for (auto track = object.constBegin(); track != object.constEnd(); ++track) { const double level = track.value().toDouble(-1); if (level >= 0 && level <= 2 && !mixKey(track.key()).isEmpty()) mix.insert(mixKey(track.key()), level); } return mix; };
     const auto mix = object.value("mix").toObject(); candidate.defaultMix = levels(mix.value("levels")); candidate.mixDeclined = levels(mix.value("declined"));
     for (const auto& exported : mix.value("history").toArray()) rememberExport(candidate.mixHistory, levels(exported));
+    const auto games = mix.value("games").toObject();
+    for (auto game = games.constBegin(); game != games.constEnd() && candidate.gameMixes.size() < 200; ++game) {
+        const auto name = game.key().trimmed().left(80); if (name.isEmpty()) continue; const auto entry = game.value().toObject();
+        if (const auto own = levels(entry.value("levels")); !own.isEmpty()) candidate.gameMixes.insert(name, own);
+        if (const auto refused = levels(entry.value("declined")); !refused.isEmpty()) candidate.gameMixDeclined.insert(name, refused);
+        QList<TrackMix> exports; for (const auto& exported : entry.value("history").toArray()) rememberExport(exports, levels(exported));
+        if (!exports.isEmpty()) candidate.gameMixHistory.insert(name, exports);
+    }
+    const auto screenshots = object.value("screenshots").toObject();
+    candidate.screenshotHotkey = screenshots.value("hotkey").toString(QStringLiteral("Ctrl+Alt+F11")); candidate.screenshotSound = screenshots.value("sound").toBool(true);
+    candidate.screenshotSoundId = screenshots.value("soundId").toString(QStringLiteral("shutter")).left(32); candidate.screenshotSoundVolume = std::clamp(screenshots.value("soundVolume").toInt(50), 0, 100);
     if (candidate.discordLimitBytes < 100000 || candidate.discordLimitBytes > 10000000000LL || !QStringList{"h264", "hevc", "av1"}.contains(candidate.discordCodec)) { error = QStringLiteral("Réglages de partage Discord invalides."); return false; }
     for (const auto& value : object.value("profiles").toArray()) {
         const auto obj = value.toObject();
@@ -162,6 +187,8 @@ bool AppConfig::fromJson(const QJsonObject& object, AppConfig& result, QString& 
         p.video.fps = v.value("fps").toInt(60); p.video.bitrateMbps = v.value("bitrateMbps").toInt(25);
         p.video.rateControl = v.value("rateControl").toString("bitrate"); p.video.quality = v.value("quality").toInt(20); p.video.effort = v.value("effort").toString("fast");
         p.video.codec = v.value("codec").toString("h264"); p.video.encoder = v.value("encoder").toString("auto");
+        // Intel Quick Sync was offered once and never worked: a profile that chose it goes back to the automatic choice.
+        if (p.video.encoder == QLatin1String("qsv")) p.video.encoder = QStringLiteral("auto");
         p.video.captureCursor = v.value("captureCursor").toBool(false);
         const auto r = obj.value("replay").toObject();
         p.replay.durationSeconds = r.value("durationSeconds").toInt(60); p.replay.memoryLimitMiB = r.value("memoryLimitMiB").toInt(512); p.replay.hotkey = r.value("hotkey").toString("Ctrl+Alt+F10");
@@ -189,6 +216,8 @@ bool AppConfig::fromJson(const QJsonObject& object, AppConfig& result, QString& 
         }
         candidate.profiles.append(p);
     }
+    // A file written before screenshots existed may use their default for the replay: they take another.
+    if (!screenshots.contains("hotkey")) for (const auto& p : candidate.profiles) if (p.replay.hotkey.compare(candidate.screenshotHotkey, Qt::CaseInsensitive) == 0) candidate.screenshotHotkey = QStringLiteral("Ctrl+Alt+F12");
     const auto errors = candidate.validationErrors();
     if (!errors.isEmpty()) { error = errors.join('\n'); return false; }
     result = candidate; error.clear(); return true;

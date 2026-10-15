@@ -8,11 +8,24 @@
 #include "library_page.h"
 #include "onboarding_page.h"
 #include "replay_strip.h"
+#include "screenshot_editor.h"
+#include "image_viewer.h"
+#include "whats_new.h"
 #include "settings_page.h"
 #include "thumbnail_cache.h"
 #include "update_service.h"
 #include "widgets.h"
+#include "core/app_log.h"
+#include "core/game_identity.h"
+#include "platform/folder_watch.h"
+#include "platform/game_detection.h"
+#include "platform/login_start.h"
 #include "platform/start_menu.h"
+#include "platform/system_info.h"
+#include "media/clip_reader.h"
+#ifdef Q_OS_WIN
+#include "platform/windows_video.h"
+#endif
 #include <QApplication>
 #include <QClipboard>
 #include <QCloseEvent>
@@ -22,6 +35,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QHBoxLayout>
+#include <QImageReader>
 #include <QJsonObject>
 #include <QMenu>
 #include <QMimeData>
@@ -79,7 +93,8 @@ int choose(QWidget* parent, const char* name, const QString& title, const QStrin
 bool confirmTrash(QWidget* parent, const QStringList& paths, bool copies) {
     ModalDialog dialog(parent, 480); dialog.setObjectName("delete-clips-prompt");
     QStringList names; for (const auto& path : paths) names.append(QFileInfo(path).fileName()); dialog.setProperty("names", names);
-    const auto count = paths.size(); const QString what = copies ? (count > 1 ? QStringLiteral("%1 copies").arg(count) : QStringLiteral("cette copie")) : (count > 1 ? QStringLiteral("%1 clips").arg(count) : QStringLiteral("ce clip"));
+    const bool images = std::all_of(paths.cbegin(), paths.cend(), [](const QString& path) { return isImageFile(path); });
+    const auto count = paths.size(); const QString what = copies ? (count > 1 ? QStringLiteral("%1 copies").arg(count) : QStringLiteral("cette copie")) : images ? (count > 1 ? QStringLiteral("%1 screenshots").arg(count) : QStringLiteral("ce screenshot")) : (count > 1 ? QStringLiteral("%1 clips").arg(count) : QStringLiteral("ce clip"));
     dialog.setHeading(QStringLiteral("Mettre %1 à la corbeille ?").arg(what), count > 1 ? QStringLiteral("Vous pourrez les récupérer depuis la corbeille du système.") : QStringLiteral("Vous pourrez le récupérer depuis la corbeille du système."),
         new IconBox(QStringLiteral("trash"), tk::danger, tk::dangerSoft), false);
     dialog.body()->setSpacing(10);
@@ -91,8 +106,8 @@ bool confirmTrash(QWidget* parent, const QStringList& paths, bool copies) {
     }
     auto* scroll = new QScrollArea; scroll->setWidgetResizable(true); scroll->setWidget(rows); scroll->setFrameShape(QFrame::NoFrame); scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     scroll->setFixedHeight(int(std::min<qsizetype>(6, count) * 30)); wellLayout->addWidget(scroll); dialog.body()->addWidget(well);
-    if (!copies) { auto* hint = new QHBoxLayout; hint->setSpacing(6); hint->addWidget(new IconLabel(QStringLiteral("info"), tk::text2, 14)); hint->addWidget(label(QStringLiteral("Les copies Discord déjà préparées sont conservées."), "hint"), 1); dialog.body()->addLayout(hint); }
-    auto* keep = new Button(copies ? (count > 1 ? QStringLiteral("Garder les copies") : QStringLiteral("Garder la copie")) : (count > 1 ? QStringLiteral("Garder les clips") : QStringLiteral("Garder le clip"))); keep->setObjectName("trash-keep");
+    if (!copies && !images) { auto* hint = new QHBoxLayout; hint->setSpacing(6); hint->addWidget(new IconLabel(QStringLiteral("info"), tk::text2, 14)); hint->addWidget(label(QStringLiteral("Les copies Discord déjà préparées sont conservées."), "hint"), 1); dialog.body()->addLayout(hint); }
+    auto* keep = new Button(copies ? (count > 1 ? QStringLiteral("Garder les copies") : QStringLiteral("Garder la copie")) : images ? (count > 1 ? QStringLiteral("Garder les screenshots") : QStringLiteral("Garder le screenshot")) : (count > 1 ? QStringLiteral("Garder les clips") : QStringLiteral("Garder le clip"))); keep->setObjectName("trash-keep");
     auto* confirm = new Button(QStringLiteral("trash"), QStringLiteral("Mettre à la corbeille"), Button::DangerSolid); confirm->setObjectName("trash-confirm"); confirm->setAutoDefault(false);
     dialog.footer()->addWidget(keep); dialog.footer()->addWidget(confirm); keep->setDefault(true); keep->setFocus();
     QObject::connect(keep, &QPushButton::clicked, &dialog, &QDialog::reject); QObject::connect(confirm, &QPushButton::clicked, &dialog, &QDialog::accept);
@@ -106,6 +121,11 @@ MainWindow::MainWindow(QString configDirectory, QWidget* parent, ClipTrashOperat
     m_store.load(m_config, m_loadError); m_saved = m_config;
     QString labelsError; m_labels.load(labelsError);
     m_replay = new ReplayEngine(this); m_globalHotkey = new GlobalHotkey(this); m_batch = new DiscordBatch(this); m_cache = new ThumbnailCache(this);
+    m_shotHotkey = new GlobalHotkey(this, 0x4c44); m_shotTask = new QFutureWatcher<QString>(this); m_imageScan = new QFutureWatcher<LibraryScan>(this);
+    // What was read of each clip is kept beside the settings: the next launch shows it without reading the clips again.
+    m_configDirectory = configDirectory; m_cache->setStorage(QDir(configDirectory).filePath(QStringLiteral("cache/thumbnails")));
+    m_folderWatch = new FolderWatcher(this); m_folderSettle = new QTimer(this); m_folderSettle->setSingleShot(true); m_folderSettle->setInterval(600);
+    m_autoWatch = new QTimer(this); m_autoWatch->setInterval(3000);
     m_updates = new UpdateService(QStringLiteral(CLIPSAPP_VERSION), QCoreApplication::applicationDirPath(), this);
     setWindowTitle(QStringLiteral("Clipsapp[*]")); resize(1220, 820); setMinimumSize(980, 650); setWindowIcon(appIcon());
     m_tray = new QSystemTrayIcon(windowIcon(), this); m_tray->setToolTip("Clipsapp");
@@ -116,6 +136,7 @@ MainWindow::MainWindow(QString configDirectory, QWidget* parent, ClipTrashOperat
     connect(trayMenu->addAction(QStringLiteral("Ouvrir Clipsapp")), &QAction::triggered, this, [this] { surface(); });
     trayMenu->addSeparator();
     m_traySave = trayMenu->addAction(QStringLiteral("Sauvegarder le clip")); connect(m_traySave, &QAction::triggered, this, [this] { saveReplay(); });
+    connect(trayMenu->addAction(QStringLiteral("Prendre un screenshot")), &QAction::triggered, this, [this] { takeScreenshot(); });
     m_trayToggle = trayMenu->addAction(QString()); connect(m_trayToggle, &QAction::triggered, this, [this] { toggleCapture(); });
     trayMenu->addSeparator();
     connect(trayMenu->addAction(QStringLiteral("Quitter Clipsapp")), &QAction::triggered, this, [this] { quit(); });
@@ -125,13 +146,14 @@ MainWindow::MainWindow(QString configDirectory, QWidget* parent, ClipTrashOperat
     m_strip = new ReplayStrip; vertical->addWidget(m_strip);
     auto* horizontal = new QHBoxLayout; horizontal->setSpacing(0); horizontal->addWidget(buildRail());
     m_pages = new QStackedWidget; m_library = new LibraryPage(m_cache); m_sharing = new SharingPage(m_cache, m_batch); m_settings = new SettingsPage(m_config, m_store.filePath()); m_editor = new ClipEditor; m_onboarding = new OnboardingPage(m_config);
-    for (auto* page : std::initializer_list<QWidget*>{m_library, m_sharing, m_settings, m_editor, m_onboarding}) m_pages->addWidget(page);
+    m_shots = new LibraryPage(m_cache, LibraryPage::Screenshots); m_shotEditor = new ScreenshotEditor;
+    for (auto* page : std::initializer_list<QWidget*>{m_library, m_sharing, m_settings, m_editor, m_onboarding, m_shots, m_shotEditor}) m_pages->addWidget(page);
     horizontal->addWidget(m_pages, 1); vertical->addLayout(horizontal, 1);
     m_toasts = new ToastHost(m_pages);
 
     // Replay strip
     connect(m_strip, &ReplayStrip::startRequested, this, [this] { startCapture(); });
-    connect(m_strip, &ReplayStrip::stopRequested, this, [this] { m_restartPending = false; m_replay->stop(); });
+    connect(m_strip, &ReplayStrip::stopRequested, this, [this] { stopCapture(); });
     connect(m_strip, &ReplayStrip::saveRequested, this, [this] { saveReplay(); });
     connect(m_strip, &ReplayStrip::fullScreenRequested, this, [this] { captureWholeScreen(); });
     connect(m_strip, &ReplayStrip::settingsRequested, this, [this] { m_settings->showTab(0); setPage(Settings); });
@@ -139,7 +161,7 @@ MainWindow::MainWindow(QString configDirectory, QWidget* parent, ClipTrashOperat
     connect(m_replay, &ReplayEngine::changed, this, [this] { updateCapture(); });
     connect(m_replay, &ReplayEngine::failed, this, [this](const QString& error) {
         // A capture that stops stays written in the strip until the user acts; a failed save is a notification.
-        if (m_replay->state() == ReplayEngine::State::Error) { m_replayError = firstLine(error); m_restartPending = false; updateCapture(); }
+        if (m_replay->state() == ReplayEngine::State::Error) { m_replayError = firstLine(error); m_restartPending = false; m_auto.failed(); updateCapture(); }
         else m_toasts->show(ToastHost::Error, QStringLiteral("Le clip n'a pas pu être sauvegardé"), error);
     });
     connect(m_replay, &ReplayEngine::saved, this, [this](const QString& path, double seconds) {
@@ -165,7 +187,7 @@ MainWindow::MainWindow(QString configDirectory, QWidget* parent, ClipTrashOperat
         QString error; if (!m_labels.setFavorites(paths, favorite, error)) m_toasts->show(ToastHost::Error, QStringLiteral("Favoris non enregistrés"), error);
         rebuildLibrary();
     });
-    for (auto* list : {m_library->list(), m_sharing->list()}) {
+    for (auto* list : {m_library->list(), m_sharing->list(), m_shots->list()}) {
         connect(list, &ClipListView::fileDragStarted, this, [this](int count, int unavailable) {
             m_toasts->show(ToastHost::Info, count > 1 ? QStringLiteral("Déposez les %1 fichiers dans Discord").arg(count) : QStringLiteral("Déposez le fichier dans Discord"),
                 QStringLiteral("Dans un message privé ou un salon, puis validez l'envoi.") + (unavailable ? QStringLiteral(" %1 fichier(s) indisponible(s) écarté(s).").arg(unavailable) : QString()));
@@ -173,6 +195,44 @@ MainWindow::MainWindow(QString configDirectory, QWidget* parent, ClipTrashOperat
         connect(list, &ClipListView::fileDragUnavailable, this, [this] { m_toasts->show(ToastHost::Warn, QStringLiteral("Fichiers introuvables"), QStringLiteral("La sélection n'existe plus sur le disque. La liste est actualisée.")); refreshLibrary(); refreshSharing(); });
     }
     connect(m_library, &LibraryPage::selectionBarVisible, this, [this](bool visible) { if (m_pages->currentWidget() == m_library) m_toasts->setBottomInset(visible ? 88 : 20); });
+
+    // Screenshots: the same list and the same marks as the clips, and an editor of their own.
+    connect(m_shots, &LibraryPage::openRequested, this, &MainWindow::openScreenshot);
+    connect(m_shots, &LibraryPage::viewRequested, this, &MainWindow::viewImages);
+    connect(m_shots, &LibraryPage::trashRequested, this, [this](const QStringList& paths) { deleteClips(paths); });
+    connect(m_shots, &LibraryPage::classifyRequested, this, &MainWindow::classifyClips);
+    connect(m_shots, &LibraryPage::renameRequested, this, &MainWindow::renameClip);
+    connect(m_shots, &LibraryPage::copyRequested, this, &MainWindow::copyFiles);
+    connect(m_shots, &LibraryPage::revealRequested, this, &MainWindow::revealFile);
+    connect(m_shots, &LibraryPage::favoriteRequested, this, [this](const QStringList& paths, bool favorite) {
+        QString error; if (!m_labels.setFavorites(paths, favorite, error)) m_toasts->show(ToastHost::Error, QStringLiteral("Favoris non enregistrés"), error);
+        rebuildScreenshots();
+    });
+    connect(m_shots, &LibraryPage::selectionBarVisible, this, [this](bool visible) { if (m_pages->currentWidget() == m_shots) m_toasts->setBottomInset(visible ? 88 : 20); });
+    connect(m_shotEditor, &ScreenshotEditor::backRequested, this, [this] { setPage(Screenshots); });
+    connect(m_shotEditor, &ScreenshotEditor::renameRequested, this, &MainWindow::renameClip);
+    connect(m_shotEditor, &ScreenshotEditor::deleteRequested, this, [this](const QString& path, bool confirmed) { deleteClips({path}, confirmed); });
+    connect(m_shotEditor, &ScreenshotEditor::copyRequested, this, &MainWindow::copyFiles);
+    connect(m_shotEditor, &ScreenshotEditor::revealRequested, this, &MainWindow::revealFile);
+    connect(m_shotEditor, &ScreenshotEditor::openRequested, this, &MainWindow::openScreenshot);
+    connect(m_shotEditor, &ScreenshotEditor::failed, this, [this](const QString& title, const QString& detail) { m_toasts->show(ToastHost::Error, title, detail); });
+    connect(m_shotEditor, &ScreenshotEditor::saved, this, [this](const QString& path, const QString& original) {
+        // A cropped picture keeps the game of the one it comes from.
+        const auto game = m_labels.gameFor(original, {}); QString error; if (!game.isEmpty()) m_labels.setGame(path, game, error);
+        m_freshShots.insert(path); refreshScreenshots();
+    });
+    connect(m_editor, &ClipEditor::screenshotRequested, this, &MainWindow::screenshotFromClip);
+    connect(m_shotHotkey, &GlobalHotkey::activated, this, [this] { takeScreenshot(); });
+    connect(m_shotTask, &QFutureWatcher<QString>::finished, this, [this] { screenshotDone(); });
+    connect(m_imageScan, &QFutureWatcher<LibraryScan>::finished, this, [this] {
+        auto result = m_imageScan->result();
+        if (m_imageRescanPending) { m_imageRescanPending = false; refreshScreenshots(); return; }
+        for (auto& image : result.clips) image.game = m_labels.gameFor(image.path, image.game);
+        const auto same = [](const ClipEntry& left, const ClipEntry& right) { return left.path == right.path && left.size == right.size && left.modified == right.modified && left.game == right.game; };
+        const bool unchanged = m_imagesScanned && result.clips.size() == m_images.size() && std::equal(result.clips.cbegin(), result.clips.cend(), m_images.cbegin(), same);
+        m_images = result.clips; m_imagesScanned = true; m_shots->setLoading(false);
+        if (!unchanged) rebuildScreenshots();
+    });
     connect(m_sharing, &SharingPage::selectionBarVisible, this, [this](bool visible) { if (m_pages->currentWidget() == m_sharing) m_toasts->setBottomInset(visible ? 88 : 20); });
 
     // Sharing
@@ -194,7 +254,7 @@ MainWindow::MainWindow(QString configDirectory, QWidget* parent, ClipTrashOperat
     connect(m_batch, &DiscordBatch::highQualityReady, this, [this](const QString& path, const QString& original, const ClipEdit& edit) {
         const auto game = m_labels.gameFor(original, {}); QString error; if (!game.isEmpty()) m_labels.setGame(path, game, error);
         m_editor->noteHighQualityExport(original, edit); refreshLibrary();
-        if (m_editor->clipPath() == original && !m_editor->clipInfo().mixed) learnMix(editLevels(edit));
+        if (m_editor->clipPath() == original && !m_editor->clipInfo().mixed) learnMix(editLevels(edit), gameOf(original));
     });
     connect(m_batch, &DiscordBatch::finished, this, [this](int, int failed, bool cancelled) {
         refreshSharing(); if (m_shareDialog) return;
@@ -206,7 +266,8 @@ MainWindow::MainWindow(QString configDirectory, QWidget* parent, ClipTrashOperat
     connect(m_settings, &SettingsPage::edited, this, [this] { setWindowModified(dirty()); updateCapture(); });
     connect(m_settings, &SettingsPage::saveRequested, this, [this] { saveConfig(); });
     connect(m_settings, &SettingsPage::revertRequested, this, [this] { revertConfig(); });
-    connect(m_settings, &SettingsPage::stopReplayRequested, this, [this] { m_restartPending = false; m_replay->stop(); });
+    connect(m_settings, &SettingsPage::stopReplayRequested, this, [this] { stopCapture(); });
+    connect(m_settings, &SettingsPage::copyDiagnosticRequested, this, [this] { copyDiagnostic(); });
     connect(m_settings, &SettingsPage::chooseFolderRequested, this, [this] { chooseLibraryFolder(); });
     connect(m_settings, &SettingsPage::openSettingsFolderRequested, this, [this] { QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(m_store.filePath()).absolutePath())); });
     connect(m_settings, &SettingsPage::notice, this, [this](const QString& title, const QString& text) { m_toasts->show(ToastHost::Ok, title, text); });
@@ -232,9 +293,14 @@ MainWindow::MainWindow(QString configDirectory, QWidget* parent, ClipTrashOperat
         const auto game = m_labels.gameFor(original, {}); QString error;
         if (!game.isEmpty() && !m_labels.setGame(path, game, error)) m_toasts->show(ToastHost::Warn, QStringLiteral("Classement non repris"), error);
         m_fresh.insert(path); refreshLibrary();
-        if (m_editor->clipPath() == original && !m_editor->clipInfo().mixed) learnMix(editLevels(m_editor->exportedEdit()));
+        if (m_editor->clipPath() == original && !m_editor->clipInfo().mixed) learnMix(editLevels(m_editor->exportedEdit()), gameOf(original));
     });
     connect(m_editor, &ClipEditor::mixChosen, this, [this](const TrackMix& mix) {
+        // Kept for the game of the clip: the clips of other games keep theirs.
+        if (const auto game = gameOf(m_editor->clipPath()); !game.isEmpty()) {
+            adoptGameMix(game, mix); m_toasts->show(ToastHost::Ok, QStringLiteral("Volumes de %1 enregistrés").arg(game), QStringLiteral("Les clips %1 s'ouvrent avec ces volumes ; ceux des autres jeux ne changent pas. Ils se retrouvent dans Réglages › Audio.").arg(game));
+            return;
+        }
         adoptMix(mix); m_toasts->show(ToastHost::Ok, QStringLiteral("Volumes habituels enregistrés"), QStringLiteral("Les prochains clips s'ouvrent avec ces volumes. Ils se règlent aussi dans Réglages › Audio."));
     });
     connect(m_editor, &ClipEditor::deleteRequested, this, [this](const QString& path, bool confirmed) { deleteClips({path}, confirmed); });
@@ -255,9 +321,11 @@ MainWindow::MainWindow(QString configDirectory, QWidget* parent, ClipTrashOperat
         const auto result = m_trash->result(); QString error;
         if (!result.removed.isEmpty()) {
             m_labels.forget(result.removed, error);
-            for (const auto& path : result.removed) { m_editor->forgetClip(path); m_fresh.remove(path); }
+            for (const auto& path : result.removed) { m_editor->forgetClip(path); m_fresh.remove(path); m_freshShots.remove(path); m_shotEditor->forgetImage(path); }
+            // The screenshot shown is gone: back to the list.
+            if (m_pages->currentWidget() == m_shotEditor && m_shotEditor->imagePath().isEmpty()) setPage(Screenshots);
         }
-        m_cache->setActive(true); updateBusy(); refreshLibrary(); refreshSharing();
+        m_cache->setActive(true); updateBusy(); refreshLibrary(); refreshSharing(); refreshScreenshots();
         const auto count = result.removed.size();
         if (!result.errors.isEmpty()) m_toasts->show(ToastHost::Warn, QStringLiteral("%1 fichier(s) sont restés en place").arg(result.errors.size()), result.errors.first());
         else if (count) m_toasts->show(ToastHost::Ok, count > 1 ? QStringLiteral("%1 fichiers mis à la corbeille").arg(count) : QStringLiteral("Fichier mis à la corbeille"), QStringLiteral("La corbeille du système permet de les récupérer."));
@@ -266,43 +334,80 @@ MainWindow::MainWindow(QString configDirectory, QWidget* parent, ClipTrashOperat
     connect(m_rename, &QFutureWatcher<ClipRename>::finished, this, [this] {
         const auto result = m_rename->result(); const auto from = m_renaming; m_renaming.clear(); m_cache->setActive(true); updateBusy();
         const auto reopen = m_reopenAfterRename; m_reopenAfterRename.clear();
-        if (!result.error.isEmpty()) { m_toasts->show(ToastHost::Error, QStringLiteral("Le clip n'a pas été renommé"), result.error); if (!reopen.isEmpty()) openClip(from); return; }
-        QString error; m_labels.moveClip(from, result.path, error); m_editor->moveClip(from, result.path);
+        if (!result.error.isEmpty()) { m_toasts->show(ToastHost::Error, isImageFile(from) ? QStringLiteral("Le screenshot n'a pas été renommé") : QStringLiteral("Le clip n'a pas été renommé"), result.error); if (!reopen.isEmpty()) openClip(from); return; }
+        QString error; m_labels.moveClip(from, result.path, error); m_editor->moveClip(from, result.path); m_shotEditor->moveImage(from, result.path);
         if (m_fresh.remove(from)) m_fresh.insert(result.path);
-        m_selectAfterScan = {result.path}; refreshLibrary(); refreshSharing();
+        if (m_freshShots.remove(from)) m_freshShots.insert(result.path);
+        m_selectAfterScan = {result.path}; refreshLibrary(); refreshSharing(); refreshScreenshots();
         if (!reopen.isEmpty()) openClip(result.path);
     });
     connect(m_shareScan, &QFutureWatcher<LibraryScan>::finished, this, [this] {
         if (m_shareRescanPending) { m_shareRescanPending = false; refreshSharing(); return; }
-        const auto scan = m_shareScan->result(); m_copies.clear();
-        for (const auto& clip : scan.clips) m_copies.append({clip, m_labels.shareLink(clip.path)});
-        m_sharing->setCopies(m_copies, m_config.discordLimitBytes); updateNav(); rebuildLibrary();
+        const auto scan = m_shareScan->result(); QList<ShareCopy> copies;
+        for (const auto& clip : scan.clips) copies.append({clip, m_labels.shareLink(clip.path)});
+        const auto same = [](const ShareCopy& left, const ShareCopy& right) { return left.file.path == right.file.path && left.file.size == right.file.size && left.file.modified == right.file.modified && left.link.source == right.link.source && left.link.limitBytes == right.link.limitBytes; };
+        // The page follows the state of the batch as well; the library only needs the copies themselves.
+        const bool unchanged = m_sharesScanned && copies.size() == m_copies.size() && std::equal(copies.cbegin(), copies.cend(), m_copies.cbegin(), same);
+        m_copies = copies; m_sharesScanned = true;
+        m_sharing->setCopies(m_copies, m_config.discordLimitBytes); updateNav(); if (!unchanged) rebuildLibrary();
     });
     connect(m_scan, &QFutureWatcher<LibraryScan>::finished, this, [this] {
-        const auto result = m_scan->result();
+        auto result = m_scan->result();
         if (m_rescanPending) { m_rescanPending = false; refreshLibrary(); return; }
+        for (auto& clip : result.clips) clip.game = m_labels.gameFor(clip.path, clip.game);
+        // The folder is read again on every change seen in it: a list that is still the same is left as it is.
+        const auto same = [](const ClipEntry& left, const ClipEntry& right) { return left.path == right.path && left.size == right.size && left.modified == right.modified && left.game == right.game && left.name == right.name; };
+        const bool unchanged = m_scanned && result.clips.size() == m_clips.size() && std::equal(result.clips.cbegin(), result.clips.cend(), m_clips.cbegin(), same);
         m_clips = result.clips; m_scanned = true;
-        for (auto& clip : m_clips) clip.game = m_labels.gameFor(clip.path, clip.game);
-        m_library->setLoading(false); rebuildLibrary();
+        m_library->setLoading(false); if (!unchanged || !m_selectAfterScan.isEmpty()) rebuildLibrary();
         if (!m_selectAfterScan.isEmpty()) { m_library->select(m_selectAfterScan); m_selectAfterScan.clear(); }
-        if (!result.warning.isEmpty()) m_toasts->show(ToastHost::Warn, QStringLiteral("Bibliothèque volumineuse"), result.warning);
+        if (!result.warning.isEmpty() && result.warning != m_scanWarning) m_toasts->show(ToastHost::Warn, QStringLiteral("Bibliothèque volumineuse"), result.warning);
+        m_scanWarning = result.warning;
     });
     auto* find = new QShortcut(QKeySequence::Find, this); connect(find, &QShortcut::activated, this, [this] { if (m_pages->currentWidget() == m_library) m_library->focusSearch(); });
+
+    // A clip copied, renamed or deleted from the Explorer shows in the lists by itself. What changes
+    // comes in bursts, a copy most of all: the lists are read again once it settles.
+    connect(m_folderWatch, &FolderWatcher::changed, this, [this](const QStringList& paths) {
+        bool library = paths.isEmpty(), sharing = paths.isEmpty(), shots = paths.isEmpty();
+        for (const auto& path : paths) {
+            // A file that is neither a clip nor a picture, written under a temporary name for instance,
+            // changes nothing in the lists. A folder, or what is already gone, may have held some.
+            const QFileInfo file(QDir(m_config.libraryPath).filePath(path)); const auto first = path.section('/', 0, 0);
+            if (file.isFile() && !QStringList{"mp4", "mkv", "webm", "mov", "avi"}.contains(file.suffix().toLower()) && !isImageFile(path)) continue;
+            if (first.compare(QStringLiteral("Partage Discord"), Qt::CaseInsensitive) == 0) sharing = true;
+            else if (first.compare(QStringLiteral("Screenshots"), Qt::CaseInsensitive) == 0) shots = true;
+            else library = true;
+        }
+        m_folderLibrary |= library; m_folderSharing |= sharing; m_folderShots |= shots;
+        if (library || sharing || shots) m_folderSettle->start();
+    });
+    connect(m_folderSettle, &QTimer::timeout, this, [this] {
+        if (std::exchange(m_folderLibrary, false)) refreshLibrary();
+        if (std::exchange(m_folderSharing, false)) refreshSharing();
+        if (std::exchange(m_folderShots, false)) refreshScreenshots();
+    });    connect(m_autoWatch, &QTimer::timeout, this, [this] { autoReplayTick(); });
 
     m_settings->refreshCatalog(); m_settings->load(); m_settings->setSaved(m_saved); m_onboarding->setCatalog(m_settings->catalog()); spreadMix();
     setPage(m_firstLaunch ? Onboarding : Library);
     if (!m_loadError.isEmpty()) m_toasts->show(ToastHost::Warn, QStringLiteral("Réglages illisibles"), QStringLiteral("Les réglages par défaut sont affichés. Le fichier d'origine sera conservé à côté du nouveau."));
     if (!labelsError.isEmpty()) m_toasts->show(ToastHost::Warn, QStringLiteral("Classement illisible"), labelsError);
-    m_library->setLoading(true); refreshLibrary(); refreshSharing(); updateCapture();
+    m_library->setLoading(true); m_shots->setLoading(true); refreshLibrary(); refreshSharing(); refreshScreenshots(); updateCapture();
 }
 QWidget* MainWindow::buildRail() {
     auto* rail = new QFrame; m_rail = rail; rail->setObjectName("sidebar"); rail->setFixedWidth(208); rail->setStyleSheet(QStringLiteral("QFrame#sidebar { background: #101318; border: none; border-right: 1px solid #242A34; }"));
     auto* layout = new QVBoxLayout(rail); layout->setContentsMargins(10, 12, 11, 14); layout->setSpacing(2);
+    // Under each kind, its favourites and its games: shown only while that kind is the one on screen.
+    const auto games = [rail, layout](const char* name, QWidget*& host, QVBoxLayout*& list) {
+        host = new QWidget; list = new QVBoxLayout(host); list->setContentsMargins(0, 0, 0, 0); list->setSpacing(1);
+        auto* scroll = new QScrollArea(rail); scroll->setObjectName(name); scroll->setWidgetResizable(true); scroll->setWidget(host); scroll->setFrameShape(QFrame::NoFrame); scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff); scroll->setMaximumHeight(0);
+        // The list of games takes the height it needs before the empty space below does, and scrolls only when the rail is full.
+        layout->addWidget(scroll, 1000);
+    };
     auto* clips = new NavButton(QStringLiteral("clips"), QStringLiteral("Clips")); clips->setObjectName("nav-clips"); m_clipsNav = clips; layout->addWidget(clips);
-    m_subNavHost = new QWidget; m_subNav = new QVBoxLayout(m_subNavHost); m_subNav->setContentsMargins(0, 0, 0, 0); m_subNav->setSpacing(1);
-    auto* scroll = new QScrollArea; scroll->setObjectName("nav-games"); scroll->setWidgetResizable(true); scroll->setWidget(m_subNavHost); scroll->setFrameShape(QFrame::NoFrame); scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff); scroll->setMaximumHeight(0);
-    // The list of games takes the height it needs before the empty space below does, and scrolls only when the rail is full.
-    layout->addWidget(scroll, 1000); layout->addSpacing(8);
+    games("nav-games", m_subNavHost, m_subNav);
+    auto* shots = new NavButton(QStringLiteral("image"), QStringLiteral("Screenshots")); shots->setObjectName("nav-screenshots"); m_shotsNav = shots; layout->addWidget(shots);
+    games("nav-screenshot-games", m_shotSubNavHost, m_shotSubNav); layout->addSpacing(8);
     auto* share = new NavButton(QStringLiteral("share"), QStringLiteral("Partage Discord")); share->setObjectName("nav-sharing"); m_shareNav = share; layout->addWidget(share);
     auto* settings = new NavButton(QStringLiteral("settings"), QStringLiteral("Réglages")); settings->setObjectName("nav-settings"); m_settingsNav = settings; layout->addWidget(settings); layout->addStretch(1);
     // A newer version waits here, out of the way, until the user wants it.
@@ -310,43 +415,67 @@ QWidget* MainWindow::buildRail() {
     connect(m_updateButton, &QPushButton::clicked, this, [this] { showUpdate(); });
     auto* foot = new QVBoxLayout; foot->setContentsMargins(10, 0, 10, 0); foot->setSpacing(2); auto* local = new QHBoxLayout; local->setSpacing(6);
     local->addWidget(new IconLabel(QStringLiteral("lock"), tk::text2, 14)); local->addWidget(label(QStringLiteral("Vos clips restent sur ce PC"), "small"), 1); foot->addLayout(local);
-    foot->addWidget(label(QStringLiteral("Version %1").arg(CLIPSAPP_VERSION), "small3")); layout->addLayout(foot);
+    // The version opens the journal of the versions, on the one in use.
+    auto* version = new QPushButton(QStringLiteral("Version %1").arg(CLIPSAPP_VERSION)); version->setObjectName("app-version"); version->setFont(uiFont(12)); version->setCursor(Qt::PointingHandCursor); version->setFocusPolicy(Qt::TabFocus);
+    version->setToolTip(QStringLiteral("Voir les nouveautés de chaque version")); version->setFlat(true);
+    version->setStyleSheet(QStringLiteral("QPushButton#app-version { border: none; background: transparent; padding: 0; text-align: left; color: #8A94A5; } QPushButton#app-version:hover, QPushButton#app-version:focus { color: #E9EDF3; text-decoration: underline; }"));
+    foot->addWidget(version, 0, Qt::AlignLeft); layout->addLayout(foot);
+    connect(version, &QPushButton::clicked, this, [this] { showChangelog(); });
     connect(clips, &QPushButton::clicked, this, [this] { m_libraryFilter = LibraryPage::All; m_libraryGame.clear(); m_library->setFilter(LibraryPage::All); setPage(Library); });
+    connect(shots, &QPushButton::clicked, this, [this] { m_shotFilter = LibraryPage::All; m_shotGame.clear(); m_shots->setFilter(LibraryPage::All); setPage(Screenshots); });
     connect(share, &QPushButton::clicked, this, [this] { setPage(Sharing); refreshSharing(); });
     connect(settings, &QPushButton::clicked, this, [this] { setPage(Settings); });
     return rail;
 }
 void MainWindow::rebuildRail() {
-    while (auto* child = m_subNav->takeAt(0)) { if (child->widget()) { child->widget()->hide(); child->widget()->deleteLater(); } delete child; }
-    QHash<QString, int> counts; int favorites = 0; for (const auto& clip : m_clips) { ++counts[clip.game]; if (m_labels.isFavorite(clip.path)) ++favorites; }
-    QList<QPair<QString, int>> games; for (auto it = counts.cbegin(); it != counts.cend(); ++it) if (it.key() != unclassified) games.append({it.key(), it.value()});
-    std::sort(games.begin(), games.end(), [](const auto& left, const auto& right) { return left.second != right.second ? left.second > right.second : left.first.localeAwareCompare(right.first) < 0; });
-    int rows = 0;
-    const auto add = [&](const QString& text, int count, int filter, const QString& game) {
-        auto* button = new NavButton(QString(), text, true); button->setNote(QString::number(count)); button->setProperty("filter", filter); button->setProperty("game", game); button->setToolTip(text); m_subNav->addWidget(button); ++rows;
-        connect(button, &QPushButton::clicked, this, [this, filter, game] { m_libraryFilter = filter; m_libraryGame = game; m_library->setFilter(LibraryPage::Filter(filter), game); setPage(Library); });
+    const auto* current = m_pages->currentWidget();
+    const bool clipsShown = current == m_library || current == m_editor, shotsShown = current == m_shots || current == m_shotEditor;
+    // The rows of one kind: its favourites, its games by number, and what has none.
+    const auto fill = [this](QVBoxLayout* list, const char* scrollName, const QList<ClipEntry>& entries, bool shown, int& filter, QString& selected, LibraryPage* page, Page target) {
+        while (auto* child = list->takeAt(0)) { if (child->widget()) { child->widget()->hide(); child->widget()->deleteLater(); } delete child; }
+        QHash<QString, int> counts; int favorites = 0; for (const auto& entry : entries) { ++counts[entry.game]; if (m_labels.isFavorite(entry.path)) ++favorites; }
+        QList<QPair<QString, int>> games; for (auto it = counts.cbegin(); it != counts.cend(); ++it) if (it.key() != unclassified) games.append({it.key(), it.value()});
+        std::sort(games.begin(), games.end(), [](const auto& left, const auto& right) { return left.second != right.second ? left.second > right.second : left.first.localeAwareCompare(right.first) < 0; });
+        int rows = 0;
+        const auto add = [&](const QString& text, int count, int kind, const QString& game) {
+            auto* button = new NavButton(QString(), text, true); button->setNote(QString::number(count)); button->setProperty("filter", kind); button->setProperty("game", game); button->setToolTip(text); list->addWidget(button); ++rows;
+            connect(button, &QPushButton::clicked, this, [this, &filter, &selected, page, target, kind, game] { filter = kind; selected = game; page->setFilter(LibraryPage::Filter(kind), game); setPage(target); });
+        };
+        if (shown) {
+            if (!entries.isEmpty()) add(QStringLiteral("Favoris"), favorites, LibraryPage::Favorites, {});
+            for (const auto& game : games) add(game.first, game.second, LibraryPage::Game, game.first);
+            if (counts.contains(unclassified) && !games.isEmpty()) add(QStringLiteral("Non classés"), counts.value(unclassified), LibraryPage::Game, unclassified);
+        }
+        // A filter whose last entry has gone falls back to every one.
+        if (filter == LibraryPage::Game && !counts.contains(selected)) { filter = LibraryPage::All; selected.clear(); page->setFilter(LibraryPage::All); }
+        m_rail->findChild<QScrollArea*>(scrollName)->setMaximumHeight(rows ? rows * 31 + 3 : 0);
     };
-    if (!m_clips.isEmpty()) add(QStringLiteral("Favoris"), favorites, LibraryPage::Favorites, {});
-    for (const auto& game : games) add(game.first, game.second, LibraryPage::Game, game.first);
-    if (counts.contains(unclassified) && !games.isEmpty()) add(QStringLiteral("Non classés"), counts.value(unclassified), LibraryPage::Game, unclassified);
-    // A filter whose last clip has gone falls back to every clip.
-    if (m_libraryFilter == LibraryPage::Game && !counts.contains(m_libraryGame)) { m_libraryFilter = LibraryPage::All; m_libraryGame.clear(); m_library->setFilter(LibraryPage::All); }
-    m_rail->findChild<QScrollArea*>("nav-games")->setMaximumHeight(rows ? rows * 31 + 3 : 0);
-    nav(m_clipsNav)->setNote(QString::number(m_clips.size())); updateNav();
+    fill(m_subNav, "nav-games", m_clips, clipsShown, m_libraryFilter, m_libraryGame, m_library, Library);
+    fill(m_shotSubNav, "nav-screenshot-games", m_images, shotsShown, m_shotFilter, m_shotGame, m_shots, Screenshots);
+    nav(m_clipsNav)->setNote(QString::number(m_clips.size())); nav(m_shotsNav)->setNote(QString::number(m_images.size())); updateNav();
 }
 void MainWindow::updateNav() {
-    const auto* current = m_pages->currentWidget(); const bool library = current == m_library;
-    nav(m_clipsNav)->setChecked(library && m_libraryFilter == LibraryPage::All); nav(m_shareNav)->setChecked(current == m_sharing); nav(m_settingsNav)->setChecked(current == m_settings);
-    for (int index = 0; index < m_subNav->count(); ++index) if (auto* button = qobject_cast<QPushButton*>(m_subNav->itemAt(index)->widget()))
-        button->setChecked(library && button->property("filter").toInt() == m_libraryFilter && button->property("game").toString() == m_libraryGame);
+    const auto* current = m_pages->currentWidget(); const bool library = current == m_library, shots = current == m_shots;
+    nav(m_clipsNav)->setChecked(library && m_libraryFilter == LibraryPage::All); nav(m_shotsNav)->setChecked(shots && m_shotFilter == LibraryPage::All);
+    nav(m_shareNav)->setChecked(current == m_sharing); nav(m_settingsNav)->setChecked(current == m_settings);
+    const auto check = [](QVBoxLayout* list, bool on, int filter, const QString& game) {
+        for (int index = 0; index < list->count(); ++index) if (auto* button = qobject_cast<QPushButton*>(list->itemAt(index)->widget()))
+            button->setChecked(on && button->property("filter").toInt() == filter && button->property("game").toString() == game);
+    };
+    check(m_subNav, library, m_libraryFilter, m_libraryGame); check(m_shotSubNav, shots, m_shotFilter, m_shotGame);
     if (m_batch->running()) nav(m_shareNav)->setNote(QStringLiteral("%1 %").arg(m_batch->percent()), true);
     else nav(m_shareNav)->setNote(m_copies.isEmpty() ? QString() : QString::number(m_copies.size()));
-}
-void MainWindow::setPage(Page page) {
+}void MainWindow::setPage(Page page) {
     auto* target = m_pages->widget(page);
     if (page != Editor) m_editor->suspend();
-    m_rail->setVisible(page != Editor); m_rail->setEnabled(page != Onboarding);
-    m_pages->setCurrentWidget(target); m_toasts->setBottomInset((page == Library && !m_library->selectedPaths().isEmpty()) || (page == Sharing && !m_sharing->selectedPaths().isEmpty()) ? 88 : 20);
+    // The editors take the width of the rail.
+    m_rail->setVisible(page != Editor && page != ScreenshotView); m_rail->setEnabled(page != Onboarding);
+    const auto kindOf = [this](const QWidget* widget) { return widget == m_library || widget == m_editor ? 1 : widget == m_shots || widget == m_shotEditor ? 2 : 0; };
+    const bool otherKind = kindOf(m_pages->currentWidget()) != kindOf(target);
+    m_pages->setCurrentWidget(target);
+    m_toasts->setBottomInset((page == Library && !m_library->selectedPaths().isEmpty()) || (page == Sharing && !m_sharing->selectedPaths().isEmpty()) || (page == Screenshots && !m_shots->selectedPaths().isEmpty()) ? 88 : 20);
+    // The games of the rail are those of the kind on screen.
+    if (otherKind) rebuildRail();
     updateNav(); updateCapture();
 }
 RecordingProfile& MainWindow::profile() {
@@ -362,12 +491,18 @@ bool MainWindow::saveConfig(bool announce) {
     }
     QString error;
     if (!m_store.save(m_config, error)) { m_toasts->show(ToastHost::Error, QStringLiteral("Réglages non enregistrés"), error); return false; }
-    const bool changedFolder = m_saved.libraryPath != m_config.libraryPath, changedShortcut = m_saved.startMenuShortcut != m_config.startMenuShortcut;
+    const bool changedFolder = m_saved.libraryPath != m_config.libraryPath, changedShortcut = m_saved.startMenuShortcut != m_config.startMenuShortcut, changedLogin = m_saved.launchAtLogin != m_config.launchAtLogin;
+    const bool changedScreenshotKey = m_saved.screenshotHotkey != m_config.screenshotHotkey;
+    if (m_saved.autoReplay != m_config.autoReplay || m_saved.replayGames != m_config.replayGames) qInfo("Replay automatique : %s, %lld jeu(x) suivi(s).", qUtf8Printable(m_config.autoReplay), qlonglong(m_config.replayGames.size()));
     m_loadError.clear(); m_saved = m_config; m_settings->setSaved(m_saved); setWindowModified(false);
-    refreshTray(); spreadMix();
+    refreshTray(); spreadMix(); if (changedScreenshotKey) bindScreenshotHotkey(true);
     if (changedShortcut && !m_programs.isEmpty() && !setStartMenuShortcut(m_programs, QCoreApplication::applicationFilePath(), m_saved.startMenuShortcut, error)) m_toasts->show(ToastHost::Warn, QStringLiteral("Menu Démarrer inchangé"), error);
+    if (changedLogin && !m_loginLocation.isEmpty()) {
+        if (setLoginStart(m_loginLocation, QCoreApplication::applicationFilePath(), m_saved.launchAtLogin, error)) qInfo("Lancement avec la session : %s.", m_saved.launchAtLogin ? "activé" : "retiré");
+        else { qWarning("Lancement avec la session : %s", qUtf8Printable(error)); m_toasts->show(ToastHost::Warn, QStringLiteral("Lancement avec la session inchangé"), error); }
+    }
     if (announce) m_toasts->show(ToastHost::Ok, QStringLiteral("Réglages enregistrés"), QStringLiteral("Ils s'appliquent aux prochains clips."));
-    if (changedFolder) { refreshLibrary(); refreshSharing(); }
+    if (changedFolder) { refreshLibrary(); refreshSharing(); refreshScreenshots(); }
     updateCapture(); return true;
 }
 void MainWindow::revertConfig() {
@@ -380,12 +515,14 @@ void MainWindow::chooseLibraryFolder() {
     if (state == ReplayEngine::State::Starting || state == ReplayEngine::State::Running || state == ReplayEngine::State::Stopping) {
         m_toasts->show(ToastHost::Info, QStringLiteral("Le replay utilise ce dossier"), QStringLiteral("Arrêtez le replay avant de changer le dossier des clips.")); return;
     }
-    const auto directory = QFileDialog::getExistingDirectory(this, QStringLiteral("Dossier des clips"), m_config.libraryPath);
+    const auto directory = QFileDialog::getExistingDirectory(this, QStringLiteral("Dossier des clips et captures d'écran"), m_config.libraryPath);
     if (directory.isEmpty()) return;
     m_settings->setFolder(QDir::fromNativeSeparators(directory)); m_settings->collect(); setWindowModified(dirty()); m_library->setLoading(true); refreshLibrary(); refreshSharing();
 }
 void MainWindow::refreshLibrary() {
     m_library->setLibraryPath(m_config.libraryPath);
+    // Followed from the first reading on; a folder created since, by the first clip saved, is followed from then.
+    m_folderWatch->watch(m_config.libraryPath);
     if (m_scan->isRunning()) { m_rescanPending = true; return; }
     const auto directory = m_config.libraryPath; m_scan->setFuture(QtConcurrent::run([directory] { return scanLibrary(directory); }));
 }
@@ -401,10 +538,10 @@ void MainWindow::refreshSharing() {
 }
 void MainWindow::updateBusy() {
     const bool trashing = m_trash->isRunning() || m_rename->isRunning(), sharing = m_batch->running();
-    m_library->setBusy(trashing, sharing); m_sharing->setBusy(trashing); m_editor->setSharingBusy(sharing || trashing);
+    m_library->setBusy(trashing, sharing); m_shots->setBusy(trashing, false); m_sharing->setBusy(trashing); m_editor->setSharingBusy(sharing || trashing);
 }
 void MainWindow::savedFeedback(const QString& path) {
-    if (m_config.clipSavedSound) playClipSavedSound();
+    if (m_config.clipSavedSound) playClipSavedSound(m_config.clipSavedSoundId, m_config.clipSavedSoundVolume);
     // The game usually has the focus at this moment: the system notification is the one that will be seen.
     if (m_config.clipSavedNotification && QSystemTrayIcon::isSystemTrayAvailable() && !isActiveWindow()) { m_tray->show(); m_tray->showMessage(QStringLiteral("Clip sauvegardé"), QFileInfo(path).completeBaseName(), QSystemTrayIcon::NoIcon, 4000); }
 }
@@ -415,7 +552,8 @@ void MainWindow::startDiscordSharing(QStringList paths, bool edited) {
     if (edited && !m_batch->running()) { if (!m_editor->ready()) return; info = m_editor->clipInfo(); edit = m_editor->currentEdit(); }
     // A running batch is shown rather than replaced: the dialog opens on its progress.
     if (m_batch->running()) paths.clear();
-    const ShareOptions options{QDir(m_config.libraryPath).filePath("Partage Discord"), m_config.discordLimitBytes, m_config.discordCodec, m_config.discordAutoResize, m_saved.defaultMix};
+    // Each clip leaves with the usual levels of its own game.
+    const ShareOptions options{QDir(m_config.libraryPath).filePath("Partage Discord"), m_config.discordLimitBytes, m_config.discordCodec, m_config.discordAutoResize, m_saved.defaultMix, [this](const QString& path) { return mixForClip(path); }};
     auto* dialog = new DiscordDialog(m_batch, m_cache, paths, options, this, info, edit); m_shareDialog = dialog; dialog->setAttribute(Qt::WA_DeleteOnClose);
     connect(dialog, &DiscordDialog::preferencesChosen, this, [this](qint64 bytes, const QString& codec, bool resize) {
         m_config.discordLimitBytes = m_saved.discordLimitBytes = bytes; m_config.discordCodec = m_saved.discordCodec = codec; m_config.discordAutoResize = m_saved.discordAutoResize = resize;
@@ -430,9 +568,10 @@ void MainWindow::classifyClips(const QStringList& paths, const QString& game) {
     if (paths.isEmpty() || m_trash->isRunning()) return;
     QString error; const auto name = game.trimmed();
     if (!m_labels.setGames(paths, name, error)) { m_toasts->show(ToastHost::Error, QStringLiteral("Classement non enregistré"), error); return; }
-    m_selectAfterScan = paths; refreshLibrary();
-    const auto count = paths.size();
-    m_toasts->show(ToastHost::Ok, name.isEmpty() ? (count > 1 ? QStringLiteral("%1 clips rendus à leur dossier d'origine").arg(count) : QStringLiteral("Clip rendu à son dossier d'origine")) : (count > 1 ? QStringLiteral("%1 clips classés dans « %2 »").arg(count).arg(name) : QStringLiteral("Clip classé dans « %1 »").arg(name)),
+    m_selectAfterScan = paths; refreshLibrary(); refreshScreenshots();
+    const auto count = paths.size(); const bool images = std::all_of(paths.cbegin(), paths.cend(), [](const QString& path) { return isImageFile(path); });
+    const auto many = images ? QStringLiteral("screenshots") : QStringLiteral("clips"), one = images ? QStringLiteral("Screenshot") : QStringLiteral("Clip");
+    m_toasts->show(ToastHost::Ok, name.isEmpty() ? (count > 1 ? QStringLiteral("%1 %2 rendus à leur dossier d'origine").arg(count).arg(many) : QStringLiteral("%1 rendu à son dossier d'origine").arg(one)) : (count > 1 ? QStringLiteral("%1 %2 classés dans « %3 »").arg(count).arg(many, name) : QStringLiteral("%1 classé dans « %2 »").arg(one, name)),
         QStringLiteral("Les fichiers ne sont pas déplacés."));
 }
 void MainWindow::deleteClips(QStringList paths, bool confirmed) {
@@ -440,6 +579,7 @@ void MainWindow::deleteClips(QStringList paths, bool confirmed) {
     const bool copies = std::all_of(paths.begin(), paths.end(), [](const QString& path) { return path.endsWith(QStringLiteral(".discord.mp4"), Qt::CaseInsensitive); });
     if (!confirmed && !confirmTrash(this, paths, copies)) return;
     if (paths.contains(m_editor->clipPath())) { m_editor->suspend(); setPage(Library); }
+    if (m_shotEditor->saving()) { m_toasts->show(ToastHost::Info, QStringLiteral("Un instant"), QStringLiteral("L'image recadrée est en cours d'enregistrement.")); return; }
     m_cache->setActive(false);
     const auto operation = m_trashOperation; auto analyses = m_editor->pendingAnalyses(); auto preview = m_cache->pending();
     m_trash->setFuture(QtConcurrent::run([paths, operation, analyses, preview]() mutable {
@@ -467,8 +607,12 @@ void MainWindow::renameClip(const QString& path, const QString& name) {
 void MainWindow::copyFiles(const QStringList& paths) {
     const auto urls = existingFileUrls(paths);
     if (urls.isEmpty()) { m_toasts->show(ToastHost::Warn, QStringLiteral("Fichiers introuvables"), QStringLiteral("Ils ont été déplacés ou supprimés.")); return; }
-    auto* mime = new QMimeData; mime->setUrls(urls); QApplication::clipboard()->setMimeData(mime);
-    m_toasts->show(ToastHost::Info, urls.size() > 1 ? QStringLiteral("%1 fichiers copiés").arg(urls.size()) : QStringLiteral("Fichier copié"), QStringLiteral("Collez dans Discord avec Ctrl V."), {}, QStringLiteral("copy"));
+    auto* mime = new QMimeData; mime->setUrls(urls);
+    // A single picture is also copied as an image: Discord, a chat or an image editor paste it as such.
+    const bool picture = urls.size() == 1 && isImageFile(urls.first().toLocalFile());
+    if (picture) { const QImage image(urls.first().toLocalFile()); if (!image.isNull()) mime->setImageData(image); }
+    QApplication::clipboard()->setMimeData(mime);
+    m_toasts->show(ToastHost::Info, picture ? QStringLiteral("Image copiée") : urls.size() > 1 ? QStringLiteral("%1 fichiers copiés").arg(urls.size()) : QStringLiteral("Fichier copié"), QStringLiteral("Collez dans Discord avec Ctrl V."), {}, QStringLiteral("copy"));
 }
 void MainWindow::revealFile(const QString& path) {
 #ifdef Q_OS_WIN
@@ -479,16 +623,110 @@ void MainWindow::revealFile(const QString& path) {
 void MainWindow::openClip(const QString& path) {
     if (path.isEmpty() || m_trash->isRunning() || m_rename->isRunning() || m_editor->exporting()) return;
     if (!QFileInfo(path).isFile()) { m_toasts->show(ToastHost::Warn, QStringLiteral("Clip introuvable"), QStringLiteral("Le fichier a été déplacé ou supprimé.")); refreshLibrary(); return; }
-    m_fresh.remove(path); setPage(Editor); m_editor->openClip(path);
-    QString game; for (const auto& clip : m_clips) if (clip.path == path) game = clip.game;
-    if (game.isEmpty()) game = m_labels.gameFor(path, {});
-    m_editor->setGame(game == unclassified ? QString() : game);
+    // The clip opens with the usual levels of its game.
+    const auto game = gameOf(path); m_editor->setDefaultMix(mixForClip(path));
+    m_fresh.remove(path); setPage(Editor); m_editor->openClip(path); m_editor->setGame(game);
+}
+void MainWindow::viewImages(const QStringList& playlist, int index) {
+    if (playlist.isEmpty() || index < 0 || index >= playlist.size() || m_trash->isRunning() || m_rename->isRunning()) return;
+    if (!QFileInfo(playlist[index]).isFile()) { m_toasts->show(ToastHost::Warn, QStringLiteral("Screenshot introuvable"), QStringLiteral("Le fichier a été déplacé ou supprimé.")); refreshScreenshots(); return; }
+    if (!m_imageViewer) {
+        m_imageViewer = new ImageViewer(this);
+        connect(m_imageViewer, &ImageViewer::viewed, this, [this](const QString& path) { if (m_freshShots.remove(path)) rebuildScreenshots(); });
+        connect(m_imageViewer, &ImageViewer::editRequested, this, &MainWindow::openScreenshot);
+        connect(m_imageViewer, &ImageViewer::copyRequested, this, [this](const QString& path) { copyFiles({path}); });
+        // Back from the full screen, the list shows the last picture seen.
+        connect(m_imageViewer, &ImageViewer::closed, this, [this](const QString& path) { if (m_pages->currentWidget() == m_shots && !path.isEmpty()) m_shots->select({path}); });
+    }
+    m_imageViewer->open(playlist, index);
+}
+void MainWindow::refreshScreenshots() {
+    const auto directory = screenshotsDirectory(m_config.libraryPath); m_shots->setLibraryPath(directory);
+    if (m_imageScan->isRunning()) { m_imageRescanPending = true; return; }
+    m_imageScan->setFuture(QtConcurrent::run([directory] { return scanImages(directory); }));
+}
+void MainWindow::rebuildScreenshots() {
+    QList<LibraryItem> items; items.reserve(m_images.size());
+    for (const auto& image : m_images) items.append({image, m_labels.isFavorite(image.path), m_freshShots.contains(image.path), false});
+    m_shots->setItems(items, m_config.discordLimitBytes); rebuildRail();
+}
+void MainWindow::openScreenshot(const QString& path) {
+    if (path.isEmpty() || m_trash->isRunning() || m_rename->isRunning()) return;
+    if (!QFileInfo(path).isFile()) { m_toasts->show(ToastHost::Warn, QStringLiteral("Screenshot introuvable"), QStringLiteral("Le fichier a été déplacé ou supprimé.")); refreshScreenshots(); return; }
+    if (m_freshShots.remove(path)) rebuildScreenshots();
+    setPage(ScreenshotView); m_shotEditor->openImage(path); m_shotEditor->setGame(gameOf(path));
+}
+void MainWindow::armShortcuts() { m_shortcutsArmed = true; bindScreenshotHotkey(true); }
+void MainWindow::bindScreenshotHotkey(bool announce) {
+    if (!m_shortcutsArmed) return;
+    QString error;
+    if (!m_shotHotkey->bind(QKeySequence::fromString(m_saved.screenshotHotkey, QKeySequence::PortableText), error)) {
+        qWarning("Screenshots : raccourci %s indisponible : %s", qUtf8Printable(m_saved.screenshotHotkey), qUtf8Printable(error));
+        if (announce) m_toasts->show(ToastHost::Warn, QStringLiteral("Raccourci des screenshots indisponible"), error, {{QStringLiteral("Voir les réglages"), [this] { m_settings->showTab(0); setPage(Settings); }}});
+    }
+}
+void MainWindow::takeScreenshot() {
+#ifdef Q_OS_WIN
+    if (m_shotTask->isRunning() || !m_saved.activeProfile()) return;
+    const auto& active = *m_saved.activeProfile();
+    // What the replay captures; a window that is not open gives way to the main screen.
+    const auto target = active.video.targetId; const auto* screen = mainScreen(); const auto fallback = screen ? screen->id : QString();
+    if (target.isEmpty() && fallback.isEmpty()) { m_toasts->show(ToastHost::Warn, QStringLiteral("Aucun écran à prendre"), QStringLiteral("Choisissez l'écran ou la fenêtre dans Réglages › Capture.")); return; }
+    // Named and filed like the clips: the game set in the profile, or the one in front.
+    auto game = active.gameName.trimmed(); if (game.isEmpty() && active.detectGame) game = detectCapturedGame(target.isEmpty() ? fallback : target);
+    if (game.isEmpty()) game = active.name;
+    const auto folder = safeGameFolder(game); const auto path = QDir(QDir(screenshotsDirectory(m_saved.libraryPath)).filePath(folder)).filePath(capturedFileName(folder, QStringLiteral("png")));
+    const bool cursor = active.video.captureCursor; m_shotLabel.clear();
+    m_shotTask->setFuture(QtConcurrent::run([target, fallback, cursor, path] {
+        QString error; QImage image = target.isEmpty() ? QImage() : captureScreenImage(target, cursor, error);
+        if (image.isNull() && !fallback.isEmpty() && fallback != target) { QString second; image = captureScreenImage(fallback, cursor, second); if (image.isNull()) error = second; }
+        if (image.isNull()) return QStringLiteral("!") + error;
+        if (!QDir().mkpath(QFileInfo(path).absolutePath()) || !image.save(path, "PNG")) return QStringLiteral("!Impossible d'écrire ") + QDir::toNativeSeparators(path);
+        return path;
+    }));
+#else
+    m_toasts->show(ToastHost::Info, QStringLiteral("Screenshots indisponibles"), QStringLiteral("La capture Linux arrivera avec PipeWire et le portail KDE."));
+#endif
+}
+void MainWindow::screenshotFromClip(const QString& path, qint64 positionMs, const QRect& crop) {
+    if (m_shotTask->isRunning()) { m_toasts->show(ToastHost::Info, QStringLiteral("Un instant"), QStringLiteral("Le screenshot précédent est en cours d'enregistrement.")); return; }
+    // Filed with the game of the clip; a clip without one leaves its pictures at the top of the folder.
+    const auto game = gameOf(path); const auto folder = safeGameFolder(game.isEmpty() ? QFileInfo(path).completeBaseName() : game);
+    const QDir root(screenshotsDirectory(m_saved.libraryPath)); const auto target = (game.isEmpty() ? root : QDir(root.filePath(folder))).filePath(capturedFileName(folder, QStringLiteral("png")));
+    // A game whose name does not suit a folder keeps it as a classification.
+    m_shotLabel = !game.isEmpty() && folder != game ? game : QString();
+    m_shotTask->setFuture(QtConcurrent::run([path, positionMs, crop, target] {
+        try {
+            ClipReader reader(path, false); std::atomic_bool stop{false};
+            const auto time = std::clamp<qint64>(positionMs, 0, std::max<qint64>(0, reader.info().durationMs - 1)); reader.seek(time); reader.readUntil(time + 1, stop, true);
+            auto image = reader.frameAt(time); if (image.isNull()) return QStringLiteral("!Cette image du clip n'a pas pu être lue.");
+            if (crop.isValid() && crop != image.rect()) image = image.copy(crop.intersected(image.rect()));
+            if (!QDir().mkpath(QFileInfo(target).absolutePath()) || !image.save(target, "PNG")) return QStringLiteral("!Impossible d'écrire ") + QDir::toNativeSeparators(target);
+            return target;
+        } catch (const std::exception& error) { return QStringLiteral("!") + QString::fromUtf8(error.what()); }
+    }));
+}
+void MainWindow::screenshotDone() {
+    const auto result = m_shotTask->result();
+    if (result.startsWith(QLatin1Char('!'))) {
+        qWarning("Screenshot non enregistré : %s", qUtf8Printable(result.mid(1)));
+        m_toasts->show(ToastHost::Error, QStringLiteral("Le screenshot n'a pas été pris"), result.mid(1)); return;
+    }
+    qInfo("Screenshot enregistré dans %s.", qUtf8Printable(result));
+    if (!m_shotLabel.isEmpty()) { QString error; m_labels.setGame(result, std::exchange(m_shotLabel, QString()), error); }
+    if (m_saved.screenshotSound) playClipSavedSound(m_saved.screenshotSoundId, m_saved.screenshotSoundVolume);
+    // In a game, the notification of the system is what is seen.
+    if (m_saved.clipSavedNotification && QSystemTrayIcon::isSystemTrayAvailable() && !isActiveWindow()) { m_tray->show(); m_tray->showMessage(QStringLiteral("Screenshot enregistré"), QFileInfo(result).completeBaseName(), QSystemTrayIcon::NoIcon, 3000); }
+    m_freshShots.insert(result); refreshScreenshots();
+    const auto size = QImageReader(result).size();
+    m_toasts->show(ToastHost::Ok, QStringLiteral("Screenshot enregistré"), QStringLiteral("%1 · %2 × %3").arg(QFileInfo(result).completeBaseName()).arg(size.width()).arg(size.height()),
+        {{QStringLiteral("Ouvrir"), [this, result] { openScreenshot(result); }}, {QStringLiteral("Voir les screenshots"), [this] { setPage(Screenshots); }}}, QStringLiteral("camera"));
 }
 void MainWindow::viewClips(const QStringList& playlist, int index, bool fromEditor) {
     if (playlist.isEmpty() || index < 0 || index >= playlist.size() || m_trash->isRunning() || m_rename->isRunning()) return;
     if (!QFileInfo(playlist[index]).isFile()) { m_toasts->show(ToastHost::Warn, QStringLiteral("Clip introuvable"), QStringLiteral("Le fichier a été déplacé ou supprimé.")); refreshLibrary(); return; }
     if (!m_viewer) {
-        m_viewer = new ClipViewer(this); m_viewer->setVolume(m_saved.playbackVolume); m_viewer->setDefaultMix(m_saved.defaultMix);
+        m_viewer = new ClipViewer(this); m_viewer->setVolume(m_saved.playbackVolume); m_viewer->setDefaultMix(m_saved.defaultMix); m_viewer->setMixLookup([this](const QString& path) { return mixForClip(path); });
         connect(m_viewer, &ClipViewer::viewed, this, [this](const QString& path) { if (m_fresh.remove(path)) rebuildLibrary(); });
         // Back from the full screen, the editor is where the viewing stopped.
         connect(m_viewer, &ClipViewer::closed, this, [this](const QString& path, qint64 position) {
@@ -512,7 +750,21 @@ void MainWindow::followUpdates(const QString& repository, const QUrl& feed) {
     if (m_updates->enabled() && m_saved.checkUpdates && !m_firstLaunch) QTimer::singleShot(feed.isValid() ? 0 : 4000, m_updates, [this] { m_updates->check(); });
 }
 void MainWindow::announceUpdated(const QString& previousVersion) {
-    m_toasts->show(ToastHost::Ok, QStringLiteral("Clipsapp est à jour"), QStringLiteral("Version %1 installée, à la place de la %2.").arg(m_updates->currentVersion(), previousVersion));
+    // Once the window is on screen: what the version just installed brings, alone.
+    QTimer::singleShot(800, this, [this, previousVersion] {
+        const auto releases = bundledChangelog(); int index = -1;
+        for (int at = 0; at < releases.size(); ++at) if (releases[at].version == QStringLiteral(CLIPSAPP_VERSION)) index = at;
+        if (index < 0 || !isVisible() || findChild<QDialog*>("whats-new")) { m_toasts->show(ToastHost::Ok, QStringLiteral("Clipsapp est à jour"), QStringLiteral("Version %1 installée, à la place de la %2.").arg(QStringLiteral(CLIPSAPP_VERSION), previousVersion)); return; }
+        WhatsNewDialog dialog(this, {releases[index]}, 0, QStringLiteral(CLIPSAPP_VERSION), previousVersion, m_updates->repository()); dialog.exec();
+    });
+}
+void MainWindow::showChangelog() {
+    if (findChild<QDialog*>("whats-new")) return;
+    const auto releases = bundledChangelog();
+    if (releases.isEmpty()) { m_toasts->show(ToastHost::Info, QStringLiteral("Version %1").arg(CLIPSAPP_VERSION), QStringLiteral("Le journal des versions n'est pas disponible dans cette copie.")); return; }
+    // Open on the version in use; a build newer than its journal opens on the latest notes.
+    int index = 0; for (int at = 0; at < releases.size(); ++at) if (releases[at].version == QStringLiteral(CLIPSAPP_VERSION)) index = at;
+    WhatsNewDialog dialog(this, releases, index, QStringLiteral(CLIPSAPP_VERSION), {}, m_updates->repository()); dialog.exec();
 }
 void MainWindow::refreshUpdateButton() {
     using State = UpdateService::State; const auto state = m_updates->state(); const auto version = m_updates->info().version.toString();
@@ -525,21 +777,15 @@ void MainWindow::refreshUpdateButton() {
     else if (state == State::Checking && m_updateButton->isVisible()) return;
     if (!text.isEmpty() && text != m_updateButton->text()) m_updateButton->setText(text);
     m_updateButton->setVisible(!text.isEmpty());
-    m_updateButton->setToolTip(state == State::Ready ? QStringLiteral("La nouvelle version est prête : redémarrer Clipsapp pour l'utiliser") : QStringLiteral("Voir ce qu'apporte la nouvelle version"));
+    m_updateButton->setToolTip(state == State::Ready ? QStringLiteral("La nouvelle version est prête : redémarrer Clipsapp pour l'utiliser") : QStringLiteral("Télécharger la nouvelle version"));
 }
 void MainWindow::showUpdate() {
     using State = UpdateService::State;
     if (m_updates->info().version.isNull() || findChild<QDialog*>("update-dialog")) return;
     ModalDialog dialog(this, 520); dialog.setObjectName("update-dialog");
     dialog.setHeading(QStringLiteral("Clipsapp %1 est disponible").arg(m_updates->info().version.toString()), QStringLiteral("Vous utilisez la version %1.").arg(m_updates->currentVersion()), new IconBox(QStringLiteral("save"), tk::accent, tk::accentSoft));
+    // What the version brings is shown after the restart, by the version itself: here, only how to get it.
     dialog.body()->setSpacing(12);
-    if (!m_updates->info().notes.isEmpty()) {
-        // What the release says about itself, as written on its page.
-        auto* notes = label({}, nullptr, true); notes->setObjectName("update-notes"); notes->setTextFormat(Qt::MarkdownText); notes->setText(m_updates->info().notes); notes->setOpenExternalLinks(false); notes->setAlignment(Qt::AlignTop | Qt::AlignLeft); notes->setContentsMargins(12, 8, 12, 8);
-        auto* well = card("well"); auto* wellLayout = new QVBoxLayout(well); wellLayout->setContentsMargins(1, 1, 1, 1);
-        auto* scroll = new QScrollArea; scroll->setWidgetResizable(true); scroll->setWidget(notes); scroll->setFrameShape(QFrame::NoFrame); scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff); scroll->setFixedHeight(190);
-        wellLayout->addWidget(scroll); dialog.body()->addWidget(well);
-    }
     auto* status = label({}, "small", true); status->setObjectName("update-status"); dialog.body()->addWidget(status);
     auto* bar = new Bar; bar->setObjectName("update-progress"); dialog.body()->addWidget(bar);
     auto* page = new Button(QStringLiteral("open"), QStringLiteral("Page de la version"), Button::Ghost); page->setVisible(m_updates->info().page.isValid()); dialog.footerLeft()->addWidget(page);
@@ -579,7 +825,7 @@ void MainWindow::installUpdate() {
     QString error; if (!m_updates->install(error)) { m_toasts->show(ToastHost::Error, QStringLiteral("Mise à jour non installée"), error); return; }
     m_relaunch = true; m_restartPending = false; m_replay->stop(); close();
 }
-void MainWindow::spreadMix() { m_editor->setDefaultMix(m_saved.defaultMix); if (m_viewer) m_viewer->setDefaultMix(m_saved.defaultMix); }
+void MainWindow::spreadMix() { m_editor->setDefaultMix(mixForClip(m_editor->clipPath())); if (m_viewer) m_viewer->setDefaultMix(m_saved.defaultMix); }
 void MainWindow::adoptMix(const TrackMix& mix) {
     // The habit starts again from the new levels: what led to them, and what was refused, is forgotten.
     m_config.defaultMix = m_saved.defaultMix = mix; m_config.mixHistory = m_saved.mixHistory = {}; m_config.mixDeclined = m_saved.mixDeclined = {}; m_mixAsked.clear();
@@ -596,26 +842,84 @@ QString MainWindow::mixText(const TrackMix& from, const TrackMix& to) const {
     }
     return parts.size() > 1 ? parts.mid(0, parts.size() - 1).join(QStringLiteral(", ")) + QStringLiteral(" et ") + parts.last() : parts.join(QString());
 }
-void MainWindow::learnMix(const TrackMix& levels) {
+void MainWindow::learnMix(const TrackMix& levels, const QString& game) {
     if (levels.isEmpty() || !m_loadError.isEmpty()) return;
-    rememberExport(m_saved.mixHistory, levels); m_config.mixHistory = m_saved.mixHistory;
+    // A clip without a game teaches the usual levels; a clip of a game, those of its game alone.
+    if (game.isEmpty()) {
+        rememberExport(m_saved.mixHistory, levels); m_config.mixHistory = m_saved.mixHistory;
+        QString error; m_store.save(m_saved, error); m_settings->setSaved(m_saved);
+        const auto proposal = suggestedMix(m_saved.mixHistory, m_saved.defaultMix, m_saved.mixDeclined);
+        // Asked once: a question left unanswered is not put again before the habit changes.
+        if (!proposal || (!m_mixAsked.isEmpty() && m_mixAskedGame.isEmpty() && sameMix(*proposal, m_mixAsked))) return;
+        m_mixAsked = *proposal; m_mixAskedGame.clear(); const auto mix = *proposal;
+        m_toasts->show(ToastHost::Info, QStringLiteral("En faire vos volumes habituels ?"), QStringLiteral("Vous réglez souvent %1. Les prochains clips s'ouvriraient ainsi ; les enregistrements ne changent pas.").arg(mixText(m_saved.defaultMix, mix)), {
+            {QStringLiteral("Appliquer"), [this, mix] { adoptMix(mix); }},
+            {QStringLiteral("Non merci"), [this, mix] {
+                m_config.mixDeclined = m_saved.mixDeclined = mix; m_config.mixHistory = m_saved.mixHistory = {};
+                QString failure; if (m_loadError.isEmpty()) m_store.save(m_saved, failure); m_settings->setSaved(m_saved);
+            }}}, QStringLiteral("speaker"));
+        return;
+    }
+    rememberExport(m_saved.gameMixHistory[game], levels); m_config.gameMixHistory = m_saved.gameMixHistory;
     QString error; m_store.save(m_saved, error); m_settings->setSaved(m_saved);
-    const auto proposal = suggestedMix(m_saved.mixHistory, m_saved.defaultMix, m_saved.mixDeclined);
-    // Asked once: a question left unanswered is not put again before the habit changes.
-    if (!proposal || (!m_mixAsked.isEmpty() && sameMix(*proposal, m_mixAsked))) return;
-    m_mixAsked = *proposal; const auto mix = *proposal;
-    m_toasts->show(ToastHost::Info, QStringLiteral("En faire vos volumes habituels ?"), QStringLiteral("Vous réglez souvent %1. Les prochains clips s'ouvriraient ainsi ; les enregistrements ne changent pas.").arg(mixText(m_saved.defaultMix, mix)), {
-        {QStringLiteral("Appliquer"), [this, mix] { adoptMix(mix); }},
-        {QStringLiteral("Non merci"), [this, mix] {
-            m_config.mixDeclined = m_saved.mixDeclined = mix; m_config.mixHistory = m_saved.mixHistory = {};
+    const auto current = mixForGame(m_saved.defaultMix, m_saved.gameMixes, game);
+    const auto proposal = suggestedMix(m_saved.gameMixHistory.value(game), current, m_saved.gameMixDeclined.value(game));
+    if (!proposal || (!m_mixAsked.isEmpty() && m_mixAskedGame == game && sameMix(*proposal, m_mixAsked))) return;
+    m_mixAsked = *proposal; m_mixAskedGame = game; const auto mix = *proposal;
+    m_toasts->show(ToastHost::Info, QStringLiteral("Des volumes à part pour %1 ?").arg(game), QStringLiteral("Sur les clips %1, vous réglez souvent %2. Tous les clips %1 s'ouvriraient ainsi ; ceux des autres jeux ne changent pas.").arg(game, mixText(current, mix)), {
+        {QStringLiteral("Appliquer à %1").arg(game), [this, game, mix] { adoptGameMix(game, mix); }},
+        {QStringLiteral("Non merci"), [this, game, mix] {
+            m_config.gameMixDeclined[game] = mix; m_saved.gameMixDeclined[game] = mix; m_config.gameMixHistory.remove(game); m_saved.gameMixHistory.remove(game);
             QString failure; if (m_loadError.isEmpty()) m_store.save(m_saved, failure); m_settings->setSaved(m_saved);
         }}}, QStringLiteral("speaker"));
 }
-void MainWindow::manageStartMenu(const QString& programsDirectory) {
+void MainWindow::adoptGameMix(const QString& game, const TrackMix& mix) {
+    // Only what differs from the usual levels is the game's own: a usual level changed later still reaches its other tracks.
+    TrackMix own; for (auto track = mix.cbegin(); track != mix.cend(); ++track) if (std::abs(track.value() - m_saved.defaultMix.value(track.key(), 1)) >= 0.01) own.insert(track.key(), track.value());
+    for (auto* config : {&m_config, &m_saved}) {
+        if (own.isEmpty()) config->gameMixes.remove(game); else config->gameMixes.insert(game, own);
+        config->gameMixHistory.remove(game); config->gameMixDeclined.remove(game);
+    }
+    m_mixAsked.clear(); m_mixAskedGame.clear();
+    QString error; if (m_loadError.isEmpty() && !m_store.save(m_saved, error)) m_toasts->show(ToastHost::Warn, QStringLiteral("Volumes non enregistrés"), error);
+    m_settings->load(); m_settings->setSaved(m_saved); spreadMix();
+}
+QString MainWindow::gameOf(const QString& path) const {
+    if (path.isEmpty()) return {};
+    QString game; for (const auto* list : {&m_clips, &m_images}) for (const auto& entry : *list) if (entry.path == path) game = entry.game;
+    // Not listed yet: its classification, or the folder it lies in under its kind.
+    if (game.isEmpty()) {
+        const auto root = isImageFile(path) ? screenshotsDirectory(m_config.libraryPath) : m_config.libraryPath;
+        const auto parts = QDir(root).relativeFilePath(path).split('/');
+        game = m_labels.gameFor(path, parts.size() > 1 && parts.first() != QStringLiteral("..") ? parts.first() : QString());
+    }
+    return game == unclassified ? QString() : game;
+}
+TrackMix MainWindow::mixForClip(const QString& path) const { return mixForGame(m_saved.defaultMix, m_saved.gameMixes, gameOf(path)); }void MainWindow::manageStartMenu(const QString& programsDirectory) {
     m_programs = programsDirectory; m_settings->setStartMenu(!m_programs.isEmpty()); m_onboarding->setStartMenu(!m_programs.isEmpty());
     // A folder that was moved leaves its shortcut pointing nowhere: it is drawn again. One that
     // leads to another copy of the application is that copy's own, and is left alone.
     QString error; if (!m_programs.isEmpty() && m_saved.startMenuShortcut && !m_firstLaunch && !startMenuShortcutWorks(m_programs)) setStartMenuShortcut(m_programs, QCoreApplication::applicationFilePath(), true, error);
+}
+void MainWindow::manageLoginStart(const QString& location) {
+    m_loginLocation = location; m_settings->setLoginStart(!m_loginLocation.isEmpty());
+    // As with the shortcut: a folder that was moved leaves an entry that starts nothing, and it is written again.
+    QString error; if (!m_loginLocation.isEmpty() && m_saved.launchAtLogin && !m_firstLaunch && !loginStartWorks(m_loginLocation)) setLoginStart(m_loginLocation, QCoreApplication::applicationFilePath(), true, error);
+}
+bool MainWindow::startInTray() {
+    if (m_firstLaunch || !m_saved.closeToTray || !QSystemTrayIcon::isSystemTrayAvailable()) return false;
+    m_trayStart = true; refreshTray(); return true;
+}
+void MainWindow::beginAutoReplay(bool atLogin) {
+    m_autoArmed = true; m_auto.setMode(m_saved.autoReplay); m_autoWatch->start();
+    // At the opening of the session, the graphics driver and the audio devices are given time to be there.
+    if (m_auto.launched() == AutoReplay::Action::Start) QTimer::singleShot(atLogin ? 10000 : 1000, this, [this] { if (m_saved.autoReplay == QLatin1String("launch")) startAutomatically(QStringLiteral("lancement de Clipsapp")); });
+    QTimer::singleShot(atLogin ? 10000 : 1000, this, [this] { autoReplayTick(); });
+}
+void MainWindow::announceCrash(const QString& report) {
+    qWarning("La session précédente s'est arrêtée brutalement : rapport %s.", qUtf8Printable(QFileInfo(report).fileName()));
+    m_toasts->show(ToastHost::Warn, QStringLiteral("Clipsapp s'est fermé brutalement la dernière fois"), QStringLiteral("Un rapport est gardé sur ce PC. Si vous signalez le problème, joignez-y le diagnostic."),
+        {{QStringLiteral("Copier le diagnostic"), [this] { copyDiagnostic(); }}});
 }
 void MainWindow::quitWhenClosed() { m_quitOnClose = true; }
 void MainWindow::quit() { m_quitting = true; close(); }
@@ -630,7 +934,7 @@ void MainWindow::refreshTray() {
     m_tray->setToolTip(busy ? QStringLiteral("Clipsapp · replay en cours") : QStringLiteral("Clipsapp · replay arrêté"));
     // The icon is there from the moment the window is on screen, since the window may then hide
     // behind it. Otherwise it only comes with the notification of a saved clip.
-    if (m_saved.closeToTray && QSystemTrayIcon::isSystemTrayAvailable() && !testAttribute(Qt::WA_DontShowOnScreen)) { if (isVisible()) m_tray->show(); }
+    if (m_saved.closeToTray && QSystemTrayIcon::isSystemTrayAvailable() && !testAttribute(Qt::WA_DontShowOnScreen)) { if (isVisible() || m_trayStart) m_tray->show(); }
     else if (!m_saved.clipSavedNotification) m_tray->hide();
 }
 void MainWindow::showEvent(QShowEvent* event) { QMainWindow::showEvent(event); refreshTray(); }
@@ -666,26 +970,93 @@ QJsonObject MainWindow::smokeReport() const {
 }
 void MainWindow::toggleCapture() {
     const auto state = m_replay->state();
-    if (state == ReplayEngine::State::Starting || state == ReplayEngine::State::Running) m_replay->stop(); else startCapture();
+    if (state == ReplayEngine::State::Starting || state == ReplayEngine::State::Running) stopCapture(); else startCapture();
 }
+void MainWindow::stopCapture() { m_restartPending = false; m_auto.stoppedByUser(); m_replay->stop(); }
 void MainWindow::startCapture() {
     const auto state = m_replay->state();
     if (state == ReplayEngine::State::Starting || state == ReplayEngine::State::Running || state == ReplayEngine::State::Stopping) return;
     if (!saveConfig(false)) return;
     QString error; m_replayError.clear();
     if (!m_globalHotkey->bind(m_settings->hotkey(), error) || !m_replay->start(profile(), m_config.libraryPath, error)) {
-        m_globalHotkey->unbind();
+        m_globalHotkey->unbind(); qWarning("Replay : non démarré : %s", qUtf8Printable(error));
         m_toasts->show(ToastHost::Error, QStringLiteral("Le replay n'a pas démarré"), error, {{QStringLiteral("Voir les réglages"), [this] { m_settings->showTab(0); setPage(Settings); }}});
-    }
+    } else m_auto.started(false);
     updateCapture();
+}
+const SourceTarget* MainWindow::mainScreen() const {
+    const SourceTarget* screen = nullptr;
+    for (const auto& target : m_settings->catalog().videoTargets) if (target.id.startsWith(QLatin1String("screen:")) && (!screen || target.label.endsWith(QStringLiteral("principal")))) screen = &target;
+    return screen;
+}
+bool MainWindow::startAutomatically(const QString& reason) {
+    const auto state = m_replay->state();
+    if (state == ReplayEngine::State::Starting || state == ReplayEngine::State::Running || state == ReplayEngine::State::Stopping) return false;
+    // Settings being changed are the user's: the replay waits until they are saved or cancelled.
+    if (m_firstLaunch || m_pages->currentWidget() == m_onboarding || dirty() || m_replay->exporting() || !ReplayEngine::supported() || !m_saved.activeProfile()) return false;
+    // The saved profile, on a screen: a window chosen in the settings may not be open at this moment.
+    auto chosen = *m_saved.activeProfile();
+    if (!chosen.video.targetId.startsWith(QLatin1String("screen:"))) {
+        const auto* screen = mainScreen();
+        if (!screen) { qWarning("Replay automatique : aucun écran à enregistrer."); m_auto.failed(); return false; }
+        chosen.video.targetId = screen->id; chosen.video.targetLabel = screen->label;
+    }
+    qInfo("Replay automatique : démarrage, %s.", qUtf8Printable(reason));
+    QString error; m_replayError.clear();
+    if (!m_globalHotkey->bind(QKeySequence::fromString(chosen.replay.hotkey, QKeySequence::PortableText), error) || !m_replay->start(chosen, m_saved.libraryPath, error)) {
+        m_globalHotkey->unbind(); m_auto.failed(); qWarning("Replay automatique : non démarré : %s", qUtf8Printable(error));
+        m_toasts->show(ToastHost::Error, QStringLiteral("Le replay automatique n'a pas démarré"), error, {{QStringLiteral("Voir les réglages"), [this] { m_settings->showTab(0); setPage(Settings); }}});
+        updateCapture(); return false;
+    }
+    m_auto.started(true); updateCapture(); return true;
+}
+void MainWindow::autoReplayTick() {
+    if (!m_autoArmed) return;
+    m_auto.setMode(m_saved.autoReplay);
+    const bool games = m_saved.autoReplay == QLatin1String("games") && !m_saved.replayGames.isEmpty();
+    const auto running = games ? runningPrograms(m_saved.replayGames) : QStringList();
+    const auto state = m_replay->state(); const bool busy = state == ReplayEngine::State::Starting || state == ReplayEngine::State::Running || state == ReplayEngine::State::Stopping;
+    switch (m_auto.tick(!running.isEmpty(), busy, QDateTime::currentMSecsSinceEpoch())) {
+    case AutoReplay::Action::Start: {
+        const auto game = gameNameFromApplication(running.first(), {}); const auto name = game.isEmpty() ? QFileInfo(running.first()).completeBaseName() : game;
+        if (!startAutomatically(QStringLiteral("%1 est ouvert").arg(name))) break;
+        // The game has the screen: the notification of the system is what says the replay is on.
+        if (!isActiveWindow() && QSystemTrayIcon::isSystemTrayAvailable()) {
+            const auto hotkey = QKeySequence::fromString(m_saved.activeProfile()->replay.hotkey, QKeySequence::PortableText).toString(QKeySequence::NativeText);
+            m_tray->show(); m_tray->showMessage(QStringLiteral("Replay actif pour %1").arg(name), QStringLiteral("%1 sauvegarde les %2 dernières secondes.").arg(hotkey).arg(m_saved.activeProfile()->replay.durationSeconds), QSystemTrayIcon::NoIcon, 4000);
+        }
+        break;
+    }
+    case AutoReplay::Action::Stop:
+        qInfo("Replay automatique : arrêt, plus aucun jeu suivi n'est ouvert depuis %lld s.", qlonglong(AutoReplay::graceMs / 1000)); m_replay->stop(); break;
+    case AutoReplay::Action::None: break;
+    }
+}
+void MainWindow::copyDiagnostic() {
+    QStringList lines{QStringLiteral("Clipsapp %1").arg(CLIPSAPP_VERSION), systemDescription(), mediaLibraries()};
+    for (const auto& adapter : graphicsAdapters()) lines << QStringLiteral("Carte graphique : ") + adapter;
+    const auto& p = profile(); const auto& v = p.video; const auto stats = m_replay->stats();
+    lines << QStringLiteral("Profil « %1 » : %2, %3 × %4 à %5 FPS, %6, encodeur %7, %8 %9, effort %10, %11 s gardées, plafond %12 Mio")
+        .arg(p.name, v.targetId.section('|', 0, 0)).arg(v.width).arg(v.height).arg(v.fps).arg(v.codec, v.encoder, v.rateControl).arg(v.rateControl == QLatin1String("quality") ? v.quality : v.bitrateMbps).arg(v.effort).arg(p.replay.durationSeconds).arg(p.replay.memoryLimitMiB);
+    QStringList sources; for (const auto& source : p.sources) sources << QStringLiteral("%1 (%2, %3%4)").arg(source.name, sourceKindKey(source.kind), source.targetId == QLatin1String("@default") ? QStringLiteral("par défaut") : source.targetLabel.left(60), source.enabled ? QString() : QStringLiteral(", désactivée"));
+    lines << QStringLiteral("Sources : ") + sources.join(QStringLiteral(", "));
+    const QStringList states{QStringLiteral("arrêté"), QStringLiteral("en démarrage"), QStringLiteral("actif"), QStringLiteral("en arrêt"), QStringLiteral("en erreur")};
+    lines << QStringLiteral("Replay : %1%2%3").arg(states.value(int(m_replay->state())), stats.encoder.isEmpty() ? QString() : QStringLiteral(", ") + stats.encoder, m_replayError.isEmpty() ? QString() : QStringLiteral(", ") + m_replayError);
+    lines << QStringLiteral("Démarrage : avec la session %1, replay automatique %2, %3 jeu(x)").arg(m_saved.launchAtLogin ? QStringLiteral("oui") : QStringLiteral("non"), m_saved.autoReplay).arg(m_saved.replayGames.size());
+    if (auto* log = appLog()) {
+        const auto reports = QDir(log->directory()).entryList({QStringLiteral("crash-*.dmp")}, QDir::Files, QDir::Time);
+        if (!reports.isEmpty()) lines << QStringLiteral("Rapports de plantage : ") + reports.join(QStringLiteral(", "));
+        lines << QString() << QStringLiteral("Journal :") << log->tail(200);
+    }
+    auto* mime = new QMimeData; mime->setText(withoutHome(lines.join('\n'))); QApplication::clipboard()->setMimeData(mime);
+    m_toasts->show(ToastHost::Ok, QStringLiteral("Diagnostic copié"), QStringLiteral("Collez-le dans votre signalement. Le nom de votre dossier personnel y est remplacé par ~."), {}, QStringLiteral("copy"));
 }
 void MainWindow::saveReplay() {
     QString error; if (!m_replay->save(error)) m_toasts->show(ToastHost::Warn, QStringLiteral("Rien à sauvegarder pour l'instant"), error);
 }
 void MainWindow::captureWholeScreen() {
     // Capturing a window makes Windows draw its yellow border; a whole screen has none.
-    const SourceTarget* screen = nullptr;
-    for (const auto& target : m_settings->catalog().videoTargets) if (target.id.startsWith(QLatin1String("screen:")) && (!screen || target.label.endsWith(QStringLiteral("principal")))) screen = &target;
+    const auto* screen = mainScreen();
     if (!screen) { m_toasts->show(ToastHost::Warn, QStringLiteral("Aucun écran disponible"), QStringLiteral("Choisissez la cible dans Réglages › Capture.")); return; }
     profile().video.targetId = screen->id; profile().video.targetLabel = screen->label;
     m_settings->load(); m_restartPending = true; m_replay->stop();
@@ -709,10 +1080,21 @@ void MainWindow::updateCapture() {
     ReplayView view; view.capacity = p.replay.durationSeconds; view.hotkey = p.replay.hotkey; view.seconds = stats.seconds; view.bytes = stats.bytes; view.saving = m_replay->exporting();
     view.state = state == ReplayEngine::State::Starting ? ReplayView::Starting : state == ReplayEngine::State::Running ? ReplayView::Running : state == ReplayEngine::State::Stopping ? ReplayView::Stopping : state == ReplayEngine::State::Error ? ReplayView::Error : ReplayView::Idle;
     view.profileSummary = QStringLiteral("Profil %1 · %2 · %3 dernières secondes · %4 piste%5").arg(p.name, targetName(p.video)).arg(p.replay.durationSeconds).arg(tracks.size()).arg(tracks.size() > 1 ? "s" : "");
+    // Stopped, the replay says what will start it by itself.
+    if (m_autoArmed && m_saved.autoReplay == QLatin1String("games") && !m_saved.replayGames.isEmpty() && !m_auto.held()) {
+        QStringList names; for (const auto& game : m_saved.replayGames.mid(0, 3)) { const auto name = gameNameFromApplication(game, {}); names << (name.isEmpty() ? QFileInfo(game).completeBaseName() : name); }
+        if (m_saved.replayGames.size() > 3) names << QStringLiteral("…");
+        view.profileSummary = QStringLiteral("Démarre tout seul avec %1 · %2").arg(names.join(QStringLiteral(", ")), view.profileSummary);
+    }
     const auto format = QStringLiteral("%1p %2 FPS").arg(p.video.height).arg(p.video.fps);
     if (state == ReplayEngine::State::Starting) view.liveSummary = QStringLiteral("Préparation de l'encodeur · %1").arg(targetName(p.video));
     else { const auto game = m_replay->clipGameName(); QStringList parts; if (!game.isEmpty()) parts << (p.gameName.trimmed().isEmpty() && p.detectGame && game != p.name ? game + QStringLiteral(" détecté") : game); parts << format; if (!stats.encoder.isEmpty()) parts << stats.encoder; view.liveSummary = parts.join(QStringLiteral(" · ")); }
     view.warning = stats.warning; view.warningTitle = QStringLiteral("bordure Windows visible"); view.canFixWarning = p.video.targetId.startsWith(QLatin1String("window:"));
+    // A device unplugged silences its track, and the replay goes on: what is missing is said until it is back.
+    if (!stats.silent.isEmpty()) {
+        view.canFixWarning = false; view.warningTitle = stats.silent.size() > 1 ? QStringLiteral("sources audio absentes") : QStringLiteral("source audio absente");
+        view.warning = (stats.silent.size() > 1 ? QStringLiteral("%1 : leurs pistes restent silencieuses jusqu'au retour des périphériques.") : QStringLiteral("%1 : sa piste reste silencieuse jusqu'au retour du périphérique.")).arg(stats.silent.join(QStringLiteral(", ")));
+    }
     // Images given up come before the border: a clip that stutters is the worse of the two.
     if (stats.lost > 0.02) {
         view.warningTitle = QStringLiteral("images perdues"); view.canFixWarning = false;
@@ -724,6 +1106,7 @@ void MainWindow::updateCapture() {
     view.blockedReason = !ReplayEngine::supported() ? QStringLiteral("La capture Linux arrivera avec PipeWire et le portail KDE.") : onboarding ? QStringLiteral("Terminez la configuration pour démarrer") : QString();
     m_strip->apply(view); refreshTray();
     m_library->setReplayHint(QKeySequence::fromString(p.replay.hotkey, QKeySequence::PortableText), p.replay.durationSeconds, view.canStart, busy);
+    m_shots->setScreenshotHint(QKeySequence::fromString(m_saved.screenshotHotkey, QKeySequence::PortableText));
 }
 bool MainWindow::smokeCheck(QString& error) {
     const int originalFps = profile().video.fps, probe = originalFps == 30 ? 60 : 30;
@@ -748,7 +1131,7 @@ bool MainWindow::writePreviews(const QString& directory, QString& error) {
     setPage(Sharing); if (!capture("sharing.png")) return false;
     setPage(Settings); m_settings->showTab(0); if (!capture("settings-capture.png")) return false;
     m_settings->showTab(1); if (!capture("settings-audio.png")) return false;
-    m_settings->showTab(2); if (!capture("settings-files.png")) return false;
+    m_settings->showTab(2); if (!capture("settings-general.png")) return false;
     m_settings->showTab(0); setPage(Onboarding); if (!capture("onboarding.png")) return false;
     setPage(current == Editor ? Library : current);
     return true;

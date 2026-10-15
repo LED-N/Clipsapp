@@ -2,10 +2,24 @@
 #include <QDir>
 #include <QFile>
 #include <QJsonDocument>
+#include <QFileInfo>
 #include <QSaveFile>
+#include <QStandardPaths>
 #include <utility>
 
 namespace clipsapp {
+QString defaultConfigDirectory() { return QDir(QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation)).filePath(QStringLiteral("Clipsapp")); }
+void adoptEarlierSettings(const QString& earlier, const QString& directory) {
+    const QDir from(earlier);
+    if (earlier.isEmpty() || !from.exists() || QDir::cleanPath(from.absolutePath()) == QDir::cleanPath(QDir(directory).absolutePath())) return;
+    if (!QDir().mkpath(directory)) return;
+    for (const auto& entry : from.entryInfoList(QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot)) {
+        const auto target = QDir(directory).filePath(entry.fileName());
+        // Interrupted halfway, the move goes on at the next launch; what is already there stays.
+        if (!QFileInfo::exists(target)) QDir().rename(entry.absoluteFilePath(), target);
+    }
+    from.rmdir(from.absolutePath());
+}
 ConfigStore::ConfigStore(QString directory) : m_directory(std::move(directory)) {}
 QString ConfigStore::filePath() const { return QDir(m_directory).filePath("settings.json"); }
 bool ConfigStore::load(AppConfig& config, QString& error) const {

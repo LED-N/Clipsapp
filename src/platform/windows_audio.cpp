@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <map>
 #include <stdexcept>
 #include <thread>
@@ -160,16 +161,19 @@ public:
         check(enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, devices.out()), "Sorties audio des applications");
         UINT count = 0; check(devices->GetCount(&count), "Nombre de sorties audio"); QSet<QString> current;
         for (UINT index = 0; index < count; ++index) {
-            Com<IMMDevice> device; check(devices->Item(index, device.out()), "Sortie audio");
-            LPWSTR id = nullptr; check(device->GetId(&id), "Identifiant de la sortie audio"); const auto key = QString::fromWCharArray(id); CoTaskMemFree(id); current.insert(key);
-            if (endpoints.count(key)) continue;
-            auto endpoint = std::make_unique<EndpointSessions>();
-            check(device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(endpoint->manager.out())), "Sessions audio de la sortie");
-            check(endpoint->manager->RegisterSessionNotification(notification.p), "Notifications des applications audio"); endpoint->notification = notification.p;
-            Com<IAudioSessionEnumerator> sessions; check(endpoint->manager->GetSessionEnumerator(sessions.out()), "Sessions audio existantes");
-            int size = 0; check(sessions->GetCount(&size), "Nombre de sessions audio");
-            for (int item = 0; item < size; ++item) { Com<IAudioSessionControl> session; if (SUCCEEDED(sessions->GetSession(item, session.out()))) notification->OnSessionCreated(session.p); }
-            endpoints.emplace(key, std::move(endpoint));
+            // A headset unplugged while the list is read fails on its own: the other outputs are still followed.
+            try {
+                Com<IMMDevice> device; check(devices->Item(index, device.out()), "Sortie audio");
+                LPWSTR id = nullptr; check(device->GetId(&id), "Identifiant de la sortie audio"); const auto key = QString::fromWCharArray(id); CoTaskMemFree(id); current.insert(key);
+                if (endpoints.count(key)) continue;
+                auto endpoint = std::make_unique<EndpointSessions>();
+                check(device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(endpoint->manager.out())), "Sessions audio de la sortie");
+                check(endpoint->manager->RegisterSessionNotification(notification.p), "Notifications des applications audio"); endpoint->notification = notification.p;
+                Com<IAudioSessionEnumerator> sessions; check(endpoint->manager->GetSessionEnumerator(sessions.out()), "Sessions audio existantes");
+                int size = 0; check(sessions->GetCount(&size), "Nombre de sessions audio");
+                for (int item = 0; item < size; ++item) { Com<IAudioSessionControl> session; if (SUCCEEDED(sessions->GetSession(item, session.out()))) notification->OnSessionCreated(session.p); }
+                endpoints.emplace(key, std::move(endpoint));
+            } catch (const std::exception& error) { qWarning("Audio : une sortie n'a pas pu être suivie (%s).", error.what()); }
         }
         for (auto it = endpoints.begin(); it != endpoints.end();) if (!current.contains(it->first)) it = endpoints.erase(it); else ++it;
     }
@@ -259,97 +263,144 @@ struct WindowsAudio::Impl {
     std::vector<std::thread> threads;
     QMutex mutex;
     std::deque<AudioChunk> queue;
-    QString failure;
+    QString failure, unavailable;
     std::atomic<int> initialized{0};
-    void run(DWORD pid, qint64 epoch, const std::atomic_bool* localStop = nullptr, HANDLE process = nullptr) {
-        bool ready = false;
+    QByteArray label() const { return source.name.toUtf8(); }
+    // Reads one stream until keepGoing says otherwise. Its errors are thrown: the caller decides
+    // whether they end the capture or only silence the source until it can be opened again.
+    void pump(IAudioClient* client, bool application, qint64 epoch, const std::function<bool()>& keepGoing, const std::function<void()>& started) {
+        // Endpoints use their shared-engine format: a USB microphone can be
+        // mono/44.1 kHz/PCM rather than the previous forced stereo float.
+        // Process loopback requires an explicit format (no endpoint mix).
+        WAVEFORMATEX processFormat{}; processFormat.wFormatTag = WAVE_FORMAT_IEEE_FLOAT; processFormat.nChannels = 2;
+        processFormat.nSamplesPerSec = 48000; processFormat.wBitsPerSample = 32; processFormat.nBlockAlign = 8; processFormat.nAvgBytesPerSec = 384000;
+        MixFormat native;
+        if (!application) check(client->GetMixFormat(&native.p), "Format natif du périphérique audio");
+        const WAVEFORMATEX* format = native.p ? native.p : &processFormat;
+        AudioStream stream(inputFormat(*format));
+        DWORD flags = source.kind == SourceKind::Microphone ? 0 : AUDCLNT_STREAMFLAGS_LOOPBACK;
+        if (application) flags |= AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+        check(client->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 2000000, 0, format, nullptr), "Initialisation du flux audio");
+        Com<IAudioCaptureClient> capture; check(client->GetService(__uuidof(IAudioCaptureClient), reinterpret_cast<void**>(capture.out())), "Capture audio");
+        check(client->Start(), "Démarrage audio"); started();
+        UINT64 nextPosition = 0; bool hasPosition = false;
+        std::vector<uint8_t> copied;
+        while (keepGoing()) {
+            UINT32 available = 0; check(capture->GetNextPacketSize(&available), "Lecture audio");
+            while (available && keepGoing()) {
+                BYTE* data; UINT32 frames; DWORD packetFlags; UINT64 position, qpc;
+                check(capture->GetBuffer(&data, &frames, &packetFlags, &position, &qpc), "Lecture du paquet audio");
+                if (!frames) break;
+                const bool validTimestamp = !(packetFlags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR);
+                const qint64 timestamp = validTimestamp ? qint64(qpc) : windowsClock100ns() - qint64(frames) * 10000000 / format->nSamplesPerSec;
+                const bool discontinuity = hasPosition && ((packetFlags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) ||
+                    (!application && validTimestamp && position != nextPosition));
+                nextPosition = position + frames; hasPosition = true;
+                const bool silent = (packetFlags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+                copied.resize(silent ? 0 : size_t(frames) * format->nBlockAlign);
+                if (!silent) std::memcpy(copied.data(), data, copied.size());
+                // Release the Windows packet before conversion, keeping the
+                // capture thread from holding up the next hardware period.
+                check(capture->ReleaseBuffer(frames), "Libération du paquet audio");
+                auto chunk = stream.convert(silent ? nullptr : copied.data(), int(frames),
+                    qint64(std::llround((timestamp - epoch) * (48000.0L / 10000000))), validTimestamp, discontinuity);
+                if (!chunk.samples.empty()) { QMutexLocker lock(&mutex); queue.push_back(std::move(chunk));
+                  const qint64 now = (windowsClock100ns() - epoch) * 48000 / 10000000;
+                  while (!queue.empty() && (queue.front().start < now - 96000 || queue.size() > 400)) queue.pop_front(); }
+                check(capture->GetNextPacketSize(&available), "Lecture audio");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        client->Stop();
+    }
+    // A microphone or an output. While its device is missing, unplugged or refused, the source is
+    // tried again every second and its track stays silent: the replay goes on, in step, without it.
+    // A source that follows the default device of the system also follows it when it changes.
+    void runDevice(qint64 epoch) {
+        bool counted = false; const auto count = [&] { if (!counted) { counted = true; ++initialized; } };
         try {
             Apartment apartment;
-            Com<IAudioClient> client;
-            const bool application = source.kind == SourceKind::Application || source.kind == SourceKind::ApplicationMix;
-            if (application) client.p = openApplication(pid);
-            else {
-                Com<IMMDeviceEnumerator> enumerator; Com<IMMDevice> device;
-                check(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(enumerator.out())), "Liste des périphériques audio");
-                if (source.targetId == "@default") check(enumerator->GetDefaultAudioEndpoint(source.kind == SourceKind::Microphone ? eCapture : eRender, eConsole, device.out()), "Périphérique audio par défaut");
-                else check(enumerator->GetDevice(reinterpret_cast<LPCWSTR>(source.targetId.utf16()), device.out()), "Périphérique audio choisi");
-                check(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(client.out())), "Ouverture du périphérique audio");
-            }
-            // Endpoints use their shared-engine format: a USB microphone can be
-            // mono/44.1 kHz/PCM rather than the previous forced stereo float.
-            // Process loopback requires an explicit format (no endpoint mix).
-            WAVEFORMATEX processFormat{}; processFormat.wFormatTag = WAVE_FORMAT_IEEE_FLOAT; processFormat.nChannels = 2;
-            processFormat.nSamplesPerSec = 48000; processFormat.wBitsPerSample = 32; processFormat.nBlockAlign = 8; processFormat.nAvgBytesPerSec = 384000;
-            MixFormat native;
-            if (!application) check(client->GetMixFormat(&native.p), "Format natif du périphérique audio");
-            const WAVEFORMATEX* format = native.p ? native.p : &processFormat;
-            AudioStream stream(inputFormat(*format));
-            DWORD flags = source.kind == SourceKind::Microphone ? 0 : AUDCLNT_STREAMFLAGS_LOOPBACK;
-            if (application) flags |= AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-            check(client->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 2000000, 0, format, nullptr), "Initialisation du flux audio");
-            Com<IAudioCaptureClient> capture; check(client->GetService(__uuidof(IAudioCaptureClient), reinterpret_cast<void**>(capture.out())), "Capture audio");
-            check(client->Start(), "Démarrage audio"); ready = true; if (!localStop) ++initialized;
-            UINT64 nextPosition = 0; bool hasPosition = false;
-            std::vector<uint8_t> copied;
-            while (!stop && !(localStop && localStop->load())) {
-                UINT32 available = 0; check(capture->GetNextPacketSize(&available), "Lecture audio");
-                while (available && !stop && !(localStop && localStop->load())) {
-                    BYTE* data; UINT32 frames; DWORD packetFlags; UINT64 position, qpc;
-                    check(capture->GetBuffer(&data, &frames, &packetFlags, &position, &qpc), "Lecture du paquet audio");
-                    if (!frames) break;
-                    const bool validTimestamp = !(packetFlags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR);
-                    const qint64 timestamp = validTimestamp ? qint64(qpc) : windowsClock100ns() - qint64(frames) * 10000000 / format->nSamplesPerSec;
-                    const bool discontinuity = hasPosition && ((packetFlags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) ||
-                        (!application && validTimestamp && position != nextPosition));
-                    nextPosition = position + frames; hasPosition = true;
-                    const bool silent = (packetFlags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
-                    copied.resize(silent ? 0 : size_t(frames) * format->nBlockAlign);
-                    if (!silent) std::memcpy(copied.data(), data, copied.size());
-                    // Release the Windows packet before conversion, keeping the
-                    // capture thread from holding up the next hardware period.
-                    check(capture->ReleaseBuffer(frames), "Libération du paquet audio");
-                    auto chunk = stream.convert(silent ? nullptr : copied.data(), int(frames),
-                        qint64(std::llround((timestamp - epoch) * (48000.0L / 10000000))), validTimestamp, discontinuity);
-                    if (!chunk.samples.empty()) { QMutexLocker lock(&mutex); queue.push_back(std::move(chunk));
-                      const qint64 now = (windowsClock100ns() - epoch) * 48000 / 10000000;
-                      while (!queue.empty() && (queue.front().start < now - 96000 || queue.size() > 400)) queue.pop_front(); }
-                    check(capture->GetNextPacketSize(&available), "Lecture audio");
+            Com<IMMDeviceEnumerator> enumerator;
+            check(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(enumerator.out())), "Liste des périphériques audio");
+            const bool followsDefault = source.targetId == "@default"; const EDataFlow flow = source.kind == SourceKind::Microphone ? eCapture : eRender;
+            const auto defaultDevice = [&] { Com<IMMDevice> device; return SUCCEEDED(enumerator->GetDefaultAudioEndpoint(flow, eConsole, device.out())) ? deviceId(device.p) : QString(); };
+            QString problem;
+            while (!stop) {
+                bool switched = false;
+                try {
+                    Com<IMMDevice> device;
+                    if (followsDefault) check(enumerator->GetDefaultAudioEndpoint(flow, eConsole, device.out()), "Aucun périphérique audio par défaut");
+                    else check(enumerator->GetDevice(reinterpret_cast<LPCWSTR>(source.targetId.utf16()), device.out()), "Périphérique audio introuvable");
+                    const auto id = deviceId(device.p);
+                    Com<IAudioClient> client; check(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(client.out())), "Ouverture du périphérique audio");
+                    auto nextCheck = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+                    pump(client.p, false, epoch, [&] {
+                        if (stop) return false;
+                        if (!followsDefault || std::chrono::steady_clock::now() < nextCheck) return true;
+                        nextCheck = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+                        switched = defaultDevice() != id; return !switched;
+                    }, [&] {
+                        { QMutexLocker lock(&mutex); if (!unavailable.isEmpty()) { unavailable.clear(); qInfo("Audio : « %s » est de nouveau disponible.", label().constData()); } }
+                        problem.clear(); count();
+                    });
+                    if (switched) qInfo("Audio : « %s » suit le nouveau périphérique par défaut.", label().constData());
+                } catch (const std::exception& error) {
+                    if (stop) break;
+                    const auto detail = QString::fromUtf8(error.what());
+                    if (detail != problem) qWarning("Audio : « %s » indisponible, sa piste reste silencieuse jusqu'à son retour (%s).", label().constData(), error.what());
+                    problem = detail; { QMutexLocker lock(&mutex); unavailable = detail; }
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                count();
+                if (switched) continue;
+                for (int step = 0; step < 20 && !stop; ++step) std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
-            client->Stop();
+        } catch (const std::exception& error) { if (!stop) { QMutexLocker lock(&mutex); failure = source.name + ": " + QString::fromUtf8(error.what()); } }
+        count();
+    }
+    // One process of an application source. When it ends, or its sound cannot be followed, the
+    // worker ends too; the monitor decides whether to try that process again.
+    void runApplication(DWORD pid, qint64 epoch, const std::atomic_bool& localStop, HANDLE process) {
+        try {
+            Apartment apartment;
+            Com<IAudioClient> client; client.p = openApplication(pid);
+            pump(client.p, true, epoch, [&] { return !stop && !localStop; }, [] {});
         } catch (const std::exception& error) {
-            if (!stop && !(localStop && localStop->load()) && !(process && WaitForSingleObject(process, 0) == WAIT_OBJECT_0)) {
-                QMutexLocker lock(&mutex); failure = source.name + ": " + QString::fromUtf8(error.what());
-            }
+            if (!stop && !localStop && WaitForSingleObject(process, 0) != WAIT_OBJECT_0)
+                qWarning("Audio : le son du processus %lu n'a pas pu être suivi pour « %s » (%s). Nouvel essai dans 5 secondes.", pid, label().constData(), error.what());
         }
-        if (!ready && !localStop) ++initialized;
     }
     void monitor(qint64 epoch) {
         struct Worker {
-            DWORD pid = 0; HANDLE process = nullptr; std::atomic_bool stop{false}; std::thread thread;
+            DWORD pid = 0; HANDLE process = nullptr; std::atomic_bool stop{false}, done{false}; std::thread thread;
             ~Worker() { stop = true; if (thread.joinable()) thread.join(); if (process) CloseHandle(process); }
         };
         bool ready = false;
         try {
             Apartment apartment; AutomaticSessions sessions;
             std::vector<std::unique_ptr<Worker>> workers;
+            // A process whose sound could not be followed waits a little before the next try.
+            QHash<DWORD, std::chrono::steady_clock::time_point> retry;
             auto nextDevices = std::chrono::steady_clock::now() + std::chrono::seconds(5);
             while (!stop) {
-                if (std::chrono::steady_clock::now() >= nextDevices) { sessions.refreshDevices(); nextDevices = std::chrono::steady_clock::now() + std::chrono::seconds(5); }
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= nextDevices) { sessions.refreshDevices(); nextDevices = now + std::chrono::seconds(5); }
                 QList<quint32> roots;
                 if (source.kind == SourceKind::Application) { for (auto pid : applicationProcesses(source.targetId)) roots.append(pid); }
                 else roots = sessions.roots(source.excludedApplications);
                 if (roots.size() > 32) throw std::runtime_error("Plus de 32 applications audio actives : ajoutez des exclusions.");
                 for (auto it = workers.begin(); it != workers.end();) {
-                    if (!roots.contains((*it)->pid) || WaitForSingleObject((*it)->process, 0) == WAIT_OBJECT_0) it = workers.erase(it); else ++it;
+                    const auto& worker = **it;
+                    if (worker.done && WaitForSingleObject(worker.process, 0) != WAIT_OBJECT_0 && roots.contains(worker.pid)) retry.insert(worker.pid, now + std::chrono::seconds(5));
+                    if (worker.done || !roots.contains(worker.pid) || WaitForSingleObject(worker.process, 0) == WAIT_OBJECT_0) it = workers.erase(it); else ++it;
                 }
+                for (auto it = retry.begin(); it != retry.end();) if (!roots.contains(it.key())) it = retry.erase(it); else ++it;
                 for (auto pid : roots) {
                     if (stop) break;
                     if (std::any_of(workers.begin(), workers.end(), [pid](const auto& worker) { return worker->pid == pid; })) continue;
+                    if (retry.contains(pid) && now < retry.value(pid)) continue;
                     auto worker = std::make_unique<Worker>(); worker->pid = pid;
                     worker->process = OpenProcess(SYNCHRONIZE, FALSE, pid); if (!worker->process) continue;
-                    auto* state = worker.get(); worker->thread = std::thread([this, state, epoch] { run(state->pid, epoch, &state->stop, state->process); });
+                    auto* state = worker.get(); worker->thread = std::thread([this, state, epoch] { runApplication(state->pid, epoch, state->stop, state->process); state->done = true; });
                     workers.push_back(std::move(worker));
                 }
                 if (!ready) { ready = true; ++initialized; }
@@ -358,22 +409,24 @@ struct WindowsAudio::Impl {
         } catch (const std::exception& error) { if (!stop) { QMutexLocker lock(&mutex); failure = source.name + ": " + QString::fromUtf8(error.what()); } }
         if (!ready) ++initialized;
     }
+    static QString deviceId(IMMDevice* device) {
+        LPWSTR id = nullptr; if (FAILED(device->GetId(&id))) return {};
+        const auto result = QString::fromWCharArray(id); CoTaskMemFree(id); return result;
+    }
 };
 WindowsAudio::WindowsAudio(const AudioSource& source) : m_impl(std::make_unique<Impl>()) { m_impl->source = source; }
 WindowsAudio::~WindowsAudio() { m_impl->stop = true; for (auto& thread : m_impl->threads) if (thread.joinable()) thread.join(); }
 void WindowsAudio::start(qint64 epoch) {
-    if (m_impl->source.kind == SourceKind::ApplicationMix || m_impl->source.kind == SourceKind::Application) {
-        m_impl->threads.emplace_back([this, epoch] { m_impl->monitor(epoch); });
-    } else {
-    std::vector<unsigned long> pids{0};
-    for (const auto pid : pids) m_impl->threads.emplace_back([this, pid, epoch] { m_impl->run(pid, epoch); });
-    }
+    if (m_impl->source.kind == SourceKind::ApplicationMix || m_impl->source.kind == SourceKind::Application) m_impl->threads.emplace_back([this, epoch] { m_impl->monitor(epoch); });
+    else m_impl->threads.emplace_back([this, epoch] { m_impl->runDevice(epoch); });
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(7);
     while (m_impl->initialized < int(m_impl->threads.size()) && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(5));
     if (m_impl->initialized < int(m_impl->threads.size())) throw std::runtime_error("Délai d'initialisation audio dépassé.");
     const QString failure = error(); if (!failure.isEmpty()) throw std::runtime_error(failure.toStdString());
 }
 QString WindowsAudio::error() const { QMutexLocker lock(&m_impl->mutex); return m_impl->failure; }
+QString WindowsAudio::unavailable() const { QMutexLocker lock(&m_impl->mutex); return m_impl->unavailable; }
+const AudioSource& WindowsAudio::source() const { return m_impl->source; }
 void WindowsAudio::mix(qint64 first, int count, float* left, float* right) {
     QMutexLocker lock(&m_impl->mutex);
     for (auto it = m_impl->queue.begin(); it != m_impl->queue.end();) {

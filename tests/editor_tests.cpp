@@ -20,6 +20,7 @@
 #include <QMimeData>
 #include <QUrl>
 #include <QTemporaryDir>
+#include <QScrollArea>
 #include <QScrollBar>
 #include <QProcess>
 #include <QtConcurrent/QtConcurrentRun>
@@ -46,6 +47,21 @@
 #include "ui/layout_keys.h"
 #include "ui/update_service.h"
 #include "ui/settings_page.h"
+#include "ui/clip_feedback.h"
+#include "ui/video_surface.h"
+#include "ui/screenshot_editor.h"
+#include "ui/image_viewer.h"
+#include "ui/whats_new.h"
+#include <QPainter>
+#include "ui/image_markup.h"
+#include "platform/windows_video.h"
+#include <QKeySequenceEdit>
+#include <QStackedWidget>
+#include <QtEndian>
+#include <QToolTip>
+#include <QWindow>
+#include <QVBoxLayout>
+#include <windows.h>
 #include "core/update.h"
 #include <QCryptographicHash>
 #include <QJsonArray>
@@ -476,7 +492,7 @@ private slots:
             dialog->findChild<QPushButton*>(confirm ? "trash-confirm" : "trash-keep")->click();
         }); };
         list->selectPaths({paths[0], paths[1]}); auto* classify = window.findChild<QPushButton*>("classify-clip"); QVERIFY(classify->isEnabled()); classify->click();
-        auto* popup = window.findChild<ClassifyPopup*>(); QVERIFY(popup); QVERIFY(!popup->isHidden()); auto* game = popup->findChild<QLineEdit*>("classify-game"); auto* suggestions = popup->findChild<QListWidget*>(); QVERIFY(game); QVERIFY(suggestions);
+        auto* popup = window.findChild<LibraryPage*>("library-page")->findChild<ClassifyPopup*>(); QVERIFY(popup); QVERIFY(!popup->isHidden()); auto* game = popup->findChild<QLineEdit*>("classify-game"); auto* suggestions = popup->findChild<QListWidget*>(); QVERIFY(game); QVERIFY(suggestions);
         game->setText("FIFA 27"); QCOMPARE(suggestions->item(0)->text(), QStringLiteral("Créer « FIFA 27 »")); QTest::keyClick(game, Qt::Key_Return); QVERIFY(popup->isHidden());
         QTRY_COMPARE_WITH_TIMEOUT(gameOf(paths[0]), QString("FIFA 27"), 3000); QCOMPARE(gameOf(paths[1]), QString("FIFA 27")); QTRY_COMPARE_WITH_TIMEOUT(list->selectedPaths().size(), 2, 3000);
         // An existing category is offered first and applied with Enter alone.
@@ -522,7 +538,7 @@ private slots:
         const auto alpha = QDir(library).filePath("Jeu test/Alpha.mp4"), bravo = QDir(library).filePath("Bravo.mp4"); QVERIFY(QFile::copy(m_source, alpha)); QVERIFY(QFile::copy(m_source, bravo));
         ConfigStore store(directory.filePath("config")); auto config = AppConfig::defaults(); config.libraryPath = library; QString error; QVERIFY(store.save(config, error));
         MainWindow window(directory.filePath("config")); window.setAttribute(Qt::WA_DontShowOnScreen); window.show();
-        auto* list = window.findChild<ClipListView*>("clip-library"); auto* page = window.findChild<LibraryPage*>(); QTRY_COMPARE_WITH_TIMEOUT(clipPaths(list).size(), 2, 3000);
+        auto* list = window.findChild<ClipListView*>("clip-library"); auto* page = window.findChild<LibraryPage*>("library-page"); QTRY_COMPARE_WITH_TIMEOUT(clipPaths(list).size(), 2, 3000);
         const auto data = [&](const QString& path, int role) { return list->clips()->index(list->rowOf(path), 0).data(role); };
         QCOMPARE(data(alpha, ClipRole::Game).toString(), QString("Jeu test")); QVERIFY(!data(alpha, ClipRole::Favorite).toBool());
         // Under the default 20 Mo limit, a small clip is ready to drag as it is.
@@ -567,7 +583,7 @@ private slots:
         auto* usual = window.findChild<QSlider*>("track-mix-0"); QVERIFY(usual); QCOMPARE(usual->value(), 100); QVERIFY(!usual->toolTip().isEmpty()); usual->setValue(70);
         QCOMPARE(window.findChild<QLabel*>("settings-dirty")->text(), QStringLiteral("4 modifications non enregistrées"));
         QTest::qWait(50); QVERIFY(window.grab().save(previewPath("settings-audio.png")));
-        window.findChild<QPushButton*>("settings-tab-2")->click(); QVERIFY(window.grab().save(previewPath("settings-files.png")));
+        window.findChild<QPushButton*>("settings-tab-2")->click(); QVERIFY(window.grab().save(previewPath("settings-general.png")));
         // "Annuler" gives the saved settings back; nothing was written meanwhile.
         window.findChild<QPushButton*>("settings-revert")->click(); QCOMPARE(fps->currentData().toInt(), 60); QVERIFY(saveBar->isHidden()); QVERIFY(!window.isWindowModified());
         // The lanes are drawn again with the settings given back; the ones they replace go with the next event.
@@ -613,7 +629,7 @@ private slots:
         window.setPage(MainWindow::Settings); window.findChild<QPushButton*>("settings-tab-2")->click();
         auto* sound = window.findChild<QCheckBox*>("clip-saved-sound"); sound->setChecked(!sound->isChecked()); window.findChild<QPushButton*>("settings-save")->click(); QVERIFY(tray->isVisible());
         QStringList entries; for (const auto* action : menu->actions()) if (!action->isSeparator()) entries.append(action->text());
-        QCOMPARE(entries, QStringList({QStringLiteral("Ouvrir Clipsapp"), QStringLiteral("Sauvegarder le clip"), QStringLiteral("Démarrer le replay"), QStringLiteral("Quitter Clipsapp")}));
+        QCOMPARE(entries, QStringList({QStringLiteral("Ouvrir Clipsapp"), QStringLiteral("Sauvegarder le clip"), QStringLiteral("Prendre un screenshot"), QStringLiteral("Démarrer le replay"), QStringLiteral("Quitter Clipsapp")}));
         QVERIFY(!menu->actions().at(2)->isEnabled());
         // Closing hides the window and ends nothing; unsaved settings are not asked about, they are still there.
         sound->setChecked(!sound->isChecked()); QVERIFY(!window.close()); QVERIFY(window.isHidden()); QVERIFY(tray->isVisible());
@@ -790,7 +806,8 @@ private slots:
         bool seen = false;
         QTimer::singleShot(300, &window, [&] {
             auto* dialog = window.findChild<QDialog*>("update-dialog"); if (!dialog) return; seen = true;
-            const bool complete = dialog->findChild<QLabel*>("update-notes")->text().contains(QStringLiteral("Ralenti")) && dialog->findChild<QLabel*>("update-status")->text().contains(formatBytes(bytes.size())) && dialog->findChild<QPushButton*>("update-action")->text() == QStringLiteral("Télécharger") && dialog->findChild<QWidget*>("update-progress")->isHidden();
+            // The notes wait for the restart: here, only how to get the version.
+            const bool complete = !dialog->findChild<QLabel*>("update-notes") &&dialog->findChild<QLabel*>("update-status")->text().contains(formatBytes(bytes.size())) && dialog->findChild<QPushButton*>("update-action")->text() == QStringLiteral("Télécharger") && dialog->findChild<QWidget*>("update-progress")->isHidden();
             seen = complete && dialog->grab().save(previewPath("update-dialog.png")); dialog->findChild<QPushButton*>("update-later")->click();
         });
         button->click(); QVERIFY(seen); QVERIFY(!window.relaunchRequested()); QVERIFY(!button->isHidden()); QCOMPARE(window.updates()->state(), State::Available);
@@ -844,6 +861,380 @@ private slots:
         for (int i = 0; i < 16; ++i) { player.seek((i % 3) * 500); QTest::qWait(2); }
         player.seek(1700); QCOMPARE(player.snapshot().positionMs, qint64(1700));
         QTRY_VERIFY_WITH_TIMEOUT(!player.snapshot().loading, 3000); QCOMPARE(player.snapshot().positionMs, qint64(1700)); QVERIFY(player.snapshot().error.isEmpty()); QVERIFY(ticks > 0); player.close();
+    }
+    void previewsAndWhatWasReadOfEachClipAreKeptForTheNextLaunch() {
+        QTemporaryDir directory; const auto storage = directory.filePath("cache"), key = ThumbnailCache::keyFor(m_source);
+        const auto changing = directory.filePath("change.mp4"); QVERIFY(QFile::copy(m_source, changing)); const auto changingKey = ThumbnailCache::keyFor(changing);
+        {
+            ThumbnailCache cache; cache.setStorage(storage); QVERIFY(!cache.preview(key));
+            cache.request(key, m_source); QTRY_VERIFY_WITH_TIMEOUT(cache.preview(key) && !cache.preview(key)->image.isNull(), 5000);
+            cache.request(changingKey, changing); QTRY_VERIFY_WITH_TIMEOUT(cache.preview(changingKey), 5000);
+        }
+        QVERIFY(QFile::exists(QDir(storage).filePath("index.json"))); QCOMPARE(QDir(storage).entryList({"*.jpg"}, QDir::Files).size(), 2);
+        // Known at once on the next launch, the clip is not read again: a request for it goes nowhere.
+        { QFile file(changing); QVERIFY(file.open(QIODevice::Append)); file.write("plus long"); }
+        ThumbnailCache again; again.setStorage(storage); QSignalSpy ready(&again, &ThumbnailCache::ready);
+        QVERIFY(again.meta(key)); QCOMPARE(again.meta(key)->size, m_info.size); QCOMPARE(again.meta(key)->tracks, 3); QCOMPARE(again.meta(key)->durationMs, m_info.durationMs);
+        const auto* preview = again.preview(key); QVERIFY(preview); QVERIFY(!preview->image.isNull()); QVERIFY(preview->image.width() <= 128);
+        again.request(key, directory.filePath("absent.mp4")); QTest::qWait(300); QCOMPARE(ready.size(), 0);
+        // A clip that changed since is forgotten, preview included; the next reading starts afresh.
+        QTRY_VERIFY_WITH_TIMEOUT(!again.meta(changingKey), 3000); QVERIFY(!again.preview(changingKey));
+        QTRY_COMPARE_WITH_TIMEOUT(QDir(storage).entryList({"*.jpg"}, QDir::Files).size(), 1, 3000);
+    }
+    void libraryFollowsWhatTheExplorerAddsRenamesAndRemoves() {
+        QTemporaryDir directory; const auto library = directory.filePath("clips"); QVERIFY(QDir().mkpath(library + "/Jeu"));
+        ConfigStore store(directory.filePath("config")); auto config = AppConfig::defaults(); config.libraryPath = library; QString error; QVERIFY(store.save(config, error));
+        MainWindow window(directory.filePath("config")); window.setAttribute(Qt::WA_DontShowOnScreen); window.show();
+        auto* list = window.findChild<ClipListView*>("clip-library"); auto* shares = window.findChild<ClipListView*>("discord-library"); auto* cache = window.findChild<ThumbnailCache*>(); QVERIFY(list); QVERIFY(shares); QVERIFY(cache);
+        QTest::qWait(300); QVERIFY(clipPaths(list).isEmpty());
+        // Copied by hand into a game folder, the clip shows without anything to refresh.
+        const auto added = QDir(library).filePath("Jeu/Ajout.mp4"); QVERIFY(QFile::copy(m_source, added));
+        QTRY_VERIFY_WITH_TIMEOUT(clipPaths(list).contains(added), 5000); QCOMPARE(list->clips()->index(list->rowOf(added), 0).data(ClipRole::Game).toString(), QString("Jeu"));
+        QVERIFY(QDir().mkpath(library + "/Partage Discord")); const auto copy = QDir(library).filePath("Partage Discord/Ajout-1.discord.mp4"); QVERIFY(QFile::copy(m_source, copy));
+        QTRY_VERIFY_WITH_TIMEOUT(clipPaths(shares).contains(copy), 5000); QVERIFY(!clipPaths(list).contains(copy));
+        // Nothing reads the clips while the Explorer works on them: the folders are the user's.
+        cache->setActive(false); QTRY_VERIFY_WITH_TIMEOUT(!cache->pending().isRunning(), 3000);
+        QVERIFY(QDir(library).rename("Jeu", "Autre jeu")); const auto moved = QDir(library).filePath("Autre jeu/Ajout.mp4");
+        QTRY_VERIFY_WITH_TIMEOUT(clipPaths(list).contains(moved) && !clipPaths(list).contains(added), 5000); QCOMPARE(list->clips()->index(list->rowOf(moved), 0).data(ClipRole::Game).toString(), QString("Autre jeu"));
+        QVERIFY(QFile::remove(moved)); QVERIFY(QFile::remove(copy)); QTRY_VERIFY_WITH_TIMEOUT(clipPaths(list).isEmpty() && clipPaths(shares).isEmpty(), 5000);
+        window.close();
+    }
+    void startupSettingsChooseWhenTheReplayStartsByItself() {
+        QTemporaryDir directory; const auto configPath = directory.filePath("config"); QString error;
+        { auto config = AppConfig::defaults(); config.libraryPath = directory.filePath("clips"); QVERIFY(ConfigStore(configPath).save(config, error)); }
+        MainWindow window(configPath); window.setAttribute(Qt::WA_DontShowOnScreen); window.show(); window.setPage(MainWindow::Settings); window.findChild<QPushButton*>("settings-tab-2")->click();
+        auto* settings = window.findChild<SettingsPage*>(); auto* mode = window.findChild<QComboBox*>("auto-replay"); auto* games = window.findChild<QWidget*>("replay-games"); auto* hint = window.findChild<QLabel*>("auto-replay-hint");
+        QVERIFY(settings); QVERIFY(mode); QVERIFY(games); QVERIFY(hint);
+        // Nothing starts by itself at first; a copy that does not manage the session has no switch for it.
+        QCOMPARE(mode->currentData().toString(), QString("off")); QVERIFY(!games->isVisible()); QVERIFY(window.findChild<QCheckBox*>("login-start")->isHidden());
+        mode->setCurrentIndex(mode->findData("launch")); QVERIFY(hint->text().contains(QStringLiteral("écran principal"))); QVERIFY(!games->isVisible());
+        mode->setCurrentIndex(mode->findData("games")); QVERIFY(games->isVisible()); QVERIFY(hint->text().contains(QStringLiteral("30 secondes")));
+        settings->addReplayGame("C:\\Jeux\\Valorant\\VALORANT.exe"); settings->addReplayGame("c:/jeux/valorant/valorant.exe"); settings->addReplayGame("D:/Steam/cs2.exe");
+        QVERIFY(window.findChild<QWidget*>("replay-game-1")); QVERIFY(!window.findChild<QWidget*>("replay-game-2"));
+        QScrollArea* area = nullptr; for (auto* parent = games->parentWidget(); parent && !area; parent = parent->parentWidget()) area = qobject_cast<QScrollArea*>(parent);
+        QVERIFY(area); QTest::qWait(50); area->ensureWidgetVisible(window.findChild<QWidget*>("add-replay-game")); QTest::qWait(50);
+        // Laid out, the section stacks its parts without overlap: the choice, its explanation, then the games.
+        QVERIFY(mode->mapTo(area, QPoint(0, mode->height())).y() <= hint->mapTo(area, QPoint()).y()); QVERIFY(hint->mapTo(area, QPoint(0, hint->height())).y() <= games->mapTo(area, QPoint()).y());
+        QVERIFY(window.grab().save(previewPath("settings-startup.png")));
+        window.findChild<QPushButton*>("remove-replay-game-1")->click(); QTRY_VERIFY(!window.findChild<QWidget*>("replay-game-1"));
+        QVERIFY(!window.findChild<QWidget*>("savebar")->isHidden()); window.findChild<QPushButton*>("settings-save")->click();
+        AppConfig stored; QVERIFY(ConfigStore(configPath).load(stored, error)); QCOMPARE(stored.autoReplay, QString("games")); QCOMPARE(stored.replayGames, QStringList({"C:/Jeux/Valorant/VALORANT.exe"})); QVERIFY(!stored.launchAtLogin);
+        // Cancelling brings back what was saved, list of games included.
+        window.findChild<QPushButton*>("remove-replay-game-0")->click(); mode->setCurrentIndex(mode->findData("off"));
+        window.findChild<QPushButton*>("settings-revert")->click(); QCOMPARE(mode->currentData().toString(), QString("games")); QTRY_VERIFY(window.findChild<QWidget*>("replay-game-0"));
+        window.close();
+    }
+    void aWidgetRaisedAboveTheVideoGetsAWindowWithoutItsParents() {
+        // A parent made native is what had Qt complain that a popup's parent "must be a top level window".
+        QWidget top; top.setProperty("directVideo", true); top.setAttribute(Qt::WA_DontShowOnScreen); top.resize(320, 200);
+        auto* pages = new QStackedWidget(&top); auto* page = new QWidget; pages->addWidget(page); auto* toast = new QLabel(QStringLiteral("Clip sauvegardé"), page);
+        top.show(); QCoreApplication::processEvents();
+        VideoSurface::raiseAbove(toast);
+        QVERIFY(toast->internalWinId()); QVERIFY(!page->internalWinId()); QVERIFY(!pages->internalWinId());
+    }
+    void theCropIsDrawnWithTheMouseOverTheVideoShownByTheCard() {
+        // Shown by the graphics card, the image lies in a window of its own: Windows hands it the mouse, not the view.
+        QWidget top; top.resize(640, 400); auto* column = new QVBoxLayout(&top); column->setContentsMargins(40, 60, 40, 20);
+        auto* canvas = new VideoCanvas; column->addWidget(canvas);
+        top.show(); QVERIFY(QTest::qWaitForWindowExposed(&top));
+        auto* surface = canvas->prepareSurface(); if (!surface) QSKIP("This machine shows no clip through its graphics card.");
+        QImage image(320, 192, QImage::Format_ARGB32); image.fill(Qt::red);
+        canvas->setFrame(image, image.size()); canvas->setCrop(image.rect()); canvas->setCropTool(true); canvas->setDirect(true); QTest::qWait(50);
+        QVERIFY(surface->isVisible()); QVERIFY(surface->windowHandle());
+        QSignalSpy selected(canvas, &VideoCanvas::cropSelected);
+        // Pressed, dragged and let go over the surface, the way the system sends it.
+        const auto at = [surface, canvas](QPoint inCanvas) { return surface->mapFrom(canvas, inCanvas); };
+        const QPoint from(canvas->width() / 4, canvas->height() / 4), to(canvas->width() * 3 / 4, canvas->height() * 3 / 4);
+        QTest::mousePress(surface->windowHandle(), Qt::LeftButton, Qt::NoModifier, at(from)); QTest::mouseMove(surface->windowHandle(), at((from + to) / 2)); QTest::mouseMove(surface->windowHandle(), at(to));
+        QTest::mouseRelease(surface->windowHandle(), Qt::LeftButton, Qt::NoModifier, at(to));
+        QVERIFY(!selected.isEmpty()); const auto crop = selected.last().first().toRect(); QVERIFY(crop.width() > 60 && crop.width() < 260); QVERIFY(crop.height() > 30);
+    }
+    void theEditorDrawsAFreeCropWithTheMouseWhereverTheImageIsShown() {
+        ClipEditor editor; editor.resize(1100, 760); editor.move(40, 40); editor.show(); QVERIFY(QTest::qWaitForWindowExposed(&editor)); editor.openClip(m_source);
+        // Windows answers with what is under the mouse on screen: the editor comes first, above anything else open.
+        editor.raise(); editor.activateWindow(); (void)QTest::qWaitForWindowActive(&editor);
+        auto* width = editor.findChild<QSpinBox*>("crop-width"); auto* height = editor.findChild<QSpinBox*>("crop-height"); QVERIFY(width); QVERIFY(height);
+        QTRY_VERIFY_WITH_TIMEOUT(width->isEnabled() && width->value() == 320, 5000); QTest::qWait(300);
+        auto* canvas = editor.findChild<VideoCanvas*>(); QVERIFY(canvas);
+        editor.findChild<QPushButton*>("crop-ratio-4")->click(); QTest::qWait(100);
+        // The mouse goes to the window Windows finds under it, the card's surface when it shows the image.
+        const auto under = [canvas](QPoint inCanvas) {
+            const auto global = canvas->mapToGlobal(inCanvas); const double ratio = canvas->devicePixelRatioF();
+            auto* widget = QWidget::find(WId(WindowFromPoint(POINT{LONG(global.x() * ratio), LONG(global.y() * ratio)})));
+            return std::pair<QWindow*, QPoint>(widget ? widget->windowHandle() : nullptr, widget ? widget->mapFromGlobal(global) : QPoint());
+        };
+        const QPoint from(canvas->width() * 3 / 10, canvas->height() * 3 / 10), to(canvas->width() * 6 / 10, canvas->height() * 6 / 10);
+        const auto start = under(from), middle = under((from + to) / 2), end = under(to);
+        if (!start.first || !middle.first || !end.first) QSKIP("Another window covers the editor on this screen: Windows keeps it in front of the tests.");
+        QTest::mousePress(start.first, Qt::LeftButton, Qt::NoModifier, start.second); QTest::mouseMove(middle.first, middle.second); QTest::mouseMove(end.first, end.second);
+        QTest::mouseRelease(end.first, Qt::LeftButton, Qt::NoModifier, end.second);
+        const auto describe = [&] {
+            auto* widget = QWidget::find(WId(WindowFromPoint([&] { const auto g = canvas->mapToGlobal(from); return POINT{LONG(g.x() * canvas->devicePixelRatioF()), LONG(g.y() * canvas->devicePixelRatioF())}; }())));
+            return QStringLiteral("under the mouse: %1 '%2' · surface %3 visible %4").arg(widget ? widget->metaObject()->className() : "nothing", widget ? widget->objectName() : QString()).arg(canvas->surface() != nullptr).arg(canvas->surface() && canvas->surface()->isVisible());
+        };
+        QTRY_VERIFY2_WITH_TIMEOUT(width->value() < 300, qPrintable(describe()), 2000); QVERIFY(width->value() > 40); QVERIFY(height->value() < 180);
+        editor.suspend();
+    }
+    void screenshotsHaveTheirPageAndTheRailShowsTheGamesOfWhatIsOnScreen() {
+        QTemporaryDir directory; const auto library = directory.filePath("clips"); QVERIFY(QDir().mkpath(library + "/ARC Raiders"));
+        QVERIFY(QFile::copy(m_source, library + "/ARC Raiders/clip.mp4"));
+        QImage picture(160, 90, QImage::Format_RGB32); picture.fill(Qt::darkCyan);
+        for (const auto& name : {"/Screenshots/ARC Raiders/vue.png", "/Screenshots/EA SPORTS FC 27/but.png"}) { QVERIFY(QDir().mkpath(QFileInfo(library + name).absolutePath())); QVERIFY(picture.save(library + name)); }
+        { auto config = AppConfig::defaults(); config.libraryPath = library; QString error; QVERIFY(ConfigStore(directory.filePath("config")).save(config, error)); }
+        MainWindow window(directory.filePath("config")); window.setAttribute(Qt::WA_DontShowOnScreen); window.show();
+        auto* clips = window.findChild<ClipListView*>("clip-library"); auto* shots = window.findChild<ClipListView*>("screenshot-library"); QVERIFY(clips); QVERIFY(shots);
+        QTRY_COMPARE_WITH_TIMEOUT(clipPaths(clips).size(), 1, 5000); QTRY_COMPARE_WITH_TIMEOUT(clipPaths(shots).size(), 2, 5000);
+        const auto height = [&window](const char* name) { return window.findChild<QScrollArea*>(name)->maximumHeight(); };
+        // On the clips, their games; those of the screenshots wait for their page.
+        QVERIFY(height("nav-games") > 0); QCOMPARE(height("nav-screenshot-games"), 0);
+        window.findChild<QPushButton*>("nav-screenshots")->click(); QVERIFY(window.findChild<QWidget*>("screenshots-page")->isVisible());
+        QCOMPARE(height("nav-games"), 0); QCOMPARE(height("nav-screenshot-games"), 3 * 31 + 3);
+        QVERIFY(window.grab().save(previewPath("screenshots.png")));
+        // A game of the screenshots filters their list.
+        // New rows show on the next turn of the event loop.
+        QPushButton* fc = nullptr;
+        QTRY_VERIFY((fc = [&window]() -> QPushButton* { for (auto* button : window.findChild<QScrollArea*>("nav-screenshot-games")->findChildren<QPushButton*>()) if (button->property("game").toString() == "EA SPORTS FC 27" && button->isVisible()) return button; return nullptr; }())); fc->click(); QCOMPARE(clipPaths(shots), QStringList({library + "/Screenshots/EA SPORTS FC 27/but.png"}));
+        window.findChild<QPushButton*>("nav-settings")->click(); QCOMPARE(height("nav-games"), 0); QCOMPARE(height("nav-screenshot-games"), 0);
+        window.findChild<QPushButton*>("nav-clips")->click(); QVERIFY(height("nav-games") > 0); QCOMPARE(height("nav-screenshot-games"), 0);
+        window.close();
+    }
+    void theScreenshotEditorSavesACroppedCopyAndKeepsTheOriginal() {
+        QTemporaryDir directory; const auto original = directory.filePath("ARC Raiders-vue.png");
+        QImage picture(400, 200, QImage::Format_RGB32); picture.fill(Qt::red); for (int y = 0; y < 200; ++y) for (int x = 200; x < 400; ++x) picture.setPixelColor(x, y, Qt::blue);
+        QVERIFY(picture.save(original)); const auto digestBefore = digest(original);
+        ScreenshotEditor editor; editor.setAttribute(Qt::WA_DontShowOnScreen); editor.resize(1100, 700); editor.show(); editor.openImage(original);
+        QCOMPARE(editor.imageSize(), QSize(400, 200)); QTRY_VERIFY(editor.findChild<QLabel*>("screenshot-title")->width() > 60);
+        auto* save = editor.findChild<QPushButton*>("screenshot-save"); QVERIFY(!save->isEnabled());
+        // A square in the middle of the picture: half red, half blue.
+        editor.findChild<QPushButton*>("screenshot-ratio-3")->click(); QCOMPARE(editor.crop(), QRect(100, 0, 200, 200)); QVERIFY(save->isEnabled());
+        QTest::qWait(50); QVERIFY(editor.grab().save(previewPath("screenshot-editor.png")));
+        QSignalSpy saved(&editor, &ScreenshotEditor::saved); save->click();
+        QTRY_COMPARE_WITH_TIMEOUT(saved.size(), 1, 5000); const auto copy = saved.first().first().toString();
+        QCOMPARE(copy, directory.filePath("ARC Raiders-vue (recadré).png")); QVERIFY(saved.first().at(1).toString() == original);
+        const QImage cropped(copy); QCOMPARE(cropped.size(), QSize(200, 200)); QCOMPARE(cropped.pixelColor(50, 100), QColor(Qt::red)); QCOMPARE(cropped.pixelColor(150, 100), QColor(Qt::blue));
+        QCOMPARE(digest(original), digestBefore); QVERIFY(editor.findChild<QWidget*>("screenshot-banner")->isVisible());
+        QCOMPARE(ScreenshotEditor::croppedPath(original), directory.filePath("ARC Raiders-vue (recadré 2).png"));
+    }
+    void theClipEditorKeepsTheFrameShownAmongTheScreenshots() {
+        QTemporaryDir directory; const auto library = directory.filePath("clips"); QVERIFY(QDir().mkpath(library + "/ARC Raiders")); const auto clip = library + "/ARC Raiders/clip.mp4"; QVERIFY(QFile::copy(m_source, clip));
+        { auto config = AppConfig::defaults(); config.libraryPath = library; QString error; QVERIFY(ConfigStore(directory.filePath("config")).save(config, error)); }
+        MainWindow window(directory.filePath("config")); window.setAttribute(Qt::WA_DontShowOnScreen); window.show();
+        auto* list = window.findChild<ClipListView*>("clip-library"); QTRY_VERIFY_WITH_TIMEOUT(clipPaths(list).contains(clip), 5000); emit list->openRequested(clip);
+        auto* width = window.findChild<QSpinBox*>("crop-width"); QTRY_VERIFY_WITH_TIMEOUT(width->isEnabled() && width->value() == 320, 5000);
+        window.findChild<QPushButton*>("editor-screenshot")->click();
+        // Taken at the size of the clip, filed with its game, listed among the screenshots.
+        const auto folder = library + "/Screenshots/ARC Raiders";
+        QTRY_COMPARE_WITH_TIMEOUT(QDir(folder).entryList({"*.png"}, QDir::Files).size(), 1, 5000);
+        const QImage taken(QDir(folder).filePath(QDir(folder).entryList({"*.png"}, QDir::Files).first())); QCOMPARE(taken.size(), QSize(320, 192));
+        auto* shots = window.findChild<ClipListView*>("screenshot-library"); QTRY_COMPARE_WITH_TIMEOUT(clipPaths(shots).size(), 1, 5000);
+        // With a framing set, only the framed part is kept.
+        width->setValue(160); window.findChild<QSpinBox*>("crop-height")->setValue(96); window.findChild<QPushButton*>("editor-screenshot")->click();
+        QTRY_COMPARE_WITH_TIMEOUT(QDir(folder).entryList({"*.png"}, QDir::Files).size(), 2, 5000);
+        bool framed = false; for (const auto& name : QDir(folder).entryList({"*.png"}, QDir::Files)) framed |= QImage(QDir(folder).filePath(name)).size() == QSize(160, 96);
+        QVERIFY(framed); window.close();
+    }
+    void aGameKeepsItsOwnVolumesAndTheOthersKeepTheUsualOnes() {
+        QTemporaryDir directory; const auto library = directory.filePath("clips");
+        const auto arc = library + "/ARC Raiders/arc.mp4", fc = library + "/EA SPORTS FC 27/fc.mp4";
+        for (const auto& clip : {arc, fc}) { QVERIFY(QDir().mkpath(QFileInfo(clip).absolutePath())); QVERIFY(QFile::copy(m_source, clip)); }
+        const auto configPath = directory.filePath("config"); { auto config = AppConfig::defaults(); config.libraryPath = library; QString error; QVERIFY(ConfigStore(configPath).save(config, error)); }
+        MainWindow window(configPath); window.setAttribute(Qt::WA_DontShowOnScreen); window.show();
+        auto* list = window.findChild<ClipListView*>("clip-library"); QTRY_COMPARE_WITH_TIMEOUT(clipPaths(list).size(), 2, 5000);
+        const auto open = [&](const QString& clip) -> QSlider* {
+            emit list->openRequested(clip);
+            if (!QTest::qWaitFor([&] { auto* width = window.findChild<QSpinBox*>("crop-width"); return width && width->isEnabled() && width->value() == 320 && window.findChild<QSlider*>("track-volume-1"); }, 5000)) return nullptr;
+            QTest::qWait(50); return window.findChild<QSlider*>("track-volume-1");
+        };
+        auto* game = open(arc); QVERIFY(game); QCOMPARE(game->value(), 100); game->setValue(40);
+        auto* keep = window.findChild<QPushButton*>("keep-mix"); QTRY_VERIFY(keep->isVisible()); QCOMPARE(keep->text(), QStringLiteral("Garder ces volumes pour ARC Raiders")); keep->click();
+        AppConfig stored; QString error; QVERIFY(ConfigStore(configPath).load(stored, error));
+        QCOMPARE(stored.gameMixes.value("ARC Raiders").value("jeu"), 0.4); QVERIFY(stored.defaultMix.isEmpty());
+        // The clips of another game open as before; those of the game, with its levels.
+        window.findChild<QPushButton*>("editor-back")->click(); auto* other = open(fc); QVERIFY(other); QCOMPARE(other->value(), 100);
+        window.findChild<QPushButton*>("editor-back")->click(); auto* again = open(arc); QVERIFY(again); QCOMPARE(again->value(), 40);
+        // The settings list it, and forgetting it brings the usual levels back.
+        window.findChild<QPushButton*>("editor-back")->click(); window.setPage(MainWindow::Settings); window.findChild<QPushButton*>("settings-tab-1")->click();
+        QTRY_VERIFY(window.findChild<QWidget*>("game-mix-0")); QVERIFY(window.findChild<QWidget*>("game-mixes")->isVisible());
+        window.findChild<QPushButton*>("forget-game-mix-0")->click(); window.findChild<QPushButton*>("settings-save")->click();
+        QVERIFY(ConfigStore(configPath).load(stored, error)); QVERIFY(stored.gameMixes.isEmpty());
+        window.close();
+    }
+    void aWindowIsCapturedPixelForPixel() {
+        // A window of the test itself: nothing of the screen of whoever runs the tests is read.
+        QWidget target; target.setWindowTitle(QStringLiteral("Clipsapp, capture d'essai")); target.setAutoFillBackground(true);
+        QPalette palette = target.palette(); palette.setColor(QPalette::Window, Qt::red); target.setPalette(palette); target.resize(300, 200); target.show(); QVERIFY(QTest::qWaitForWindowExposed(&target)); QTest::qWait(200);
+        QString error; const auto image = captureScreenImage(QStringLiteral("window:%1|%2").arg(QCoreApplication::applicationFilePath().toCaseFolded(), target.windowTitle()), false, error);
+        QVERIFY2(!image.isNull(), qPrintable(error));
+        QVERIFY(image.width() >= qRound(300 * target.devicePixelRatioF())); QVERIFY(image.height() >= qRound(200 * target.devicePixelRatioF()));
+        const auto middle = image.pixelColor(image.width() / 2, image.height() / 2); QVERIFY2(middle.red() > 200 && middle.green() < 60 && middle.blue() < 60, qPrintable(middle.name()));
+    }
+    void screenshotSettingsTakeAShortcutAndASoundOfTheirOwn() {
+        QTemporaryDir directory; const auto configPath = directory.filePath("config"); QString error;
+        { auto config = AppConfig::defaults(); config.libraryPath = directory.filePath("clips"); QVERIFY(ConfigStore(configPath).save(config, error)); }
+        MainWindow window(configPath); window.setAttribute(Qt::WA_DontShowOnScreen); window.show(); window.setPage(MainWindow::Settings);
+        auto* settings = window.findChild<SettingsPage*>(); settings->showTab(0); QCoreApplication::processEvents();
+        auto* key = window.findChild<QKeySequenceEdit*>("screenshot-hotkey"); QVERIFY(key); QCOMPARE(key->keySequence(), QKeySequence(QStringLiteral("Ctrl+Alt+F11")));
+        QVERIFY(window.findChild<QPushButton*>("screenshot-hotkey-change")->isVisible());
+        key->setKeySequence(QKeySequence(QStringLiteral("Ctrl+Shift+S")));
+        settings->showTab(2); QCoreApplication::processEvents();
+        auto* sound = window.findChild<QComboBox*>("screenshot-sound-choice"); QVERIFY(sound && sound->isVisible()); QCOMPARE(sound->currentData().toString(), QString("shutter"));
+        sound->setCurrentIndex(sound->findData("coin")); window.findChild<QSlider*>("screenshot-sound-volume")->setValue(70);
+        window.findChild<QPushButton*>("settings-save")->click();
+        AppConfig stored; QVERIFY(ConfigStore(configPath).load(stored, error));
+        QCOMPARE(stored.screenshotHotkey, QString("Ctrl+Shift+S")); QCOMPARE(stored.screenshotSoundId, QString("coin")); QCOMPARE(stored.screenshotSoundVolume, 70);
+        window.close();
+    }
+    void whatsNewShowsTheNotesOfTheInstalledVersionOverTheWindow() {
+        const auto sample = QStringLiteral("## 0.8.3\r\n\r\n**Nouveautés**\r\n\r\n- **Screenshots** : un raccourci prend l'écran en qualité native.\r\n- **Démarrage automatique**, dans **Réglages → Général** :\r\n  - **Lancer Clipsapp** avec Windows.\r\n  - Replay automatique.\r\n\r\n**Corrections**\r\n\r\n- Le recadrage `Libre` refonctionne, voir [la page](https://example.com/a).\r\n");
+        const auto sections = parseReleaseNotes(sample);
+        QCOMPARE(sections.size(), 2); QCOMPARE(sections[0].title, QStringLiteral("Nouveautés")); QCOMPARE(sections[0].items.size(), 2);
+        QCOMPARE(sections[0].items[0].lead, QStringLiteral("Screenshots")); QCOMPARE(sections[0].items[0].text, QStringLiteral("Un raccourci prend l'écran en qualité native."));
+        QVERIFY(sections[0].items[1].lead.isEmpty()); QCOMPARE(sections[0].items[1].details, QStringList({QStringLiteral("**Lancer Clipsapp** avec Windows."), QStringLiteral("Replay automatique.")}));
+        QCOMPARE(sections[1].title, QStringLiteral("Corrections")); QCOMPARE(sections[1].items.size(), 1);
+        const auto html = inlineMarkdown(sections[1].items[0].text + QStringLiteral(" <b>"));
+        QVERIFY(html.contains(QStringLiteral("Consolas"))); QVERIFY(html.contains(QStringLiteral("href=\"https://example.com/a\""))); QVERIFY(html.contains(QStringLiteral("&lt;b&gt;")));
+
+        // In the window, over a library.
+        QTemporaryDir directory; const auto library = directory.filePath("clips");
+        for (const auto& [game, name] : std::initializer_list<std::pair<const char*, const char*>>{{"Nova Strike", "Clutch 1v3"}, {"Turbo Ball", "Arrêt décisif"}, {"Nova Strike", "Ace en défense"}}) {
+            QVERIFY(QDir().mkpath(library + '/' + game)); QVERIFY(QFile::copy(m_source, QStringLiteral("%1/%2/%3.mp4").arg(library, QString::fromUtf8(game), QString::fromUtf8(name))));
+        }
+        ConfigStore store(directory.filePath("config")); auto config = AppConfig::defaults(); config.libraryPath = library; QString error; QVERIFY(store.save(config, error));
+        MainWindow window(directory.filePath("config")); window.setAttribute(Qt::WA_DontShowOnScreen); window.show();
+        auto* list = window.findChild<ClipListView*>("clip-library"); QTRY_COMPARE_WITH_TIMEOUT(clipPaths(list).size(), 3, 5000); QTest::qWait(1500);
+        // The journal built into the program: newest first, the version in use among them, every version readable.
+        const auto releases = bundledChangelog(); QVERIFY(releases.size() >= 4); QCOMPARE(releases.first().version, QStringLiteral(CLIPSAPP_VERSION)); QCOMPARE(releases.last().version, QStringLiteral("0.8.0"));
+        for (const auto& release : releases) QVERIFY2(!parseReleaseNotes(release.notes).isEmpty(), qPrintable(release.version));
+        QCOMPARE(changelogReleases(sample).size(), 1); QCOMPARE(changelogReleases(sample).first().version, QStringLiteral("0.8.3"));
+        const auto composite = [&](QWidget* dialog) { QImage shot = window.grab().toImage(); QPainter painter(&shot); painter.drawPixmap(dialog->mapToGlobal(QPoint()) - window.mapToGlobal(QPoint()), dialog->grab()); return shot; };
+        const auto hasText = [](QWidget* widget, const QString& text) { for (auto* found : widget->findChildren<QLabel*>()) if (found->text() == text) return true; return false; };
+
+        // After an update: the notes of the version installed, alone, once the window is on screen.
+        bool after = false;
+        QTimer::singleShot(1400, &window, [&] {
+            auto* dialog = static_cast<WhatsNewDialog*>(window.findChild<QDialog*>("whats-new")); if (!dialog) return;
+            after = dialog->isVisible() && !dialog->findChild<QComboBox*>("whats-new-versions") && hasText(dialog, QStringLiteral("Quoi de neuf dans Clipsapp %1").arg(CLIPSAPP_VERSION))
+                && hasText(dialog, QStringLiteral("Mise à jour installée, à la place de la version 0.8.2.")) && dialog->height() < window.height() && dialog->findChild<QWidget*>("whats-new-notes");
+            after = after && composite(dialog).save(previewPath("whats-new.png"));
+            auto* scroll = dialog->findChild<QScrollArea*>("whats-new-scroll"); scroll->verticalScrollBar()->setValue(scroll->verticalScrollBar()->maximum()); QTest::qWait(50);
+            after = after && composite(dialog).save(previewPath("whats-new-end.png"));
+            dialog->findChild<QPushButton*>("whats-new-close")->click();
+        });
+        window.announceUpdated(QStringLiteral("0.8.2")); QTRY_VERIFY_WITH_TIMEOUT(after, 5000);
+
+        // The version in the side bar opens the journal on the version in use; the others are a choice away, in a card that keeps its height.
+        bool journal = false;
+        QTimer::singleShot(300, &window, [&] {
+            auto* dialog = static_cast<WhatsNewDialog*>(window.findChild<QDialog*>("whats-new")); if (!dialog) return;
+            auto* versions = dialog->findChild<QComboBox*>("whats-new-versions"); if (!versions) return;
+            const bool opened = versions->count() == releases.size() && versions->currentIndex() == 0 && versions->itemText(0).endsWith(QStringLiteral("installée")) && dialog->shown() == 0 && hasText(dialog, QStringLiteral("C'est la version que vous utilisez."));
+            const int height = dialog->height(); versions->setCurrentIndex(int(releases.size()) - 1); QTest::qWait(50);
+            journal = opened && dialog->shown() == releases.size() - 1 && hasText(dialog, QStringLiteral("Quoi de neuf dans Clipsapp 0.8.0")) && hasText(dialog, QStringLiteral("Une version précédente. Vous utilisez la %1.").arg(CLIPSAPP_VERSION)) && dialog->height() == height;
+            versions->setCurrentIndex(1); QTest::qWait(50); journal = journal && composite(dialog).save(previewPath("whats-new-journal.png"));
+            dialog->findChild<QPushButton*>("whats-new-close")->click();
+        });
+        auto* version = window.findChild<QPushButton*>("app-version"); QCOMPARE(version->text(), QStringLiteral("Version %1").arg(CLIPSAPP_VERSION)); version->click(); QVERIFY(journal);
+        window.close();
+    }
+    void screenshotsAreSeenFullScreenOneAfterTheOtherWithTheArrows() {
+        QTemporaryDir directory; QStringList paths;
+        for (const auto& [name, color] : std::initializer_list<std::pair<const char*, QColor>>{{"un.png", Qt::red}, {"deux.png", Qt::green}, {"trois.png", Qt::blue}}) {
+            QImage picture(320, 180, QImage::Format_RGB32); picture.fill(color); const auto path = directory.filePath(name); QVERIFY(picture.save(path)); paths.append(path);
+        }
+        QWidget owner; ImageViewer viewer(&owner); viewer.setAttribute(Qt::WA_DontShowOnScreen); viewer.resize(800, 500); QSignalSpy closed(&viewer, &ImageViewer::closed);
+        viewer.open(paths, 0); QCOMPARE(viewer.currentPath(), paths[0]); QCOMPARE(viewer.image().pixelColor(10, 10), QColor(Qt::red));
+        QVERIFY(!viewer.findChild<QPushButton*>("image-viewer-previous")->isEnabled()); QVERIFY(viewer.findChild<QPushButton*>("image-viewer-next")->isEnabled());
+        QTest::keyClick(&viewer, Qt::Key_Right); QCOMPARE(viewer.index(), 1); QCOMPARE(viewer.image().pixelColor(10, 10), QColor(Qt::green));
+        QTest::keyClick(&viewer, Qt::Key_Right); QTest::keyClick(&viewer, Qt::Key_Right); QCOMPARE(viewer.index(), 2);
+        QTest::keyClick(&viewer, Qt::Key_Left); QCOMPARE(viewer.index(), 1); QTest::keyClick(&viewer, Qt::Key_Home); QCOMPARE(viewer.index(), 0); QTest::keyClick(&viewer, Qt::Key_Left); QCOMPARE(viewer.index(), 0);
+        QTest::keyClick(&viewer, Qt::Key_End); QCOMPARE(viewer.index(), 2); QCOMPARE(viewer.findChild<QLabel*>("image-viewer-count")->text(), QStringLiteral("3 sur 3"));
+        QTest::qWait(50); QVERIFY(viewer.grab().save(previewPath("image-viewer.png")));
+        QTest::keyClick(&viewer, Qt::Key_Escape); QCOMPARE(closed.size(), 1); QCOMPARE(closed.first().first().toString(), paths[2]); QVERIFY(viewer.isHidden());
+        // From the list of screenshots: a picture is not played, it is seen larger, in the order of the list.
+        LibraryPage page(nullptr, LibraryPage::Screenshots); QSignalSpy view(&page, &LibraryPage::viewRequested), open(&page, &LibraryPage::openRequested);
+        QList<LibraryItem> items; for (const auto& path : paths) items.append({ClipEntry{path, QFileInfo(path).completeBaseName(), QStringLiteral("Jeu"), QStringLiteral("PNG"), 10, QDateTime::currentDateTime()}});
+        page.setItems(items, 20000000); emit page.list()->actionRequested(ClipRowDelegate::Play, paths[1], {});
+        QCOMPARE(view.size(), 1); QCOMPARE(view.first().at(0).toStringList().size(), 3); QCOMPARE(open.size(), 0);
+    }
+    void marksDrawnOnAScreenshotLandInTheFullPicture() {
+        QTemporaryDir directory; const auto original = directory.filePath("vue.png");
+        QImage picture(400, 200, QImage::Format_RGB32); picture.fill(Qt::white); QVERIFY(picture.save(original)); const auto before = digest(original);
+        ScreenshotEditor editor; editor.setAttribute(Qt::WA_DontShowOnScreen); editor.resize(1100, 700); editor.show(); editor.openImage(original); QTest::qWait(50);
+        auto* save = editor.findChild<QPushButton*>("screenshot-save"); QVERIFY(!save->isEnabled());
+        // Choosing a tool turns to drawing; a frame is drawn across the middle of the picture, in red.
+        editor.findChild<QPushButton*>("markup-tool-2")->click(); QCOMPARE(editor.findChild<Segmented*>("screenshot-mode")->currentIndex(), 1);
+        auto* canvas = editor.findChild<VideoCanvas*>("screenshot-canvas"); auto* layer = editor.findChild<MarkupLayer*>(); QVERIFY(canvas); QVERIFY(layer);
+        const auto area = canvas->imageArea(); const auto at = [&area](double x, double y) { return QPointF(area.x() + x * area.width() / 400, area.y() + y * area.height() / 200).toPoint(); };
+        QTest::mousePress(layer, Qt::LeftButton, Qt::NoModifier, at(100, 50)); QTest::mouseMove(layer, at(200, 100)); QTest::mouseMove(layer, at(300, 150)); QTest::mouseRelease(layer, Qt::LeftButton, Qt::NoModifier, at(300, 150));
+        QCOMPARE(editor.marks().size(), 1); QCOMPARE(editor.marks().first().kind, Mark::Rectangle); QVERIFY(save->isEnabled());
+        QTest::qWait(50); QVERIFY(editor.grab().save(previewPath("screenshot-markup.png")));
+        // Undone, then drawn again.
+        editor.findChild<QPushButton*>("markup-undo")->click(); QVERIFY(editor.marks().isEmpty()); QVERIFY(!save->isEnabled());
+        QTest::mousePress(layer, Qt::LeftButton, Qt::NoModifier, at(100, 50)); QTest::mouseMove(layer, at(300, 150)); QTest::mouseRelease(layer, Qt::LeftButton, Qt::NoModifier, at(300, 150));
+        QSignalSpy saved(&editor, &ScreenshotEditor::saved); save->click(); QTRY_COMPARE_WITH_TIMEOUT(saved.size(), 1, 5000);
+        const QImage copy(saved.first().first().toString()); QCOMPARE(saved.first().first().toString(), directory.filePath("vue (annoté).png")); QCOMPARE(copy.size(), QSize(400, 200));
+        const auto edge = copy.pixelColor(100, 100); QVERIFY2(edge.red() > 200 && edge.green() < 90, qPrintable(edge.name())); QCOMPARE(copy.pixelColor(200, 100), QColor(Qt::white)); QCOMPARE(copy.pixelColor(20, 20), QColor(Qt::white));
+        QCOMPARE(digest(original), before); QVERIFY(editor.marks().isEmpty());
+    }
+    void widgetsAboveTheVideoFollowTheLayoutWhenItMoves() {
+        // The editor's buttons over the image, raised above the video, while a banner appears above the canvas.
+        QWidget top; top.setProperty("directVideo", true); top.resize(640, 420); auto* column = new QVBoxLayout(&top);
+        auto* banner = new QLabel(QStringLiteral("Clip exporté")); banner->setFixedHeight(80); banner->hide(); column->addWidget(banner);
+        auto* canvas = new QWidget; column->addWidget(canvas, 1); auto* overlay = new QPushButton(QStringLiteral("Résultat"), canvas); overlay->move(20, 20);
+        top.show(); QVERIFY(QTest::qWaitForWindowExposed(&top)); VideoSurface::raiseAbove(overlay); QCoreApplication::processEvents();
+        // Where Windows really shows it, against where the layout puts it, both in pixels of the window.
+        const auto placed = [overlay, &top] { RECT rect{}; GetWindowRect(HWND(overlay->winId()), &rect); POINT origin{0, 0}; ClientToScreen(HWND(top.winId()), &origin); return QPoint(rect.left - origin.x, rect.top - origin.y); };
+        const auto expected = [overlay] { return (QPointF(overlay->mapTo(overlay->window(), QPoint())) * overlay->devicePixelRatioF()).toPoint(); };
+        QCOMPARE(placed(), expected());
+        banner->show(); QTest::qWait(50);
+        QCOMPARE(placed(), expected());
+        banner->hide(); top.resize(720, 380); QTest::qWait(50);
+        QCOMPARE(placed(), expected());
+        // Placing its window does not move the widget in its own parent.
+        QCOMPARE(overlay->pos(), QPoint(20, 20));
+    }
+    void savedClipSoundsAreDistinctAndFollowTheirVolume() {
+        const auto sounds = clipSavedSounds(); QVERIFY(sounds.size() >= 6); QCOMPARE(sounds.first().id, QString("duo"));
+        const auto peak = [](const QByteArray& wave) { int highest = 0; for (int at = 44; at + 1 < wave.size(); at += 2) highest = std::max(highest, std::abs(int(qFromLittleEndian<qint16>(wave.constData() + at)))); return highest; };
+        QSet<QByteArray> different;
+        for (const auto& sound : sounds) {
+            const auto wave = clipSavedSoundWave(sound.id, 50);
+            QVERIFY2(wave.startsWith("RIFF") && wave.mid(8, 8) == "WAVEfmt " && wave.size() > 44 + 2000, qPrintable(sound.id));
+            // Every sound peaks at the level of the earlier one at 50 %, louder above, silent at 0.
+            QVERIFY2(std::abs(peak(wave) - 4202) < 60, qPrintable(sound.id + QString::number(peak(wave))));
+            QVERIFY(peak(clipSavedSoundWave(sound.id, 100)) > 3 * peak(wave)); QCOMPARE(peak(clipSavedSoundWave(sound.id, 0)), 0);
+            different.insert(wave); QVERIFY(!sound.name.isEmpty());
+        }
+        QCOMPARE(different.size(), sounds.size());
+        QCOMPARE(clipSavedSoundWave("inconnu", 50), clipSavedSoundWave("duo", 50));
+    }
+    void settingsKeepTheClipsFolderWithTheCaptureAndLetTheSoundBeChosen() {
+        QTemporaryDir directory; const auto configPath = directory.filePath("config"); QString error;
+        { auto config = AppConfig::defaults(); config.libraryPath = directory.filePath("clips"); QVERIFY(ConfigStore(configPath).save(config, error)); }
+        MainWindow window(configPath); window.setAttribute(Qt::WA_DontShowOnScreen); window.show(); window.setPage(MainWindow::Settings);
+        auto* tabs = window.findChild<QStackedWidget*>(); QVERIFY(tabs);
+        const auto inTab = [&window](const char* name, int tab) { auto* widget = window.findChild<QWidget*>(name); auto* settings = window.findChild<SettingsPage*>(); settings->showTab(tab); QCoreApplication::processEvents(); return widget && widget->isVisible(); };
+        // The folder of the clips is set with the capture; the third tab is the general one.
+        QVERIFY(inTab("libraryPath", 0)); QVERIFY(!inTab("libraryPath", 2)); QCOMPARE(window.findChild<QPushButton*>("settings-tab-2")->text(), QStringLiteral("Général"));
+        // Each choice of a setting reads on its own line, its name in bold.
+        const auto effort = window.findChild<QComboBox*>("effort")->toolTip(); QVERIFY(effort.contains("<b>Rapide</b>")); QVERIFY(effort.contains("<b>Soigné</b>"));
+        QVERIFY(window.findChild<QComboBox*>("rate-control")->toolTip().contains("<b>Qualité constante</b>"));
+        QVERIFY(!window.findChild<QComboBox*>("fps")->toolTip().contains("<b>"));
+        QToolTip::showText(QPoint(200, 200), effort); QWidget* tip = nullptr;
+        QTRY_VERIFY_WITH_TIMEOUT((tip = [] { for (auto* widget : QApplication::topLevelWidgets()) if (widget->inherits("QTipLabel") && widget->isVisible()) return widget; return static_cast<QWidget*>(nullptr); }()), 2000);
+        QVERIFY(tip->width() < 600); QVERIFY(tip->grab().save(previewPath("tooltip-effort.png"))); QToolTip::hideText();
+        // Quick Sync is not offered any more.
+        auto* encoder = window.findChild<QComboBox*>("encoder"); QVERIFY(encoder); QCOMPARE(encoder->findData("qsv"), -1); QVERIFY(encoder->findData("nvenc") >= 0); QVERIFY(encoder->findData("amf") >= 0);
+        QVERIFY(inTab("clip-saved-sound-choice", 2));
+        auto* sound = window.findChild<QComboBox*>("clip-saved-sound-choice"); auto* volume = window.findChild<QSlider*>("clip-saved-sound-volume"); auto* toggle = window.findChild<QCheckBox*>("clip-saved-sound");
+        QVERIFY(window.findChild<QPushButton*>("clip-saved-sound-preview")); QCOMPARE(sound->count(), int(clipSavedSounds().size())); QCOMPARE(volume->value(), 50);
+        sound->setCurrentIndex(sound->findData("chime")); volume->setValue(30); QVERIFY(!window.findChild<QWidget*>("savebar")->isHidden());
+        // Without a sound, its choice and its level rest.
+        toggle->setChecked(false); QVERIFY(!sound->isEnabled()); toggle->setChecked(true); QVERIFY(sound->isEnabled());
+        QTest::qWait(50); QVERIFY(window.grab().save(previewPath("settings-general.png")));
+        window.findChild<QPushButton*>("settings-save")->click();
+        AppConfig stored; QVERIFY(ConfigStore(configPath).load(stored, error)); QCOMPARE(stored.clipSavedSoundId, QString("chime")); QCOMPARE(stored.clipSavedSoundVolume, 30);
+        window.close();
     }
 };
 QTEST_MAIN(EditorTests)

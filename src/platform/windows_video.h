@@ -1,5 +1,6 @@
 #pragma once
 #include "core/config.h"
+#include <QImage>
 #include <memory>
 #include <atomic>
 struct AVFrame;
@@ -15,4 +16,7 @@ private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 };
+// One image of a screen or a window, pixel for pixel as it is on screen: nothing is scaled or
+// converted, unlike the replay. Taken beside a replay that runs, without disturbing it.
+QImage captureScreenImage(const QString& targetId, bool cursor, QString& error);
 }

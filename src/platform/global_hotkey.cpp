@@ -4,11 +4,11 @@
 #include <windows.h>
 #endif
 namespace clipsapp {
-GlobalHotkey::GlobalHotkey(QObject* parent) : QObject(parent) { QCoreApplication::instance()->installNativeEventFilter(this); }
+GlobalHotkey::GlobalHotkey(QObject* parent, int id) : QObject(parent), m_id(id) { QCoreApplication::instance()->installNativeEventFilter(this); }
 GlobalHotkey::~GlobalHotkey() { unbind(); QCoreApplication::instance()->removeNativeEventFilter(this); }
 void GlobalHotkey::unbind() {
 #ifdef Q_OS_WIN
-    if (m_bound) UnregisterHotKey(nullptr, 0x4c43);
+    if (m_bound) UnregisterHotKey(nullptr, m_id);
 #endif
     m_bound = false;
 }
@@ -32,7 +32,7 @@ bool GlobalHotkey::bind(const QKeySequence& sequence, QString& error) {
     if (modifiers & Qt::AltModifier) flags |= MOD_ALT;
     if (modifiers & Qt::ShiftModifier) flags |= MOD_SHIFT;
     if (modifiers & Qt::MetaModifier) flags |= MOD_WIN;
-    if (!RegisterHotKey(nullptr, 0x4c43, flags, nativeKey)) { error = QStringLiteral("Le raccourci est déjà utilisé ou réservé par Windows. Choisissez-en un autre."); return false; }
+    if (!RegisterHotKey(nullptr, m_id, flags, nativeKey)) { error = QStringLiteral("Le raccourci est déjà utilisé ou réservé par Windows. Choisissez-en un autre."); return false; }
     m_bound = true; return true;
 #else
     error = QStringLiteral("Les raccourcis globaux Linux seront intégrés avec le portail KDE."); return false;
@@ -41,7 +41,7 @@ bool GlobalHotkey::bind(const QKeySequence& sequence, QString& error) {
 bool GlobalHotkey::nativeEventFilter(const QByteArray&, void* message, qintptr* result) {
 #ifdef Q_OS_WIN
     const auto* event = static_cast<MSG*>(message);
-    if (m_bound && event->message == WM_HOTKEY && event->wParam == 0x4c43) { if (result) *result = 0; emit activated(); return true; }
+    if (m_bound && event->message == WM_HOTKEY && event->wParam == WPARAM(m_id)) { if (result) *result = 0; emit activated(); return true; }
 #else
     Q_UNUSED(message); Q_UNUSED(result);
 #endif

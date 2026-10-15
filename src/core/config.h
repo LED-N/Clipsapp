@@ -56,6 +56,9 @@ struct AppConfig {
     QString activeProfileId;
     QList<RecordingProfile> profiles;
     bool clipSavedSound = true, clipSavedNotification = true;
+    // Which sound a saved clip makes, and how loud, from 0 to 100: 50 is the level of the earlier versions.
+    QString clipSavedSoundId = "duo";
+    int clipSavedSoundVolume = 50;
     qint64 discordLimitBytes = 20000000;
     QString discordCodec = "h264";
     bool discordAutoResize = true;
@@ -68,12 +71,30 @@ struct AppConfig {
     bool closeToTray = true, trayNoticeShown = false;
     // A shortcut to the application is kept in the Start menu.
     bool startMenuShortcut = false;
+    // Started with the Windows session, the application waits behind its icon.
+    bool launchAtLogin = false;
+    // When the replay starts by itself: never ("off"), as soon as the application runs ("launch"),
+    // or while one of the games listed runs ("games"), until a little after the last one closes.
+    QString autoReplay = "off";
+    QStringList replayGames;
     // The usual level of each track, applied when a clip is played, edited or shared, never when
     // it is recorded. Then what the application learns it from: the levels of the last exports,
     // and the proposal the user refused.
     TrackMix defaultMix;
     QList<TrackMix> mixHistory;
     TrackMix mixDeclined;
+    // The same for the clips of a game, by its name: its levels over the usual ones, the exports of
+    // its clips they are learnt from, and the proposal refused for it. A clip without a game teaches
+    // the usual levels; a clip of a game teaches those of its game only.
+    QMap<QString, TrackMix> gameMixes;
+    QMap<QString, QList<TrackMix>> gameMixHistory;
+    QMap<QString, TrackMix> gameMixDeclined;
+    // Screenshots: the shortcut that takes one of the captured screen, whether the replay runs or
+    // not, and the sound it makes.
+    QString screenshotHotkey = "Ctrl+Alt+F11";
+    bool screenshotSound = true;
+    QString screenshotSoundId = "shutter";
+    int screenshotSoundVolume = 50;
     static AppConfig defaults();
     RecordingProfile* activeProfile();
     const RecordingProfile* activeProfile() const;

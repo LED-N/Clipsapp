@@ -4,7 +4,9 @@
 #include <d3d11.h>
 #include <roapi.h>
 #include <winstring.h>
+#include <QImage>
 #include <algorithm>
+#include <cstring>
 #include <stdexcept>
 #include <thread>
 extern "C" {
@@ -186,5 +188,52 @@ bool WindowsVideo::read(AVFrame* output) {
     }
     if (!output->buf[0] && capture.last->buf[0]) { if (av_frame_ref(output, capture.last) < 0) throw std::bad_alloc(); }
     return output->buf[0] != nullptr;
+}
+QImage captureScreenImage(const QString& targetId, bool cursor, QString& error) {
+    const HRESULT initialized = RoInitialize(RO_INIT_MULTITHREADED); const bool apartment = SUCCEEDED(initialized);
+    QImage image;
+    try {
+        if (FAILED(initialized) && initialized != RPC_E_CHANGED_MODE) check(initialized, "Initialisation de la capture");
+        const QString resolved = windowsVideoOptions(targetId);
+        HWND window = nullptr; HMONITOR monitor = nullptr;
+        if (resolved.startsWith("hwnd=")) window = reinterpret_cast<HWND>(quintptr(resolved.mid(5).toULongLong())); else monitor = reinterpret_cast<HMONITOR>(quintptr(resolved.mid(9).toULongLong()));
+        Com<ID3D11Device> device; Com<ID3D11DeviceContext> context;
+        check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION, device.out(), nullptr, context.out()), "Périphérique graphique D3D11");
+        Com<IDXGIDevice> dxgi; check(device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(dxgi.out())), "Périphérique DXGI");
+        Com<IInspectable> winrtDevice; check(CreateDirect3D11DeviceFromDXGIDevice(dxgi.p, winrtDevice.out()), "Périphérique de capture");
+        Com<wgc::ItemFactory> itemFactory; factory(L"Windows.Graphics.Capture.GraphicsCaptureItem", wgc::itemFactoryId, reinterpret_cast<void**>(itemFactory.out()));
+        Com<wgc::Item> item;
+        if (window) check(itemFactory->ForWindow(window, wgc::itemId, reinterpret_cast<void**>(item.out())), "Capture de la fenêtre");
+        else check(itemFactory->ForMonitor(monitor, wgc::itemId, reinterpret_cast<void**>(item.out())), "Capture du moniteur");
+        wgc::Size size{}; check(item->GetSize(&size), "Dimensions de la source");
+        Com<wgc::PoolFactory> poolFactory; factory(L"Windows.Graphics.Capture.Direct3D11CaptureFramePool", wgc::poolFactoryId, reinterpret_cast<void**>(poolFactory.out()));
+        Com<wgc::Pool> pool; check(poolFactory->Create(winrtDevice.p, 87 /* B8G8R8A8_UNORM */, 1, size, pool.out()), "Buffer de capture GPU");
+        Com<wgc::Session> session; check(pool->CreateSession(item.p, session.out()), "Session de capture");
+        Com<wgc::Cursor> pointer; check(session->QueryInterface(wgc::cursorId, reinterpret_cast<void**>(pointer.out())), "Réglage du curseur"); check(pointer->Set(cursor), "Capture du curseur");
+        const std::atomic_bool never{false}; disableBorder(session.p, never);
+        check(session->Start(), "Démarrage de Windows Graphics Capture");
+        // The first image comes within a frame or two of the screen.
+        Com<wgc::Frame> frame; const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (!frame.p && std::chrono::steady_clock::now() < deadline) { check(pool->Next(frame.out()), "Lecture de la capture"); if (!frame.p) std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
+        if (!frame.p) throw std::runtime_error("Windows n'a fourni aucune image de l'écran.");
+        Com<IInspectable> surface; Com<wgc::DxgiAccess> access; Com<ID3D11Texture2D> texture; wgc::Size content{};
+        check(frame->ContentSize(&content), "Dimensions de l'image"); check(frame->Surface(surface.out()), "Surface capturée");
+        check(surface->QueryInterface(wgc::dxgiAccessId, reinterpret_cast<void**>(access.out())), "Accès à la texture");
+        check(access->GetInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(texture.out())), "Texture de capture");
+        D3D11_TEXTURE2D_DESC description; texture->GetDesc(&description);
+        const UINT width = UINT(std::clamp<int>(content.width, 1, int(description.Width))), height = UINT(std::clamp<int>(content.height, 1, int(description.Height)));
+        // Read back by the processor: a copy the card hands over, then mapped row by row.
+        D3D11_TEXTURE2D_DESC staging{}; staging.Width = width; staging.Height = height; staging.MipLevels = 1; staging.ArraySize = 1; staging.Format = description.Format;
+        staging.SampleDesc.Count = 1; staging.Usage = D3D11_USAGE_STAGING; staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        Com<ID3D11Texture2D> readable; check(device->CreateTexture2D(&staging, nullptr, readable.out()), "Copie de l'image");
+        const D3D11_BOX box{0, 0, 0, width, height, 1}; context->CopySubresourceRegion(readable.p, 0, 0, 0, 0, texture.p, 0, &box);
+        D3D11_MAPPED_SUBRESOURCE mapped{}; check(context->Map(readable.p, 0, D3D11_MAP_READ, 0, &mapped), "Lecture de l'image");
+        image = QImage(int(width), int(height), QImage::Format_RGB32);
+        for (UINT row = 0; row < height; ++row) std::memcpy(image.scanLine(int(row)), static_cast<const uchar*>(mapped.pData) + size_t(row) * mapped.RowPitch, size_t(width) * 4);
+        context->Unmap(readable.p, 0);
+        close(frame.p); close(session.p); close(pool.p);
+    } catch (const std::exception& failure) { error = QString::fromUtf8(failure.what()); image = {}; }
+    if (apartment) RoUninitialize();
+    return image;
 }
 }

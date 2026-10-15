@@ -40,6 +40,8 @@ class LibraryRowDelegate final : public ClipRowDelegate {
 public:
     using ClipRowDelegate::ClipRowDelegate;
     void setShowGame(bool show) { m_showGame = show; }
+    // Pictures rather than clips: their size instead of the length and the tracks, and a copy of the image instead of a Discord copy.
+    void setImages(bool images) { m_images = images; }
     void paint(QPainter* painter, const QStyleOptionViewItem& option, const QModelIndex& index) const override;
     QSize sizeHint(const QStyleOptionViewItem& option, const QModelIndex& index) const override;
     Hit hitTest(const QRect& row, const QModelIndex& index, const QPoint& position) const override;
@@ -47,7 +49,7 @@ public:
 private:
     struct Layout { QRectF row, check, thumb, play, text, size, time, edit, share, more; bool compact = false; };
     Layout layout(const QRect& item) const;
-    bool m_showGame = true;
+    bool m_showGame = true, m_images = false;
 };
 class ShareRowDelegate final : public ClipRowDelegate {
 public:

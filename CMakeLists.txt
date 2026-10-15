@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(Clipsapp VERSION 0.8.2 LANGUAGES CXX)
+project(Clipsapp VERSION 0.8.3 LANGUAGES CXX)
 
 # The GitHub repository whose releases the published application follows for its updates,
 # written "owner/name". Left empty, the application never looks for updates.
@@ -20,15 +20,21 @@ add_library(clipsapp_core STATIC
     src/core/game_identity.cpp src/core/game_identity.h
     src/core/update.cpp src/core/update.h
     src/core/track_mix.cpp src/core/track_mix.h
+    src/core/auto_replay.cpp src/core/auto_replay.h
+    src/core/app_log.cpp src/core/app_log.h
     src/platform/game_detection.cpp src/platform/game_detection.h
     src/platform/start_menu.cpp src/platform/start_menu.h
+    src/platform/login_start.cpp src/platform/login_start.h
+    src/platform/folder_watch.cpp src/platform/folder_watch.h
+    src/platform/crash_report.cpp src/platform/crash_report.h
+    src/platform/uninstall.cpp src/platform/uninstall.h
     src/media/clip_edit.cpp src/media/clip_edit.h
 )
 target_include_directories(clipsapp_core PUBLIC src)
 target_link_libraries(clipsapp_core PUBLIC Qt6::Core)
 if(WIN32)
     target_compile_definitions(clipsapp_core PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-    target_link_libraries(clipsapp_core PRIVATE user32 version)
+    target_link_libraries(clipsapp_core PRIVATE user32 version dbghelp)
 endif()
 
 if(WIN32)
@@ -60,6 +66,7 @@ add_library(clipsapp_editor STATIC
     src/media/gpu_video.cpp src/media/gpu_video.h
     src/media/audio_output.h ${CLIPSAPP_AUDIO_OUTPUT}
     src/platform/fine_wait.h
+    src/platform/system_info.cpp src/platform/system_info.h
 )
 target_link_libraries(clipsapp_editor PUBLIC clipsapp_core Qt6::Gui PRIVATE clipsapp_media)
 if(WIN32)
@@ -82,6 +89,10 @@ set(CLIPSAPP_APP_SOURCES
     src/ui/discord_batch.cpp src/ui/discord_batch.h
     src/ui/discord_dialog.cpp src/ui/discord_dialog.h
     src/ui/clip_editor.cpp src/ui/clip_editor.h
+    src/ui/screenshot_editor.cpp src/ui/screenshot_editor.h
+    src/ui/image_viewer.cpp src/ui/image_viewer.h
+    src/ui/whats_new.cpp src/ui/whats_new.h
+    src/ui/image_markup.cpp src/ui/image_markup.h
     src/ui/clip_viewer.cpp src/ui/clip_viewer.h
     src/ui/layout_keys.cpp src/ui/layout_keys.h
     src/ui/update_service.cpp src/ui/update_service.h
@@ -95,6 +106,8 @@ set(CLIPSAPP_APP_SOURCES
 )
 qt_add_executable(clipsapp src/main.cpp ${CLIPSAPP_APP_SOURCES})
 target_link_libraries(clipsapp PRIVATE clipsapp_core clipsapp_editor Qt6::Widgets Qt6::Concurrent Qt6::Network)
+# The journal of the versions travels inside the program: shown after an update, and from the version in the side bar.
+qt_add_resources(clipsapp "changelog" PREFIX "/" FILES CHANGELOG.md)
 if(WIN32)
     target_link_libraries(clipsapp PRIVATE winmm)
     # The icon of the executable: what Explorer, the Start menu and the taskbar show for it.
@@ -141,10 +154,11 @@ if(BUILD_TESTING)
     if(WIN32)
         qt_add_executable(clipsapp_media_tests tests/media_tests.cpp src/capture/replay_engine.cpp src/capture/replay_engine.h src/capture/windows_capture.cpp src/platform/windows_audio.cpp src/platform/windows_video.cpp src/capture/audio_stream.cpp)
         target_compile_definitions(clipsapp_media_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-        target_link_libraries(clipsapp_media_tests PRIVATE clipsapp_core clipsapp_media Qt6::Test Qt6::Concurrent ole32 uuid user32 mmdevapi)
+        target_link_libraries(clipsapp_media_tests PRIVATE clipsapp_core clipsapp_media Qt6::Test Qt6::Gui Qt6::Concurrent ole32 uuid user32 mmdevapi)
         add_test(NAME clipsapp_media_tests COMMAND clipsapp_media_tests)
         set_tests_properties(clipsapp_media_tests PROPERTIES TIMEOUT 35)
         qt_add_executable(clipsapp_editor_tests tests/editor_tests.cpp ${CLIPSAPP_APP_SOURCES})
+        qt_add_resources(clipsapp_editor_tests "changelog" PREFIX "/" FILES CHANGELOG.md)
         target_compile_definitions(clipsapp_editor_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN CLIPSAPP_VERSION="${PROJECT_VERSION}")
         target_link_libraries(clipsapp_editor_tests PRIVATE clipsapp_editor clipsapp_media Qt6::Widgets Qt6::Test Qt6::Concurrent Qt6::Network ole32 uuid user32 mmdevapi winmm)
         set_target_properties(clipsapp_editor_tests PROPERTIES WIN32_EXECUTABLE FALSE)

@@ -16,6 +16,7 @@ const IconData icons[] = {
     {"clips", "M2.5 3.5h11v9h-11z M2.5 6.5h11 M6 3.5l-1.5 3 M9.5 3.5L8 6.5 M13 3.5l-1.5 3"},
     {"share", "M8 10V2.5 M5 5.5l3-3 3 3 M3 9.5v4h10v-4"},
     {"settings", "M2.5 4.5h6 M11.5 4.5h2 M2.5 11.5h2 M7.5 11.5h6 M10 3v3 M6 10v3"},
+    {"toggle", "M5.5 4.5h5a3.5 3.5 0 0 1 0 7h-5a3.5 3.5 0 0 1 0-7z M10.5 6a2 2 0 1 0 0 4a2 2 0 1 0 0-4z"},
     {"save", "M8 2.5v7 M5 7l3 3 3-3 M2.5 10.5v3h11v-3"},
     {"stop", "M4.5 4.5h7v7h-7z"},
     {"rec", "M8 4.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7z"},
@@ -38,11 +39,17 @@ const IconData icons[] = {
     {"err", "M8 14a6 6 0 1 0 0-12 6 6 0 0 0 0 12z M6 6l4 4 M10 6l-4 4"},
     {"warn", "M8 2.2l6.3 11.3H1.7z M8 6.5v3 M8 11.6h.01"},
     {"lock", "M4 7.5h8v6H4z M5.5 7.5V5a2.5 2.5 0 0 1 5 0v2.5"},
-    {"star", "M8 2.2l1.8 3.7 4 .6-2.9 2.8.7 4L8 11.4l-3.6 1.9.7-4L2.2 6.5l4-.6z"},
+    {"spark", "M8 1.5l1.6 4.9 4.9 1.6-4.9 1.6L8 14.5 6.4 9.6 1.5 8l4.9-1.6z"},
+    {"star","M8 2.2l1.8 3.7 4 .6-2.9 2.8.7 4L8 11.4l-3.6 1.9.7-4L2.2 6.5l4-.6z"},
     {"tag", "M2.5 2.5h5l6 6-5 5-6-6z M5.5 5.5h.01"},
     {"trash", "M2.5 4.5h11 M6 4.5V2.5h4v2 M4 4.5l.7 9h6.6l.7-9"},
     {"folder", "M2 4.5v8h12v-6.5H8L6.5 4.5z"},
     {"crop", "M4.5 1.5v10h10 M1.5 4.5h10v10"},
+    {"image", "M2.5 3h11v10h-11z M2.5 11l3.5-3.5 3 3 2-2 2.5 2.5 M10.5 5.5a1 1 0 1 0 0 2a1 1 0 1 0 0-2z"},
+    {"arrow", "M3.5 12.5l8.5-8.5 M6.5 3.5h5.5v5.5"},
+    {"rect", "M2.5 4h11v8h-11z"},
+    {"circle", "M8 2.5a5.5 5.5 0 1 0 0 11a5.5 5.5 0 1 0 0-11z"},
+    {"camera", "M2 5h3l1.5-2h3L11 5h3v8H2z M8 6.5a2.5 2.5 0 1 0 0 5a2.5 2.5 0 1 0 0-5z"},
     {"mic", "M8 2a2 2 0 0 0-2 2v3.5a2 2 0 0 0 4 0V4a2 2 0 0 0-2-2z M4 7.5a4 4 0 0 0 8 0 M8 11.5v2.5"},
     {"app", "M2 3.5h12v9H2z M2 6h12"},
     {"apps", "M2.5 2.5h4.5v4.5H2.5z M9 2.5h4.5v4.5H9z M2.5 9h4.5v4.5H2.5z M9 9h4.5v4.5H9z"},
@@ -208,7 +215,7 @@ void applyTheme(QApplication& application) {
         QWidget { color: #E9EDF3; }
         QWidget:disabled { color: #566070; }
         QMainWindow, QDialog { background: #0C0E12; }
-        QToolTip { background: #1A1F27; color: #E9EDF3; border: 1px solid #323A47; padding: 5px 8px; }
+        QToolTip { background: #1A1F27; color: #E9EDF3; border: 1px solid #323A47; padding: 7px 10px; }
         QLabel { background: transparent; }
         QLabel[role="t2"] { color: #A1AABA; }
         QLabel[role="t3"] { color: #8A94A5; }

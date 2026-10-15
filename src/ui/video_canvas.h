@@ -31,6 +31,9 @@ public:
     void setDirect(bool direct);
     // The image being shown, for what measures how often it changes.
     qint64 frameKey() const { return m_image.cacheKey(); }
+    // Where the picture is drawn in this view, and which part of it: the crop when its result is shown.
+    QRectF imageArea() const { return displayRect(); }
+    QRect shownPart() const { return m_preview && !m_tool && m_crop.isValid() ? m_crop : QRect(QPoint(), m_original); }
 signals:
     void cropSelected(QRect crop);
     void sizeWanted(QSize size);
@@ -43,6 +46,8 @@ protected:
     void mouseReleaseEvent(QMouseEvent*) override;
 private:
     enum class Drag { None, Draw, Move, TopLeft, TopRight, BottomLeft, BottomRight };
+    // A frame to crop: drawn here, or shown by the graphics card, which leaves this view no image of it.
+    bool hasPicture() const { return !m_original.isEmpty() && (m_direct || !m_image.isNull()); }
     QRectF displayRect() const;
     QRectF frameRect(const QRect& crop) const;
     QPoint sourcePoint(QPointF point) const;

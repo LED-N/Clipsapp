@@ -205,11 +205,16 @@ void Tile::paintEvent(QPaintEvent*) {
     if (hasFocus() && property("keyboardFocus").toBool()) { painter.setPen(QPen(tk::info, 2)); painter.setBrush(Qt::NoBrush); painter.drawRoundedRect(QRectF(rect()).adjusted(1, 1, -1, -1), 7, 7); }
     if (m_centered) {
         const QColor color = on ? tk::accent : over ? tk::text : tk::text2; const auto font = uiFont(11, QFont::DemiBold); const int textHeight = QFontMetrics(font).height();
-        const double total = m_shapeSize.height() + 5 + textHeight, top = (height() - total) / 2.0;
-        const QRectF shape((width() - m_shapeSize.width()) / 2.0, top, m_shapeSize.width(), m_shapeSize.height());
-        QPen pen(color, 1.5); if (m_shape == Dashed) pen.setStyle(Qt::DashLine);
-        painter.setPen(pen); painter.setBrush(m_shape == Filled ? QColor(color.red(), color.green(), color.blue(), 46) : QColor(Qt::transparent)); painter.drawRoundedRect(shape, 2, 2);
-        painter.setFont(font); painter.setPen(color); painter.drawText(QRectF(0, top + m_shapeSize.height() + 5, width(), textHeight), Qt::AlignCenter, m_title);
+        // Above the name, a shape or, for a tool, its icon.
+        const QSizeF mark = m_icon.isEmpty() ? m_shapeSize : QSizeF(18, 18);
+        const double total = mark.height() + 5 + textHeight, top = (height() - total) / 2.0;
+        const QRectF shape((width() - mark.width()) / 2.0, top, mark.width(), mark.height());
+        if (!m_icon.isEmpty()) paintIcon(painter, m_icon, shape, color);
+        else {
+            QPen pen(color, 1.5); if (m_shape == Dashed) pen.setStyle(Qt::DashLine);
+            painter.setPen(pen); painter.setBrush(m_shape == Filled ? QColor(color.red(), color.green(), color.blue(), 46) : QColor(Qt::transparent)); painter.drawRoundedRect(shape, 2, 2);
+        }
+        painter.setFont(font); painter.setPen(color); painter.drawText(QRectF(0, top + mark.height() + 5, width(), textHeight), Qt::AlignCenter, m_title);
         return;
     }
     const double left = m_picture ? 10 : 12; double y = 10;

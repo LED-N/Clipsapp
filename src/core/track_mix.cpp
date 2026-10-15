@@ -17,6 +17,12 @@ void rememberExport(QList<TrackMix>& history, const TrackMix& levels) {
     if (levels.isEmpty()) return;
     history.append(levels); while (history.size() > remembered) history.removeFirst();
 }
+TrackMix mixForGame(const TrackMix& general, const QMap<QString, TrackMix>& games, const QString& game) {
+    TrackMix mix = general; if (game.isEmpty()) return mix;
+    const auto own = games.constFind(game); if (own == games.constEnd()) return mix;
+    for (auto track = own->cbegin(); track != own->cend(); ++track) mix.insert(track.key(), track.value());
+    return mix;
+}
 std::optional<TrackMix> suggestedMix(const QList<TrackMix>& history, const TrackMix& current, const TrackMix& declined) {
     if (history.size() < agreeing) return {};
     const auto recent = history.mid(history.size() - agreeing);

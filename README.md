@@ -21,9 +21,11 @@ Clipsapp pose ensuite quatre questions (dossier des clips, écran ou fenêtre, s
 ## Ce que fait Clipsapp
 
 - **Replay** : de 15 secondes à 10 minutes gardées en mémoire, enregistrées d'un raccourci, **Ctrl + Alt + F10** par défaut. Jusqu'en 4K, à 30, 60, 120 ou 144 images par seconde.
+- **Screenshots** : un raccourci, **Ctrl + Alt + F11** par défaut, prend l'écran en qualité native. Les images sont rangées par jeu, à part des clips, se regardent en plein écran et se recadrent ou s'annotent dans Clipsapp.
 - **Qualité au choix** : quatre préréglages, de « Légère » à « Maximale », ou des réglages avancés (débit cible ou qualité constante jusqu'au quasi sans perte), chacun expliqué par une infobulle.
-- **Son en pistes séparées** : micro, jeu et Discord, pour régler ou couper chacun après coup. Chaque piste a son volume habituel, que Clipsapp apprend de vos exports.
+- **Son en pistes séparées** : micro, jeu et Discord, pour régler ou couper chacun après coup. Chaque piste a son volume habituel, que Clipsapp apprend de vos exports, et chaque jeu peut avoir ses propres volumes.
 - **Discret** : fermer la fenêtre laisse Clipsapp et son replay dans la zone de notification, près de l'horloge.
+- **Démarrage automatique**, si vous le souhaitez : Clipsapp peut se lancer avec Windows, et son replay démarrer avec lui ou seulement quand un de vos jeux est ouvert.
 - **Bibliothèque** : clips rangés par jeu et par jour, favoris, recherche, renommage.
 - **Lecture en plein écran**, pour regarder un clip ou le montrer sans l'envoyer.
 - **Éditeur** : découpe, recadrage, volume de chaque piste, export. L'original est conservé.
@@ -32,13 +34,13 @@ Clipsapp pose ensuite quatre questions (dossier des clips, écran ou fenêtre, s
 ## À savoir
 
 - **Système** : Windows 11, 64 bits. Clipsapp est développé et essayé avec une carte graphique NVIDIA ; il n'a pas encore été essayé avec une carte AMD.
-- **Rien d'autre à installer** : tout ce dont Clipsapp a besoin est dans son dossier. Pour le désinstaller, retirez-le du menu Démarrer dans **Réglages → Fichiers et alertes** si vous l'y aviez ajouté, quittez-le, puis supprimez ce dossier.
-- **Quitter** : la croix de la fenêtre range Clipsapp dans la zone de notification. Pour le fermer vraiment, clic droit sur son icône, puis **Quitter**. Ce comportement se désactive dans **Réglages → Fichiers et alertes**.
-- **Mises à jour** : Clipsapp signale une nouvelle version à son lancement et l'installe en deux clics, sans toucher aux clips ni aux réglages. Cela se désactive dans **Réglages → Fichiers et alertes**.
+- **Rien d'autre à installer** : tout ce dont Clipsapp a besoin est dans son dossier. Pour le désinstaller, lancez `Desinstaller Clipsapp.bat`, dans ce dossier : il ferme Clipsapp, retire son raccourci du menu Démarrer et son lancement avec Windows, puis supprime le dossier. Il propose de garder vos réglages ; vos clips ne sont pas touchés.
+- **Quitter** : la croix de la fenêtre range Clipsapp dans la zone de notification. Pour le fermer vraiment, clic droit sur son icône, puis **Quitter**. Ce comportement se désactive dans **Réglages → Général**.
+- **Mises à jour** : Clipsapp signale une nouvelle version à son lancement et l'installe en deux clics, sans toucher aux clips ni aux réglages, puis présente ce qu'apporte la nouvelle version. Un clic sur le numéro de version, en bas à gauche, rouvre ces notes, version par version. La recherche se désactive dans **Réglages → Général**.
 - **Vie privée** : vos clips et vos réglages ne quittent pas votre PC. La seule connexion de Clipsapp est cette recherche de mises à jour auprès de GitHub, qui ne contient que son numéro de version.
 - **Application non signée** : c'est la raison de l'avertissement de Windows au premier lancement.
 
-Un problème ou une idée ? Écrivez dans l'onglet [Issues](https://github.com/LED-N/Clipsapp/issues), avec la version affichée en bas à gauche de Clipsapp.
+Un problème ou une idée ? Écrivez dans l'onglet [Issues](https://github.com/LED-N/Clipsapp/issues), avec la version affichée en bas à gauche de Clipsapp. **Réglages → Général → Copier le diagnostic** met dans le presse-papiers ce qui aide à comprendre le problème, sans le nom de votre compte.
 
 ## Compiler depuis les sources
 

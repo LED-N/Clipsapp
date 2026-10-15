@@ -2,6 +2,7 @@
 #include "media/clip_player.h"
 #include <QTimer>
 #include <QWidget>
+#include <functional>
 #include <optional>
 class QLabel;
 class QSlider;
@@ -28,6 +29,8 @@ public:
     void setVolume(int percent);
     // The usual level of each track, for the clips shown as they are.
     void setDefaultMix(const TrackMix& mix) { m_mix = mix; }
+    // The usual levels of each clip, those of its game: asked as each clip of the playlist opens.
+    void setMixLookup(std::function<TrackMix(const QString&)> lookup) { m_mixFor = std::move(lookup); }
 signals:
     void volumeChanged(int percent);
     void viewed(const QString& path);
@@ -59,7 +62,7 @@ private:
     QWidget* m_owner; QStringList m_playlist; int m_index = -1;
     std::optional<ClipEdit> m_edit; ClipEdit m_current; qint64 m_start = -1; bool m_ready = false, m_open = false, m_awake = false;
     QImage m_image; qint64 m_imageKey = 0; QString m_message;
-    QTimer m_hide; int m_volume = 100, m_wheel = 0; bool m_muted = false; TrackMix m_mix;
+    QTimer m_hide; int m_volume = 100, m_wheel = 0; bool m_muted = false; TrackMix m_mix; std::function<TrackMix(const QString&)> m_mixFor;
     // Where the graphics card shows the clip itself, under the two bars; nothing where it cannot.
     VideoSurface* m_surface = nullptr; bool m_direct = false; QSize m_frame;
     Button* m_stepBack; Button* m_stepForward; Button* m_mute; QSlider* m_volumeSlider;

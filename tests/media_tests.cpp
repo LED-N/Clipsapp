@@ -2,6 +2,8 @@
 #include <QTemporaryDir>
 #include <QtConcurrent/QtConcurrentRun>
 #include "capture/replay_engine.h"
+#include "platform/windows_audio.h"
+#include <algorithm>
 #include <stdexcept>
 #include <thread>
 extern "C" {
@@ -165,6 +167,16 @@ private slots:
         QVERIFY(!broken.save(error));
         QCOMPARE(backend->stats().bytes, qint64(0)); QVERIFY(backend->stats().encoder.isEmpty());
         const auto rejected = backend->save(directory.filePath("after-error.mp4")); QVERIFY(!rejected.error.isEmpty()); QVERIFY(!QFile::exists(rejected.path));
+    }
+    void anAbsentMicrophoneSilencesItsTrackWithoutStoppingAnything() {
+        // A device that does not exist is what an unplugged one looks like: nothing is opened, nothing is heard.
+        AudioSource source; source.id = "absent"; source.name = "Micro USB"; source.kind = SourceKind::Microphone; source.targetId = "{0.0.1.00000000}.{00000000-0000-0000-0000-00000000c11a}";
+        WindowsAudio audio(source); audio.start(windowsClock100ns());
+        QVERIFY(audio.error().isEmpty()); QTRY_VERIFY_WITH_TIMEOUT(!audio.unavailable().isEmpty(), 2000); QCOMPARE(audio.source().name, QString("Micro USB"));
+        std::vector<float> left(1024, 0.0f), right(1024, 0.0f); audio.mix(0, 1024, left.data(), right.data());
+        QVERIFY(std::all_of(left.begin(), left.end(), [](float sample) { return sample == 0.0f; }));
+        // Tried again every second, it stays missing without ever becoming an error.
+        QTest::qWait(1300); QVERIFY(audio.error().isEmpty()); QVERIFY(!audio.unavailable().isEmpty());
     }
 };
 QTEST_GUILESS_MAIN(MediaTests)

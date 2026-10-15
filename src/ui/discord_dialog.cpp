@@ -191,7 +191,7 @@ void DiscordDialog::updateEstimates() {
         auto* figures = static_cast<ElideLabel*>(m_estimateTexts[index]); auto* tag = m_estimateTags[index]; const qint64 bytes = QFileInfo(m_paths[index]).size();
         if (index >= m_infos.size()) { figures->setFullText(formatBytes(bytes)); tag->set(QStringLiteral("Analyse…"), Tag::Neutral); continue; }
         if (!m_infos[index].error.isEmpty()) { figures->setFullText(firstLine(m_infos[index].error)); tag->set(QStringLiteral("Illisible"), Tag::Err); tag->setIconName({}); continue; }
-        const auto& info = m_infos[index].info; auto edit = m_edited && m_editedInfo ? *m_edited : defaultEdit(info, m_defaults.mix); edit.separateTracks = false;
+        const auto& info = m_infos[index].info; auto edit = m_edited && m_editedInfo ? *m_edited : defaultEdit(info, m_defaults.mixOf(info.path)); edit.separateTracks = false;
         // An edited clip is exported in high quality first; only that step decides whether a plain copy will do.
         const auto plan = planSizedExport(info, edit, m_edited ? options.maxBytes + 1 : bytes, options); tag->setIconName({});
         if (plan.copyVideo) { figures->setFullText(formatBytes(bytes)); tag->set(QStringLiteral("Copié tel quel"), Tag::Ok); continue; }

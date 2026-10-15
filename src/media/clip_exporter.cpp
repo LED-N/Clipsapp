@@ -38,7 +38,9 @@ SizedExportPlan planSizedExport(const ClipInfo& info, const ClipEdit& edit, qint
 ClipExporter::ClipExporter(QObject* parent, QString executable) : QObject(parent), m_executable(std::move(executable)) {
     if (m_executable.isEmpty()) {
 #ifdef Q_OS_WIN
-        m_executable = QDir(QCoreApplication::applicationDirPath()).filePath("ffmpeg.exe");
+        // With the libraries of a published copy, or beside the executable built from the sources.
+        const QDir folder(QCoreApplication::applicationDirPath());
+        m_executable = folder.exists(QStringLiteral("runtime/ffmpeg.exe")) ? folder.filePath(QStringLiteral("runtime/ffmpeg.exe")) : folder.filePath(QStringLiteral("ffmpeg.exe"));
 #else
         m_executable = QStandardPaths::findExecutable("ffmpeg");
 #endif

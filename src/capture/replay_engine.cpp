@@ -15,12 +15,14 @@ ReplayEngine::ReplayEngine(QObject* parent, CaptureBackendFactory factory) : QOb
     });
     connect(&m_capture, &QFutureWatcher<QString>::finished, this, [this] {
         const auto error = m_capture.result(); m_timer.stop();
+        if (error.isEmpty()) qInfo("Replay : arrêté."); else qWarning("Replay : arrêté sur une erreur : %s", qUtf8Printable(error));
         m_backend.reset();
         setState(error.isEmpty() ? State::Idle : State::Error);
         if (!error.isEmpty()) emit failed(error);
     });
     connect(&m_export, &QFutureWatcher<ExportResult>::finished, this, [this] {
         const auto result = m_export.result(); emit changed();
+        if (result.error.isEmpty()) qInfo("Replay : clip de %.1f s sauvegardé dans %s.", result.seconds, qUtf8Printable(result.path)); else qWarning("Replay : sauvegarde impossible : %s", qUtf8Printable(result.error));
         if (result.error.isEmpty()) emit saved(result.path, result.seconds); else emit failed(result.error);
     });
 }
@@ -46,11 +48,14 @@ bool ReplayEngine::start(const RecordingProfile& profile, const QString& directo
     if (m_detectGame) m_gameName = detectCapturedGame(m_videoTarget);
     m_backend = m_factory(profile);
     if (!m_backend) { error = QStringLiteral("Moteur de capture indisponible sur ce système."); return false; }
+    const auto& video = profile.video; QStringList sources; for (const auto& source : profile.sources) if (source.enabled) sources.append(QStringLiteral("%1 (%2)").arg(source.name, sourceKindKey(source.kind)));
+    qInfo("Replay : démarrage du profil « %s » sur %s, %dx%d à %d FPS, %s, effort %s, %s %d, encodeur %s, %d s gardées, plafond %d Mio. Sources : %s.", qUtf8Printable(profile.name), qUtf8Printable(video.targetId.section('|', 0, 0)), video.width, video.height, video.fps,
+        qUtf8Printable(video.codec), qUtf8Printable(video.effort), qUtf8Printable(video.rateControl), video.rateControl == QLatin1String("quality") ? video.quality : video.bitrateMbps, qUtf8Printable(video.encoder), profile.replay.durationSeconds, profile.replay.memoryLimitMiB, qUtf8Printable(sources.join(QStringLiteral(", "))));
     setState(State::Starting); m_timer.start();
     const auto backend = m_backend;
     m_capture.setFuture(QtConcurrent::run([this, backend] {
         return backend->run(m_stop, [this](QString encoder) {
-            Q_UNUSED(encoder);
+            qInfo("Replay : actif, encodeur %s.", qUtf8Printable(encoder));
             QMetaObject::invokeMethod(this, [this] { if (m_state == State::Starting) setState(State::Running); }, Qt::QueuedConnection);
         });
     }));

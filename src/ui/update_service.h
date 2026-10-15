@@ -19,6 +19,7 @@ public:
     ~UpdateService() override;
     // The repository whose releases are followed, "owner/name". Without one the service stays silent.
     void setRepository(const QString& repository);
+    QString repository() const { return m_repository; }
     // For tests: a release description and an archive read from local files.
     void setFeed(const QUrl& feed);
     bool enabled() const { return m_feed.isValid(); }

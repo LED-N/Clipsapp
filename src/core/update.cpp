@@ -2,6 +2,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QDirIterator>
+#include <algorithm>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -12,16 +13,28 @@
 
 namespace clipsapp {
 namespace {
-const char* const manifestName = "manifest.txt";
+// Where a release lists its files: with its libraries since 0.8.3, beside the executable before.
+const char* const manifestName = "runtime/manifest.txt";
+const char* const earlierManifestName = "manifest.txt";
 // A manifest lists the files of a release, one relative path per line. Anything else is not followed.
 QSet<QString> readManifest(const QString& directory) {
-    QSet<QString> files; QFile file(QDir(directory).filePath(manifestName)); if (!file.open(QIODevice::ReadOnly)) return files;
+    QSet<QString> files; QFile file(QDir(directory).filePath(manifestName));
+    if (!file.exists()) file.setFileName(QDir(directory).filePath(earlierManifestName));
+    if (!file.open(QIODevice::ReadOnly)) return files;
     for (const auto& raw : file.readAll().split('\n')) {
         const auto path = QDir::fromNativeSeparators(QString::fromUtf8(raw).trimmed());
         if (path.isEmpty() || QDir::isAbsolutePath(path) || path.contains(QLatin1Char(':')) || path.split('/').contains(QStringLiteral("..")) || path.startsWith(QStringLiteral(".update"))) continue;
         files.insert(path);
     }
     return files;
+}
+// The folders that held these files, deepest first, removed when nothing is left in them. A folder
+// with anything else in it, the user's own files included, stays.
+void removeEmptiedFolders(const QString& installDirectory, const QSet<QString>& files) {
+    QSet<QString> folders;
+    for (auto relative : files) while (relative.contains('/')) { relative = relative.section('/', 0, -2); folders.insert(relative); }
+    auto ordered = folders.values(); std::sort(ordered.begin(), ordered.end(), [](const QString& left, const QString& right) { return left.count('/') > right.count('/'); });
+    const QDir install(installDirectory); for (const auto& folder : ordered) install.rmdir(folder);
 }
 struct Move { QString from, to; };
 bool move(const QString& from, const QString& to, QList<Move>& done) {
@@ -83,6 +96,8 @@ QString stagedRoot(const QString& unpackedDirectory, const QString& executableNa
 bool applyUpdate(const QString& stagedDirectory, const QString& installDirectory, const QString& executableName, QString& error) {
     const QDir staged(stagedDirectory), install(installDirectory);
     if (stagedDirectory.isEmpty() || !staged.exists(executableName)) { error = QStringLiteral("L'archive ne contient pas %1.").arg(executableName); return false; }
+    // What the version in place shipped, read before anything moves: the new list may take its place.
+    const auto previous = readManifest(install.absolutePath());
     QStringList incoming; QDirIterator walk(staged.absolutePath(), QDir::Files | QDir::Hidden | QDir::System, QDirIterator::Subdirectories);
     while (walk.hasNext()) { const auto relative = staged.relativeFilePath(walk.next()); if (!relative.startsWith(QStringLiteral(".update"))) incoming.append(relative); }
     const QDir aside(QDir(updateWorkDirectory(installDirectory)).filePath(QStringLiteral("old-%1").arg(QDateTime::currentMSecsSinceEpoch())));
@@ -98,15 +113,20 @@ bool applyUpdate(const QString& stagedDirectory, const QString& installDirectory
     }
     // Files the previous version shipped and this one no longer does are set aside too. Anything else in the folder is not ours to touch.
     QSet<QString> kept; for (const auto& relative : incoming) kept.insert(relative.toLower());
-    // The previous manifest was just set aside if the new version brought its own; otherwise it is still in place.
-    auto previous = readManifest(aside.absolutePath()); if (previous.isEmpty()) previous = readManifest(install.absolutePath());
     for (const auto& relative : previous) {
         if (kept.contains(relative.toLower()) || !QFileInfo(install.filePath(relative)).isFile()) continue;
         if (!move(install.filePath(relative), aside.filePath(relative), done)) return undo(relative);
     }
+    // A version that arranges its files otherwise leaves no empty folder behind.
+    removeEmptiedFolders(install.absolutePath(), previous);
     return true;
 }
 void clearUpdateLeftovers(const QString& installDirectory) {
-    QDir work(updateWorkDirectory(installDirectory)); if (work.exists()) work.removeRecursively();
+    QDir work(updateWorkDirectory(installDirectory)); if (!work.exists()) return;
+    // An update made by an earlier version set its files aside without their folders: those it emptied go now.
+    QSet<QString> previous; for (const auto& aside : work.entryList({QStringLiteral("old-*")}, QDir::Dirs)) previous.unite(readManifest(work.filePath(aside)));
+    work.removeRecursively();
+    removeEmptiedFolders(installDirectory, previous);
 }
+bool publishedCopy(const QString& installDirectory) { return QFile::exists(QDir(installDirectory).filePath(manifestName)) || QFile::exists(QDir(installDirectory).filePath(earlierManifestName)); }
 }

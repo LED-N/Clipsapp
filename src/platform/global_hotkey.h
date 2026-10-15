@@ -7,7 +7,8 @@ namespace clipsapp {
 class GlobalHotkey final : public QObject, public QAbstractNativeEventFilter {
     Q_OBJECT
 public:
-    explicit GlobalHotkey(QObject* parent = nullptr);
+    // Each shortcut of the application has its own identifier for Windows.
+    explicit GlobalHotkey(QObject* parent = nullptr, int id = 0x4c43);
     ~GlobalHotkey() override;
     bool bind(const QKeySequence& sequence, QString& error);
     void unbind();
@@ -15,6 +16,6 @@ public:
 signals:
     void activated();
 private:
-    bool m_bound = false;
+    bool m_bound = false; int m_id;
 };
 }

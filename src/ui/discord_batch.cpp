@@ -27,8 +27,8 @@ DiscordBatch::DiscordBatch(QObject* parent) : QObject(parent), m_exporter(this) 
     connect(&m_prepare, &QFutureWatcher<DiscordPrepared>::finished, this, [this] {
         if (m_cancelled) { finishBatch(); return; }
         const auto prepared = m_prepare.result(); if (!prepared.error.isEmpty()) { failCurrent(prepared.error); return; }
-        if (m_preparingHighQuality) compress(prepared.info, defaultEdit(prepared.info, m_options.mix));
-        else { m_info = prepared.info; m_edit = defaultEdit(m_info, m_options.mix); compress(m_info, m_edit); }
+        if (m_preparingHighQuality) compress(prepared.info, defaultEdit(prepared.info, m_options.mixOf(prepared.info.path)));
+        else { m_info = prepared.info; m_edit = defaultEdit(m_info, m_options.mixOf(m_info.path)); compress(m_info, m_edit); }
     });
 }
 DiscordBatch::~DiscordBatch() { disconnect(&m_exporter, nullptr, this, nullptr); disconnect(&m_prepare, nullptr, this, nullptr); }

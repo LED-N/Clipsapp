@@ -37,6 +37,9 @@ bool canUpdateInPlace(const QString& installDirectory);
 // The folder of an unpacked archive that holds the application: the folder itself, or its only sub-folder.
 QString stagedRoot(const QString& unpackedDirectory, const QString& executableName);
 bool applyUpdate(const QString& stagedDirectory, const QString& installDirectory, const QString& executableName, QString& error);
-// Removes what an update set aside. Files still held by the version that is closing stay until the next call.
+// Removes what an update set aside, and the folders it left empty. Files still held by the version
+// that is closing stay until the next call.
 void clearUpdateLeftovers(const QString& installDirectory);
+// A copy made by the release scripts carries the list of its files: it alone follows the releases.
+bool publishedCopy(const QString& installDirectory);
 }

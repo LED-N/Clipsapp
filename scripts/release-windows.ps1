@@ -30,7 +30,7 @@ if ($Publish) {
 
 & (Join-Path $PSScriptRoot 'build-windows.ps1') -Test -Package
 $taskDistribution = Join-Path $taskRoot 'dist\Clipsapp'
-if (-not (Test-Path -LiteralPath (Join-Path $taskDistribution 'manifest.txt'))) { throw 'Le paquet est incomplet.' }
+if (-not (Test-Path -LiteralPath (Join-Path $taskDistribution 'runtime\manifest.txt'))) { throw 'Le paquet est incomplet.' }
 
 # One archive whose name never changes, holding one folder named Clipsapp: the folder a user keeps
 # carries no version number, since the application updates itself in place. Windows' own tar writes the zip.

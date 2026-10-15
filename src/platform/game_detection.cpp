@@ -3,8 +3,11 @@
 #include <QHash>
 #include <QDir>
 #include <QFileInfo>
+#include <QSet>
+#include <functional>
 #ifdef Q_OS_WIN
 #include <windows.h>
+#include <tlhelp32.h>
 #include <vector>
 namespace {
 QString productName(const QString& path) {
@@ -47,5 +50,44 @@ QString detectCapturedGame(const QString& videoTarget) {
 #else
     Q_UNUSED(videoTarget); return {};
 #endif
+}
+namespace {
+QString processIdentity(const QString& path) { return QDir::cleanPath(QDir::fromNativeSeparators(path)).toCaseFolded(); }
+// Every process whose executable is one of these, with its identifier and its full path.
+void eachProcess(const QStringList& executables, const std::function<void(qint64, const QString&)>& found) {
+    QSet<QString> wanted, names;
+    for (const auto& path : executables) { wanted.insert(processIdentity(path)); names.insert(QFileInfo(processIdentity(path)).fileName()); }
+    if (wanted.isEmpty()) return;
+#ifdef Q_OS_WIN
+    // The list of processes only gives their file names; the full path is asked for those that match.
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32W entry{}; entry.dwSize = sizeof(entry);
+    if (Process32FirstW(snapshot, &entry)) do {
+        if (!names.contains(QString::fromWCharArray(entry.szExeFile).toCaseFolded())) continue;
+        const auto process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID); if (!process) continue;
+        wchar_t buffer[32768]; DWORD length = 32768; const bool ok = QueryFullProcessImageNameW(process, 0, buffer, &length); CloseHandle(process);
+        if (!ok) continue;
+        const auto path = processIdentity(QString::fromWCharArray(buffer, int(length)));
+        if (wanted.contains(path)) found(qint64(entry.th32ProcessID), path);
+    } while (Process32NextW(snapshot, &entry));
+    CloseHandle(snapshot);
+#else
+    for (const auto& process : QDir(QStringLiteral("/proc")).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+        bool number = false; const auto pid = process.fileName().toLongLong(&number); if (!number) continue;
+        const auto path = processIdentity(QFileInfo(process.filePath() + QStringLiteral("/exe")).symLinkTarget());
+        if (wanted.contains(path)) found(pid, path);
+    }
+#endif
+}
+}
+QStringList runningPrograms(const QStringList& executables) {
+    QHash<QString, QString> written; for (const auto& path : executables) written.insert(processIdentity(path), path);
+    QStringList running;
+    eachProcess(executables, [&](qint64, const QString& path) { const auto original = written.value(path); if (!running.contains(original)) running.append(original); });
+    return running;
+}
+QList<qint64> programProcesses(const QString& executable) {
+    QList<qint64> processes; eachProcess({executable}, [&](qint64 pid, const QString&) { processes.append(pid); }); return processes;
 }
 }

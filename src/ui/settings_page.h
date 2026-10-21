@@ -26,6 +26,8 @@ class SettingsPage final : public QWidget {
 public:
     SettingsPage(AppConfig& config, const QString& settingsPath, QWidget* parent = nullptr);
     void refreshCatalog();
+    // Reads the applications and devices again and shows the sources against them.
+    void refreshSources();
     const SourceCatalog& catalog() const { return m_catalog; }
     void load();
     void collect();
@@ -52,6 +54,8 @@ signals:
     void saveRequested();
     void revertRequested();
     void stopReplayRequested();
+    // The theme shown changed, saved or not: the window's icon follows it.
+    void themePreviewed();
     void chooseFolderRequested();
     void openSettingsFolderRequested();
     void notice(const QString& title, const QString& text);
@@ -79,10 +83,14 @@ private:
     QComboBox* m_resolution; QComboBox* m_fps; QComboBox* m_codec; QComboBox* m_encoder; QSpinBox* m_bitrate; QCheckBox* m_cursor;
     QComboBox* m_rateControl; QComboBox* m_quality; QComboBox* m_effort; QLabel* m_bitrateLabel; QLabel* m_qualityLabel;
     QSlider* m_durationSlider; QSpinBox* m_duration; QComboBox* m_memory; QWidget* m_estimateCalm; QLabel* m_estimateCalmText; Bar* m_estimateCalmBar;
+    QWidget* m_targetSection; QWidget* m_qualitySection; QWidget* m_addSource; QWidget* m_addLane;
+    QComboBox* m_storage; QWidget* m_diskProposal; QLabel* m_diskProposalTitle; QLabel* m_diskProposalText; QWidget* m_memoryField;
+    QWidget* m_diskBox; QComboBox* m_diskLimit; QLineEdit* m_diskFolder; QLabel* m_diskSpace;
     QWidget* m_estimateWarn; QLabel* m_estimateWarnTitle; QLabel* m_estimateWarnLimit; Bar* m_estimateWarnBar; QLabel* m_estimateWarnText;
     Keycaps* m_hotkeyCaps; QKeySequenceEdit* m_hotkey; Button* m_hotkeyChange; QLabel* m_hotkeyHint;
     Tag* m_captureTag; Tag* m_qualityTag; Tag* m_replayTag;
     QVBoxLayout* m_lanes; QLabel* m_sourceNotes; QLineEdit* m_folder; QCheckBox* m_savedSound; QCheckBox* m_savedNotify; QWidget* m_soundOptions; QComboBox* m_sound; QSlider* m_soundVolume; QLabel* m_soundPercent;
+    class ThemeEditor* m_themeEditor; Keycaps* m_recordCaps; QKeySequenceEdit* m_recordKey; Button* m_recordChange; QLabel* m_recordHint;
     QCheckBox* m_shotSound; QWidget* m_shotSoundOptions; QComboBox* m_shotSoundChoice; QSlider* m_shotVolume; QLabel* m_shotPercent; Keycaps* m_shotCaps; QKeySequenceEdit* m_shotKey; Button* m_shotChange; QLabel* m_shotHint; QVBoxLayout* m_gameMixes; QWidget* m_gameMixHost;
     QWidget* m_updateSection; QCheckBox* m_checkUpdates; QLabel* m_version; QCheckBox* m_closeToTray; QCheckBox* m_startMenu;
     QCheckBox* m_loginStart; QWidget* m_loginHint; QComboBox* m_autoReplay; QLabel* m_autoHint; QWidget* m_gamesHost; QVBoxLayout* m_games; QLabel* m_gamesEmpty;

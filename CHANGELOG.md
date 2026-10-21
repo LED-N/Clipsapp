@@ -1,5 +1,26 @@
 # Journal des versions
 
+## 0.8.4
+
+**Nouveautés**
+
+- **Enregistrement** : enregistrez vos parties en entier, sans limite de durée. Un seul raccourci, **Ctrl + Alt + F9**, le lance et l'arrête, avec ou sans le replay à côté. Réglages → Capture → Enregistrement
+- **Thèmes** : cinq thèmes prêts à l'emploi, dont un violet, ou le vôtre, avec vos couleurs et vos dégradés, à partager avec vos amis par un simple code. Le logo suit le thème. Réglages → Général → Thèmes
+- **Buffer du replay sur disque** : un long replay sans prendre la mémoire du jeu. Clipsapp le propose quand il le faut. Réglages → Capture → Replay
+
+**Améliorations**
+
+- **Sources audio** : prises en compte dès leur premier son, sans vérification en continu.
+- **Barre du replay** : le replay et l'enregistrement ont chacun leur barre, verte et rouge.
+- **Réglages pendant la capture** : thèmes, raccourcis, dossier des clips, sons et volumes se modifient sans arrêter le replay ni l'enregistrement.
+
+**Corrections**
+
+- Une application mise à jour, comme Discord, reste enregistrée et exclue de « Tout, sauf exclusions ».
+- Une application ouverte mais silencieuse n'est plus marquée « indisponible ».
+- La liste des applications audio n'est plus vide quand Clipsapp démarre avant elles.
+- En plein écran, l'image suit la taille de la fenêtre même en pause.
+
 ## 0.8.3
 
 **Nouveautés**

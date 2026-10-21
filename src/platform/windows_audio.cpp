@@ -146,6 +146,36 @@ public:
 private:
     std::atomic<ULONG> refs{1}; QMutex mutex; QList<IAudioSessionControl*> sessions; bool overflow = false;
 };
+// Windows says when a device comes, goes, changes state or becomes the default one: the sources
+// wait for that rather than looking again every second. Owned by its creator, who unregisters it
+// before it goes; its reference count is therefore not what keeps it.
+class DeviceWatch final : public IMMNotificationClient {
+public:
+    explicit DeviceWatch(IMMDeviceEnumerator* enumerator) : m_enumerator(enumerator) {
+        event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!event) throw std::runtime_error("Impossible de suivre les périphériques audio.");
+        const HRESULT result = m_enumerator->RegisterEndpointNotificationCallback(this);
+        if (FAILED(result)) { CloseHandle(event); check(result, "Suivi des périphériques audio"); }
+    }
+    ~DeviceWatch() { m_enumerator->UnregisterEndpointNotificationCallback(this); CloseHandle(event); }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
+        if (!object) return E_POINTER;
+        *object = nullptr;
+        if (iid != __uuidof(IUnknown) && iid != __uuidof(IMMNotificationClient)) return E_NOINTERFACE;
+        *object = static_cast<IMMNotificationClient*>(this); return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR, DWORD) override { SetEvent(event); return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override { SetEvent(event); return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR) override { SetEvent(event); return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow, ERole, LPCWSTR) override { SetEvent(event); return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY) override { return S_OK; }
+    // Set by any of these changes; taken by the wait that sees it.
+    HANDLE event = nullptr;
+private:
+    IMMDeviceEnumerator* m_enumerator;
+};
 struct EndpointSessions {
     Com<IAudioSessionManager2> manager; SessionNotification* notification = nullptr;
     ~EndpointSessions() { if (notification) manager->UnregisterSessionNotification(notification); }
@@ -154,8 +184,12 @@ class AutomaticSessions {
 public:
     AutomaticSessions() {
         check(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(enumerator.out())), "Suivi des applications audio");
-        notification.p = new SessionNotification; refreshDevices();
+        notification.p = new SessionNotification; refreshDevices(); devices = std::make_unique<DeviceWatch>(enumerator.p);
     }
+    ~AutomaticSessions() { devices.reset(); }
+    // A new application plays sound; an output came, went or changed.
+    HANDLE sessionEvent() const { return notification->event; }
+    HANDLE deviceEvent() const { return devices->event; }
     void refreshDevices() {
         Com<IMMDeviceCollection> devices;
         check(enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, devices.out()), "Sorties audio des applications");
@@ -198,10 +232,15 @@ public:
         QList<quint32> ids; for (auto pid : sessions) ids.append(pid);
         return includedAudioRoots(processes, ids, exclusions, GetCurrentProcessId());
     }
-    void wait() { WaitForSingleObject(notification->event, 1000); }
 private:
     Com<IMMDeviceEnumerator> enumerator; Com<SessionNotification> notification;
     std::map<QString, std::unique_ptr<EndpointSessions>> endpoints;
+    std::unique_ptr<DeviceWatch> devices;
+};
+struct Event {
+    HANDLE handle;
+    explicit Event(bool manual) : handle(CreateEventW(nullptr, manual, FALSE, nullptr)) { if (!handle) throw std::runtime_error("Événement audio impossible à créer."); }
+    ~Event() { CloseHandle(handle); }
 };
 }
 qint64 windowsClock100ns() {
@@ -213,7 +252,7 @@ std::vector<unsigned long> applicationProcesses(const QString& executable) {
     if (snapshot == INVALID_HANDLE_VALUE) return {};
     PROCESSENTRY32W entry{}; entry.dwSize = sizeof(entry);
     QHash<DWORD, DWORD> parents;
-    QSet<DWORD> candidates; const auto filename = QFileInfo(QString(executable).replace('\\', '/')).fileName();
+    QSet<DWORD> candidates; const auto filename = QFileInfo(QString(executable).replace('\\', '/')).fileName(), identity = applicationIdentity(executable);
     if (Process32FirstW(snapshot, &entry)) do {
         parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
         if (QString::fromWCharArray(entry.szExeFile).compare(filename, Qt::CaseInsensitive) == 0) candidates.insert(entry.th32ProcessID);
@@ -221,7 +260,7 @@ std::vector<unsigned long> applicationProcesses(const QString& executable) {
     CloseHandle(snapshot);
     QList<DWORD> matching;
     for (auto it = parents.cbegin(); it != parents.cend(); ++it)
-        if (candidates.contains(it.key()) && it.key() != GetCurrentProcessId() && processPath(it.key()).compare(QDir::toNativeSeparators(executable), Qt::CaseInsensitive) == 0) matching.append(it.key());
+        if (candidates.contains(it.key()) && it.key() != GetCurrentProcessId() && applicationIdentity(processPath(it.key())) == identity) matching.append(it.key());
     std::vector<unsigned long> roots;
     for (DWORD pid : matching) {
         DWORD ancestor = parents.value(pid); bool child = false;
@@ -260,6 +299,8 @@ QString windowsVideoOptions(const QString& targetId) {
 struct WindowsAudio::Impl {
     AudioSource source;
     std::atomic<bool> stop{false};
+    // Set with stop: wakes the threads that wait for a device or an application.
+    Event stopped{true};
     std::vector<std::thread> threads;
     QMutex mutex;
     std::deque<AudioChunk> queue;
@@ -313,15 +354,17 @@ struct WindowsAudio::Impl {
         }
         client->Stop();
     }
-    // A microphone or an output. While its device is missing, unplugged or refused, the source is
-    // tried again every second and its track stays silent: the replay goes on, in step, without it.
-    // A source that follows the default device of the system also follows it when it changes.
+    // A microphone or an output. While its device is missing, unplugged or refused, its track stays
+    // silent and the replay goes on, in step, without it; the source is tried again when Windows says
+    // a device came or changed. A source that follows the default device of the system also follows
+    // it when it changes. Nothing is looked at while all is well.
     void runDevice(qint64 epoch) {
         bool counted = false; const auto count = [&] { if (!counted) { counted = true; ++initialized; } };
         try {
             Apartment apartment;
             Com<IMMDeviceEnumerator> enumerator;
             check(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(enumerator.out())), "Liste des périphériques audio");
+            DeviceWatch devices(enumerator.p);
             const bool followsDefault = source.targetId == "@default"; const EDataFlow flow = source.kind == SourceKind::Microphone ? eCapture : eRender;
             const auto defaultDevice = [&] { Com<IMMDevice> device; return SUCCEEDED(enumerator->GetDefaultAudioEndpoint(flow, eConsole, device.out())) ? deviceId(device.p) : QString(); };
             QString problem;
@@ -333,11 +376,10 @@ struct WindowsAudio::Impl {
                     else check(enumerator->GetDevice(reinterpret_cast<LPCWSTR>(source.targetId.utf16()), device.out()), "Périphérique audio introuvable");
                     const auto id = deviceId(device.p);
                     Com<IAudioClient> client; check(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(client.out())), "Ouverture du périphérique audio");
-                    auto nextCheck = std::chrono::steady_clock::now() + std::chrono::seconds(1);
                     pump(client.p, false, epoch, [&] {
                         if (stop) return false;
-                        if (!followsDefault || std::chrono::steady_clock::now() < nextCheck) return true;
-                        nextCheck = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+                        // The default device is asked for only when Windows says something changed.
+                        if (!followsDefault || WaitForSingleObject(devices.event, 0) != WAIT_OBJECT_0) return true;
                         switched = defaultDevice() != id; return !switched;
                     }, [&] {
                         { QMutexLocker lock(&mutex); if (!unavailable.isEmpty()) { unavailable.clear(); qInfo("Audio : « %s » est de nouveau disponible.", label().constData()); } }
@@ -351,8 +393,10 @@ struct WindowsAudio::Impl {
                     problem = detail; { QMutexLocker lock(&mutex); unavailable = detail; }
                 }
                 count();
-                if (switched) continue;
-                for (int step = 0; step < 20 && !stop; ++step) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                if (switched || stop) continue;
+                // Missing or refused: back when a device comes or changes. One taken by another program
+                // says nothing when it is freed, hence a new try every 10 s all the same.
+                const HANDLE waits[]{stopped.handle, devices.event}; WaitForMultipleObjects(2, waits, FALSE, 10000);
             }
         } catch (const std::exception& error) { if (!stop) { QMutexLocker lock(&mutex); failure = source.name + ": " + QString::fromUtf8(error.what()); } }
         count();
@@ -377,13 +421,13 @@ struct WindowsAudio::Impl {
         bool ready = false;
         try {
             Apartment apartment; AutomaticSessions sessions;
+            // Set by a worker that ends: the monitor looks at once whether to try its process again.
+            Event ended(false);
             std::vector<std::unique_ptr<Worker>> workers;
             // A process whose sound could not be followed waits a little before the next try.
             QHash<DWORD, std::chrono::steady_clock::time_point> retry;
-            auto nextDevices = std::chrono::steady_clock::now() + std::chrono::seconds(5);
             while (!stop) {
                 const auto now = std::chrono::steady_clock::now();
-                if (now >= nextDevices) { sessions.refreshDevices(); nextDevices = now + std::chrono::seconds(5); }
                 QList<quint32> roots;
                 if (source.kind == SourceKind::Application) { for (auto pid : applicationProcesses(source.targetId)) roots.append(pid); }
                 else roots = sessions.roots(source.excludedApplications);
@@ -400,11 +444,21 @@ struct WindowsAudio::Impl {
                     if (retry.contains(pid) && now < retry.value(pid)) continue;
                     auto worker = std::make_unique<Worker>(); worker->pid = pid;
                     worker->process = OpenProcess(SYNCHRONIZE, FALSE, pid); if (!worker->process) continue;
-                    auto* state = worker.get(); worker->thread = std::thread([this, state, epoch] { runApplication(state->pid, epoch, state->stop, state->process); state->done = true; });
+                    auto* state = worker.get(); const HANDLE wake = ended.handle;
+                    worker->thread = std::thread([this, state, epoch, wake] { runApplication(state->pid, epoch, state->stop, state->process); state->done = true; SetEvent(wake); });
                     workers.push_back(std::move(worker));
                 }
                 if (!ready) { ready = true; ++initialized; }
-                sessions.wait();
+                // Nothing is looked at again until something happens: an application starts playing
+                // sound, a followed process ends, a worker stops, an output comes or goes, or a process
+                // that failed may be tried again. Every 30 s all the same, should Windows have said nothing.
+                std::vector<HANDLE> waits{stopped.handle, sessions.deviceEvent(), sessions.sessionEvent(), ended.handle};
+                for (const auto& worker : workers) waits.push_back(worker->process);
+                auto timeout = std::chrono::milliseconds(30000);
+                for (auto it = retry.cbegin(); it != retry.cend(); ++it)
+                    timeout = std::min(timeout, std::max(std::chrono::milliseconds(0), std::chrono::duration_cast<std::chrono::milliseconds>(it.value() - now) + std::chrono::milliseconds(10)));
+                const DWORD woken = WaitForMultipleObjects(DWORD(waits.size()), waits.data(), FALSE, DWORD(timeout.count()));
+                if (woken == WAIT_OBJECT_0 + 1) sessions.refreshDevices();
             }
         } catch (const std::exception& error) { if (!stop) { QMutexLocker lock(&mutex); failure = source.name + ": " + QString::fromUtf8(error.what()); } }
         if (!ready) ++initialized;
@@ -415,7 +469,7 @@ struct WindowsAudio::Impl {
     }
 };
 WindowsAudio::WindowsAudio(const AudioSource& source) : m_impl(std::make_unique<Impl>()) { m_impl->source = source; }
-WindowsAudio::~WindowsAudio() { m_impl->stop = true; for (auto& thread : m_impl->threads) if (thread.joinable()) thread.join(); }
+WindowsAudio::~WindowsAudio() { m_impl->stop = true; SetEvent(m_impl->stopped.handle); for (auto& thread : m_impl->threads) if (thread.joinable()) thread.join(); }
 void WindowsAudio::start(qint64 epoch) {
     if (m_impl->source.kind == SourceKind::ApplicationMix || m_impl->source.kind == SourceKind::Application) m_impl->threads.emplace_back([this, epoch] { m_impl->monitor(epoch); });
     else m_impl->threads.emplace_back([this, epoch] { m_impl->runDevice(epoch); });

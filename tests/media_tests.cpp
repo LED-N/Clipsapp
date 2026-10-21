@@ -104,6 +104,93 @@ private slots:
         const auto requested = pending(); QVERIFY2(requested.error.isEmpty(), qPrintable(requested.error));
         QVERIFY(inspect(requested.path).error.isEmpty());
     }
+    void aReplayKeptOnDiskSavesTheSameClipAndLeavesNoFileBehind() {
+        QTemporaryDir directory; QVERIFY(directory.isValid()); const auto folder = directory.filePath(QStringLiteral("Buffer du replay"));
+        // A file left by a replay stopped by a power cut goes at the next start.
+        QVERIFY(QDir().mkpath(folder)); { QFile left(QDir(folder).filePath("clipsapp-replay-1-1.tmp")); QVERIFY(left.open(QIODevice::WriteOnly)); left.write("old"); }
+        const auto files = [&] { return QDir(folder).entryList({QStringLiteral("clipsapp-replay-*.tmp")}, QDir::Files); };
+        auto profile = AppConfig::defaults().profiles.first(); profile.video.width = 320; profile.video.height = 192; profile.video.fps = 30; profile.video.bitrateMbps = 5; profile.replay.durationSeconds = 2;
+        profile.replay.storage = "disk"; profile.replay.diskFolder = folder; profile.replay.diskLimitMiB = 1024;
+        Run capture(profile);
+        QTRY_VERIFY_WITH_TIMEOUT(capture.backend->stats().videoFrames >= 120 || capture.future.isFinished(), 10000);
+        QVERIFY2(!capture.future.isFinished(), qPrintable(capture.future.isFinished() ? capture.future.result() : QString()));
+        QCOMPARE(files().size(), 1); QVERIFY(!files().contains("clipsapp-replay-1-1.tmp")); QVERIFY(capture.backend->stats().bytes > 0);
+        const auto saved = capture.backend->save(directory.filePath("disk.mp4")); QVERIFY2(saved.error.isEmpty(), qPrintable(saved.error));
+        const auto inspected = inspect(saved.path); QVERIFY2(inspected.error.isEmpty(), qPrintable(inspected.error));
+        QVERIFY(inspected.videoFrames >= 50); QVERIFY(inspected.duration >= 2.0 && inspected.duration <= 4.2); QVERIFY(inspected.audioFrames[1] > 48000);
+        // A clip asked for just before the stop is still written from the disk; then nothing is left.
+        auto pending = capture.backend->prepareSave(directory.filePath("before-stop.mp4"));
+        capture.stop = true; capture.future.waitForFinished(); QVERIFY2(capture.future.result().isEmpty(), qPrintable(capture.future.result()));
+        const auto requested = pending(); QVERIFY2(requested.error.isEmpty(), qPrintable(requested.error)); QVERIFY(inspect(requested.path).error.isEmpty());
+        pending = {}; QVERIFY(files().isEmpty());
+    }
+    void aRecordingOutlastsTheReplayStaysReadableWhileWrittenAndEndsComplete() {
+        QTemporaryDir directory; QVERIFY(directory.isValid());
+        auto profile = AppConfig::defaults().profiles.first(); profile.video.width = 320; profile.video.height = 192; profile.video.fps = 30; profile.video.bitrateMbps = 5; profile.replay.durationSeconds = 2;
+        for (auto& source : profile.sources) source.enabled = true;
+        Run capture(profile);
+        QTRY_VERIFY_WITH_TIMEOUT(capture.backend->stats().videoFrames >= 90 || capture.future.isFinished(), 10000);
+        QVERIFY2(!capture.future.isFinished(), qPrintable(capture.future.isFinished() ? capture.future.result() : QString()));
+        const auto path = directory.filePath(QStringLiteral("Jeu-Enregistrement été.mp4"));
+        const auto started = capture.backend->startRecording(path); QVERIFY2(started.isEmpty(), qPrintable(started));
+        QVERIFY(!capture.backend->startRecording(directory.filePath("second.mp4")).isEmpty()); QVERIFY(!QFile::exists(directory.filePath("second.mp4")));
+        QTRY_VERIFY_WITH_TIMEOUT(capture.backend->stats().recordingSeconds >= 3.5, 10000); QVERIFY(capture.backend->stats().recording); QVERIFY(capture.backend->stats().recordingBytes > 0);
+        // Being written, it is already readable up to its last fragment: a crash would leave that much.
+        const auto copy = directory.filePath("copy-while-recording.mp4"); QVERIFY(QFile::copy(path, copy));
+        const auto partial = inspect(copy); QVERIFY(partial.videoFrames >= 30);
+        // Clips are still saved meanwhile, from the replay.
+        const auto clip = capture.backend->save(directory.filePath("clip.mp4")); QVERIFY2(clip.error.isEmpty(), qPrintable(clip.error));
+        QTRY_VERIFY_WITH_TIMEOUT(capture.backend->stats().recordingSeconds >= 5, 10000);
+        // A result is given once: it is taken in a loop of its own, not by a check that asks twice.
+        capture.backend->stopRecording(); RecordingResult result;
+        for (int wait = 0; wait < 200 && result.path.isEmpty(); ++wait) { QTest::qWait(50); result = capture.backend->takeRecording(); }
+        QCOMPARE(result.path, path); QVERIFY(result.kept); QVERIFY2(result.error.isEmpty(), qPrintable(result.error)); QVERIFY(!capture.backend->stats().recording);
+        // Longer than the replay keeps, with the picture and the three named tracks.
+        const auto inspected = inspect(path); QVERIFY2(inspected.error.isEmpty(), qPrintable(inspected.error));
+        QCOMPARE(inspected.titles, QStringList({QStringLiteral("Vidéo"), "Micro", "Jeu", "Discord"}));
+        QVERIFY2(inspected.duration >= 5 && inspected.duration <= 9, qPrintable(QString::number(inspected.duration))); QVERIFY(inspected.videoFrames >= 5 * 30 - 5);
+        for (int stream = 1; stream < 4; ++stream) QVERIFY(qAbs(inspected.audioFrames[stream] / 48000.0 - inspected.duration) < 0.5);
+        // A recording stopped by the end of the capture is completed before the capture ends.
+        const auto second = directory.filePath("ended-with-capture.mp4"); QVERIFY(capture.backend->startRecording(second).isEmpty());
+        QTRY_VERIFY_WITH_TIMEOUT(capture.backend->stats().recordingSeconds >= 2, 10000);
+        capture.stop = true; capture.future.waitForFinished(); QVERIFY2(capture.future.result().isEmpty(), qPrintable(capture.future.result()));
+        result = capture.backend->takeRecording(); QCOMPARE(result.path, second); QVERIFY(result.kept); QVERIFY(inspect(second).error.isEmpty());
+    }
+    void aRecordingAloneKeepsNoReplayAndTheReplayComesAndGoesBesideIt() {
+        QTemporaryDir directory; ReplayEngine engine(nullptr, createSyntheticCaptureBackend);
+        auto profile = AppConfig::defaults().profiles.first(); profile.gameName = "ARC Raiders";
+        profile.video.width = 320; profile.video.height = 192; profile.video.fps = 30; profile.video.bitrateMbps = 5; profile.video.targetId = "synthetic";
+        QSignalSpy started(&engine, &ReplayEngine::recordingStarted), recorded(&engine, &ReplayEngine::recorded);
+        // Started for a recording, the capture keeps no replay: nothing to save, nothing in memory.
+        QString error; QVERIFY2(engine.start(profile, directory.path(), error, ReplayEngine::Purpose::Recording), qPrintable(error)); QVERIFY(engine.recording()); QVERIFY(!engine.replaying());
+        QTRY_COMPARE_WITH_TIMEOUT(started.count(), 1, 10000); QCOMPARE(engine.state(), ReplayEngine::State::Running);
+        const auto path = started.first().first().toString(); QVERIFY(path.contains(QStringLiteral("ARC Raiders-Enregistrement-"))); QCOMPARE(QFileInfo(path).dir().dirName(), QStringLiteral("ARC Raiders"));
+        QTRY_VERIFY_WITH_TIMEOUT(engine.stats().recordingSeconds >= 2, 10000);
+        QCOMPARE(engine.stats().seconds, 0.0); QCOMPARE(engine.stats().bytes, qint64(0)); QVERIFY(!engine.save(error));
+        // The replay joins it, then leaves again: the recording goes on, and the replay lets its memory go.
+        engine.startReplay(); QVERIFY(engine.replaying()); QTRY_VERIFY_WITH_TIMEOUT(engine.stats().seconds >= 1, 10000);
+        engine.stopReplay(); QVERIFY(!engine.replaying()); QCOMPARE(engine.state(), ReplayEngine::State::Running); QVERIFY(engine.recording());
+        QTRY_COMPARE_WITH_TIMEOUT(engine.stats().bytes, qint64(0), 2000); QVERIFY(engine.stats().recordingSeconds >= 3);
+        // Without a replay, the capture ends with the recording.
+        engine.stopRecording();
+        QTRY_COMPARE_WITH_TIMEOUT(recorded.count(), 1, 10000); QVERIFY(recorded.first().at(2).toBool());
+        QTRY_COMPARE_WITH_TIMEOUT(engine.state(), ReplayEngine::State::Idle, 10000); QVERIFY(!engine.recording()); QVERIFY(inspect(path).error.isEmpty());
+        // The replay goes on after a recording made beside it; stopping the replay during a recording leaves the recording.
+        QVERIFY2(engine.start(profile, directory.path(), error), qPrintable(error)); QTRY_COMPARE_WITH_TIMEOUT(engine.state(), ReplayEngine::State::Running, 10000);
+        QTRY_VERIFY_WITH_TIMEOUT(engine.stats().seconds > 0, 10000); QTest::qWait(1100);
+        QVERIFY2(engine.startRecording(error), qPrintable(error)); QTRY_VERIFY_WITH_TIMEOUT(engine.stats().recordingSeconds >= 1, 10000);
+        engine.stopRecording(); QTRY_COMPARE_WITH_TIMEOUT(recorded.count(), 2, 10000); QTest::qWait(700); QCOMPARE(engine.state(), ReplayEngine::State::Running); QVERIFY(engine.replaying());
+        QVERIFY2(engine.startRecording(error), qPrintable(error)); engine.stopReplay(); QTest::qWait(700); QCOMPARE(engine.state(), ReplayEngine::State::Running); QVERIFY(engine.recording());
+        engine.stopRecording(); QTRY_COMPARE_WITH_TIMEOUT(recorded.count(), 3, 10000); QTRY_COMPARE_WITH_TIMEOUT(engine.state(), ReplayEngine::State::Idle, 10000);
+    }
+    void aReplayOnDiskSaysWhyItCannotStart() {
+        // A file stands where the folder should be: the replay stops at once and names the folder.
+        QTemporaryDir directory; { QFile occupied(directory.filePath("occupé")); QVERIFY(occupied.open(QIODevice::WriteOnly)); }
+        auto profile = AppConfig::defaults().profiles.first(); profile.video.width = 320; profile.video.height = 192; profile.video.fps = 30; profile.video.bitrateMbps = 5;
+        profile.replay.storage = "disk"; profile.replay.diskFolder = directory.filePath("occupé/Buffer du replay");
+        Run capture(profile); capture.future.waitForFinished();
+        const auto error = capture.future.result(); QVERIFY2(error.contains(QStringLiteral("Buffer du replay")), qPrintable(error)); QCOMPARE(capture.backend->stats().videoFrames, quint64(0));
+    }
     void recordsAt144ImagesPerSecondWithPictureAndSoundInStep() {
         auto profile = AppConfig::defaults().profiles.first(); profile.video.width = 320; profile.video.height = 192; profile.video.fps = 144; profile.video.bitrateMbps = 5; profile.replay.durationSeconds = 2;
         Run capture(profile); QTemporaryDir directory;

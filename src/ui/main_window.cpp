@@ -65,7 +65,7 @@ public:
 protected:
     void paintEvent(QPaintEvent*) override {
         QPainter painter(this); painter.setRenderHint(QPainter::Antialiasing); const bool on = isChecked(), over = underMouse() && isEnabled();
-        if (on || over) { painter.setPen(Qt::NoPen); painter.setBrush(on && !m_sub ? QColor(0x1C, 0x22, 0x2B) : QColor(0x17, 0x1B, 0x22)); painter.drawRoundedRect(rect(), 6, 6); }
+        if (on || over) { painter.setPen(Qt::NoPen); painter.setBrush(on && !m_sub ? tk::mix(tk::rail, tk::hover, 0.6) : tk::mix(tk::rail, tk::hover, 0.3)); painter.drawRoundedRect(rect(), 6, 6); }
         const QColor color = !isEnabled() ? tk::textOff : on || over ? tk::text : tk::text2;
         if (!m_sub) paintIcon(painter, m_icon, QRectF(10, (height() - 16) / 2.0, 16, 16), color);
         const auto noteFont = uiFont(12, QFont::DemiBold); const int noteWidth = m_note.isEmpty() ? 0 : QFontMetrics(noteFont).horizontalAdvance(m_note) + (m_dot ? 12 : 0);
@@ -119,9 +119,11 @@ MainWindow::MainWindow(QString configDirectory, QWidget* parent, ClipTrashOperat
     : QMainWindow(parent), m_store(configDirectory), m_labels(QDir(configDirectory).filePath("library-tags.json")), m_config(AppConfig::defaults()), m_scan(new QFutureWatcher<LibraryScan>(this)), m_trash(new QFutureWatcher<ClipTrashResult>(this)), m_shareScan(new QFutureWatcher<LibraryScan>(this)), m_rename(new QFutureWatcher<ClipRename>(this)), m_trashOperation(std::move(trashOperation)) {
     m_firstLaunch = !QFile::exists(m_store.filePath());
     m_store.load(m_config, m_loadError); m_saved = m_config;
+    // The theme first: what is built next is drawn in its colors.
+    applyColors(themeFromSettings(m_config.theme));
     QString labelsError; m_labels.load(labelsError);
     m_replay = new ReplayEngine(this); m_globalHotkey = new GlobalHotkey(this); m_batch = new DiscordBatch(this); m_cache = new ThumbnailCache(this);
-    m_shotHotkey = new GlobalHotkey(this, 0x4c44); m_shotTask = new QFutureWatcher<QString>(this); m_imageScan = new QFutureWatcher<LibraryScan>(this);
+    m_shotHotkey = new GlobalHotkey(this, 0x4c44); m_recordHotkey = new GlobalHotkey(this, 0x4c45); m_shotTask = new QFutureWatcher<QString>(this); m_imageScan = new QFutureWatcher<LibraryScan>(this);
     // What was read of each clip is kept beside the settings: the next launch shows it without reading the clips again.
     m_configDirectory = configDirectory; m_cache->setStorage(QDir(configDirectory).filePath(QStringLiteral("cache/thumbnails")));
     m_folderWatch = new FolderWatcher(this); m_folderSettle = new QTimer(this); m_folderSettle->setSingleShot(true); m_folderSettle->setInterval(600);
@@ -137,10 +139,11 @@ MainWindow::MainWindow(QString configDirectory, QWidget* parent, ClipTrashOperat
     trayMenu->addSeparator();
     m_traySave = trayMenu->addAction(QStringLiteral("Sauvegarder le clip")); connect(m_traySave, &QAction::triggered, this, [this] { saveReplay(); });
     connect(trayMenu->addAction(QStringLiteral("Prendre un screenshot")), &QAction::triggered, this, [this] { takeScreenshot(); });
+    m_trayRecord = trayMenu->addAction(QString()); connect(m_trayRecord, &QAction::triggered, this, [this] { toggleRecording(); });
     m_trayToggle = trayMenu->addAction(QString()); connect(m_trayToggle, &QAction::triggered, this, [this] { toggleCapture(); });
     trayMenu->addSeparator();
     connect(trayMenu->addAction(QStringLiteral("Quitter Clipsapp")), &QAction::triggered, this, [this] { quit(); });
-    m_tray->setContextMenu(trayMenu);
+    m_tray->setContextMenu(trayMenu); refreshIcons(true);
 
     auto* root = new QWidget; setCentralWidget(root); auto* vertical = new QVBoxLayout(root); vertical->setContentsMargins(0, 0, 0, 0); vertical->setSpacing(0);
     m_strip = new ReplayStrip; vertical->addWidget(m_strip);
@@ -155,6 +158,30 @@ MainWindow::MainWindow(QString configDirectory, QWidget* parent, ClipTrashOperat
     connect(m_strip, &ReplayStrip::startRequested, this, [this] { startCapture(); });
     connect(m_strip, &ReplayStrip::stopRequested, this, [this] { stopCapture(); });
     connect(m_strip, &ReplayStrip::saveRequested, this, [this] { saveReplay(); });
+    connect(m_strip, &ReplayStrip::recordRequested, this, [this] { toggleRecording(); });
+    connect(m_recordHotkey, &GlobalHotkey::activated, this, [this] { toggleRecording(); });
+    // The game usually has the screen: a sound and the notification of the system say what happened.
+    connect(m_replay, &ReplayEngine::recordingStarted, this, [this](const QString& path) {
+        if (m_config.clipSavedSound) playClipSavedSound(QStringLiteral("beep"), m_config.clipSavedSoundVolume);
+        const auto key = QKeySequence::fromString(m_saved.recordHotkey, QKeySequence::PortableText).toString(QKeySequence::NativeText);
+        if (m_config.clipSavedNotification && QSystemTrayIcon::isSystemTrayAvailable() && !isActiveWindow()) { m_tray->show(); m_tray->showMessage(QStringLiteral("Enregistrement démarré"), QStringLiteral("%1 l'arrête.").arg(key), QSystemTrayIcon::NoIcon, 3000); }
+        m_toasts->show(ToastHost::Info, QStringLiteral("Enregistrement démarré"), QStringLiteral("%1 · %2 l'arrête.").arg(QFileInfo(path).completeBaseName(), key));
+    });
+    connect(m_replay, &ReplayEngine::recorded, this, [this](const QString& path, double seconds, bool kept, const QString& error) {
+        if (!kept) { m_toasts->show(ToastHost::Warn, QStringLiteral("Enregistrement non gardé"), error + QStringLiteral(".")); return; }
+        m_fresh.insert(path); refreshLibrary();
+        if (m_config.clipSavedSound) playClipSavedSound(m_config.clipSavedSoundId, m_config.clipSavedSoundVolume);
+        if (m_config.clipSavedNotification && QSystemTrayIcon::isSystemTrayAvailable() && !isActiveWindow()) { m_tray->show(); m_tray->showMessage(QStringLiteral("Enregistrement sauvegardé"), QFileInfo(path).completeBaseName(), QSystemTrayIcon::NoIcon, 4000); }
+        const int total = qRound(seconds); const auto length = total >= 3600 ? QStringLiteral("%1 h %2 min").arg(total / 3600).arg(total / 60 % 60, 2, 10, QLatin1Char('0')) : total >= 60 ? QStringLiteral("%1 min %2 s").arg(total / 60).arg(total % 60, 2, 10, QLatin1Char('0')) : QStringLiteral("%1 s").arg(total);
+        const auto detail = QStringLiteral("%1 · %2 · %3").arg(QFileInfo(path).completeBaseName(), length, formatBytes(QFileInfo(path).size()));
+        const QList<ToastAction> actions{{QStringLiteral("Lire"), [this, path] { viewClips({path}, 0); }}, {QStringLiteral("Afficher dans le dossier"), [this, path] { revealFile(path); }}};
+        if (error.isEmpty()) m_toasts->show(ToastHost::Ok, QStringLiteral("Enregistrement sauvegardé"), detail, actions);
+        else m_toasts->show(ToastHost::Warn, QStringLiteral("Enregistrement arrêté : %1").arg(error.toLower()), detail + QStringLiteral(". Le fichier est gardé jusque-là."), actions);
+    });
+    connect(m_replay, &ReplayEngine::recordingFailed, this, [this](const QString& error) { m_toasts->show(ToastHost::Error, QStringLiteral("L'enregistrement n'a pas démarré"), error); });
+    connect(m_replay, &ReplayEngine::replayFailed, this, [this](const QString& error) {
+        m_toasts->show(ToastHost::Error, QStringLiteral("Le replay n'a pas démarré"), error, {{QStringLiteral("Voir les réglages"), [this] { m_settings->showTab(0); setPage(Settings); }}}); updateCapture();
+    });
     connect(m_strip, &ReplayStrip::fullScreenRequested, this, [this] { captureWholeScreen(); });
     connect(m_strip, &ReplayStrip::settingsRequested, this, [this] { m_settings->showTab(0); setPage(Settings); });
     connect(m_globalHotkey, &GlobalHotkey::activated, this, [this] { saveReplay(); });
@@ -266,7 +293,9 @@ MainWindow::MainWindow(QString configDirectory, QWidget* parent, ClipTrashOperat
     connect(m_settings, &SettingsPage::edited, this, [this] { setWindowModified(dirty()); updateCapture(); });
     connect(m_settings, &SettingsPage::saveRequested, this, [this] { saveConfig(); });
     connect(m_settings, &SettingsPage::revertRequested, this, [this] { revertConfig(); });
-    connect(m_settings, &SettingsPage::stopReplayRequested, this, [this] { stopCapture(); });
+    // The settings wait for the whole capture: the replay and a recording stop together.
+    connect(m_settings, &SettingsPage::themePreviewed, this, [this] { refreshIcons(false); });
+    connect(m_settings, &SettingsPage::stopReplayRequested, this, [this] { m_restartPending = false; m_auto.stoppedByUser(); m_replay->stop(); });
     connect(m_settings, &SettingsPage::copyDiagnosticRequested, this, [this] { copyDiagnostic(); });
     connect(m_settings, &SettingsPage::chooseFolderRequested, this, [this] { chooseLibraryFolder(); });
     connect(m_settings, &SettingsPage::openSettingsFolderRequested, this, [this] { QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(m_store.filePath()).absolutePath())); });
@@ -395,7 +424,7 @@ MainWindow::MainWindow(QString configDirectory, QWidget* parent, ClipTrashOperat
     m_library->setLoading(true); m_shots->setLoading(true); refreshLibrary(); refreshSharing(); refreshScreenshots(); updateCapture();
 }
 QWidget* MainWindow::buildRail() {
-    auto* rail = new QFrame; m_rail = rail; rail->setObjectName("sidebar"); rail->setFixedWidth(208); rail->setStyleSheet(QStringLiteral("QFrame#sidebar { background: #101318; border: none; border-right: 1px solid #242A34; }"));
+    auto* rail = new QFrame; m_rail = rail; rail->setObjectName("sidebar"); rail->setFixedWidth(208);
     auto* layout = new QVBoxLayout(rail); layout->setContentsMargins(10, 12, 11, 14); layout->setSpacing(2);
     // Under each kind, its favourites and its games: shown only while that kind is the one on screen.
     const auto games = [rail, layout](const char* name, QWidget*& host, QVBoxLayout*& list) {
@@ -473,6 +502,7 @@ void MainWindow::updateNav() {
     const auto kindOf = [this](const QWidget* widget) { return widget == m_library || widget == m_editor ? 1 : widget == m_shots || widget == m_shotEditor ? 2 : 0; };
     const bool otherKind = kindOf(m_pages->currentWidget()) != kindOf(target);
     m_pages->setCurrentWidget(target);
+    if (page == Settings && m_settings->currentTab() == 1) m_settings->refreshSources();
     m_toasts->setBottomInset((page == Library && !m_library->selectedPaths().isEmpty()) || (page == Sharing && !m_sharing->selectedPaths().isEmpty()) || (page == Screenshots && !m_shots->selectedPaths().isEmpty()) ? 88 : 20);
     // The games of the rail are those of the kind on screen.
     if (otherKind) rebuildRail();
@@ -492,11 +522,16 @@ bool MainWindow::saveConfig(bool announce) {
     QString error;
     if (!m_store.save(m_config, error)) { m_toasts->show(ToastHost::Error, QStringLiteral("Réglages non enregistrés"), error); return false; }
     const bool changedFolder = m_saved.libraryPath != m_config.libraryPath, changedShortcut = m_saved.startMenuShortcut != m_config.startMenuShortcut, changedLogin = m_saved.launchAtLogin != m_config.launchAtLogin;
-    const bool changedScreenshotKey = m_saved.screenshotHotkey != m_config.screenshotHotkey;
+    const bool changedScreenshotKey = m_saved.screenshotHotkey != m_config.screenshotHotkey, changedRecordKey = m_saved.recordHotkey != m_config.recordHotkey, changedTheme = m_saved.theme != m_config.theme;
+    const bool changedReplayKey = m_saved.activeProfile() && m_saved.activeProfile()->replay.hotkey != profile().replay.hotkey;
     if (m_saved.autoReplay != m_config.autoReplay || m_saved.replayGames != m_config.replayGames) qInfo("Replay automatique : %s, %lld jeu(x) suivi(s).", qUtf8Printable(m_config.autoReplay), qlonglong(m_config.replayGames.size()));
     m_loadError.clear(); m_saved = m_config; m_settings->setSaved(m_saved); setWindowModified(false);
-    refreshTray(); spreadMix(); if (changedScreenshotKey) bindScreenshotHotkey(true);
-    if (changedShortcut && !m_programs.isEmpty() && !setStartMenuShortcut(m_programs, QCoreApplication::applicationFilePath(), m_saved.startMenuShortcut, error)) m_toasts->show(ToastHost::Warn, QStringLiteral("Menu Démarrer inchangé"), error);
+    refreshTray(); spreadMix(); if (changedScreenshotKey) bindScreenshotHotkey(true); if (changedRecordKey) bindRecordHotkey(true);
+    if (changedTheme) refreshIcons(true);
+    // Saved during a capture: the next clips go to the new folder, the replay answers its new key.
+    if (changedFolder) m_replay->setDirectory(m_config.libraryPath);
+    if (changedReplayKey && m_replay->replaying() && !m_globalHotkey->bind(m_settings->hotkey(), error)) m_toasts->show(ToastHost::Warn, QStringLiteral("Raccourci du replay indisponible"), error);
+    if (changedShortcut && !m_programs.isEmpty() && !setStartMenuShortcut(m_programs, QCoreApplication::applicationFilePath(), m_saved.startMenuShortcut, error, m_themeIcon)) m_toasts->show(ToastHost::Warn, QStringLiteral("Menu Démarrer inchangé"), error);
     if (changedLogin && !m_loginLocation.isEmpty()) {
         if (setLoginStart(m_loginLocation, QCoreApplication::applicationFilePath(), m_saved.launchAtLogin, error)) qInfo("Lancement avec la session : %s.", m_saved.launchAtLogin ? "activé" : "retiré");
         else { qWarning("Lancement avec la session : %s", qUtf8Printable(error)); m_toasts->show(ToastHost::Warn, QStringLiteral("Lancement avec la session inchangé"), error); }
@@ -656,7 +691,31 @@ void MainWindow::openScreenshot(const QString& path) {
     if (m_freshShots.remove(path)) rebuildScreenshots();
     setPage(ScreenshotView); m_shotEditor->openImage(path); m_shotEditor->setGame(gameOf(path));
 }
-void MainWindow::armShortcuts() { m_shortcutsArmed = true; bindScreenshotHotkey(true); }
+void MainWindow::armShortcuts() { m_shortcutsArmed = true; bindScreenshotHotkey(true); bindRecordHotkey(true); }
+void MainWindow::bindRecordHotkey(bool announce) {
+    if (!m_shortcutsArmed) return;
+    QString error;
+    if (!m_recordHotkey->bind(QKeySequence::fromString(m_saved.recordHotkey, QKeySequence::PortableText), error)) {
+        qWarning("Enregistrement : raccourci %s indisponible : %s", qUtf8Printable(m_saved.recordHotkey), qUtf8Printable(error));
+        if (announce) m_toasts->show(ToastHost::Warn, QStringLiteral("Raccourci de l'enregistrement indisponible"), error, {{QStringLiteral("Voir les réglages"), [this] { m_settings->showTab(0); setPage(Settings); }}});
+    }
+}
+void MainWindow::toggleRecording() {
+    if (m_replay->recording()) { m_replay->stopRecording(); updateCapture(); return; }
+    QString error;
+    switch (m_replay->state()) {
+    case ReplayEngine::State::Running: if (!m_replay->startRecording(error)) m_toasts->show(ToastHost::Error, QStringLiteral("L'enregistrement n'a pas démarré"), error); break;
+    // Asked while the replay starts, it begins as soon as the capture runs.
+    case ReplayEngine::State::Starting: m_replay->recordWhenRunning(); break;
+    case ReplayEngine::State::Stopping: m_toasts->show(ToastHost::Info, QStringLiteral("La capture s'arrête"), QStringLiteral("Relancez l'enregistrement dans un instant.")); break;
+    // Nothing runs: the capture starts for the recording alone, without a replay, and stops with it.
+    case ReplayEngine::State::Idle: case ReplayEngine::State::Error:
+        if (m_pages->currentWidget() == m_onboarding || !ReplayEngine::supported()) return;
+        startCapture(ReplayEngine::Purpose::Recording);
+        break;
+    }
+    updateCapture();
+}
 void MainWindow::bindScreenshotHotkey(bool announce) {
     if (!m_shortcutsArmed) return;
     QString error;
@@ -899,7 +958,17 @@ TrackMix MainWindow::mixForClip(const QString& path) const { return mixForGame(m
     m_programs = programsDirectory; m_settings->setStartMenu(!m_programs.isEmpty()); m_onboarding->setStartMenu(!m_programs.isEmpty());
     // A folder that was moved leaves its shortcut pointing nowhere: it is drawn again. One that
     // leads to another copy of the application is that copy's own, and is left alone.
-    QString error; if (!m_programs.isEmpty() && m_saved.startMenuShortcut && !m_firstLaunch && !startMenuShortcutWorks(m_programs)) setStartMenuShortcut(m_programs, QCoreApplication::applicationFilePath(), true, error);
+    QString error; if (!m_programs.isEmpty() && m_saved.startMenuShortcut && !m_firstLaunch && !startMenuShortcutWorks(m_programs)) setStartMenuShortcut(m_programs, QCoreApplication::applicationFilePath(), true, error, m_themeIcon);
+    // Its icon is that of the theme; again only when the shortcut is this copy's.
+    else if (!m_programs.isEmpty() && m_saved.startMenuShortcut && QFileInfo(QFileInfo(startMenuShortcut(m_programs)).symLinkTarget()) == QFileInfo(QCoreApplication::applicationFilePath())) setShortcutIcon(startMenuShortcut(m_programs), m_themeIcon);
+}
+void MainWindow::refreshIcons(bool files) {
+    // The window, the taskbar and the notification area take the logo in the colors of the theme.
+    const auto logo = appIcon(); QApplication::setWindowIcon(logo); setWindowIcon(logo); m_tray->setIcon(logo);
+    if (!files) return;
+    // The Start menu shows it through a file: the program's own icon cannot change while it runs.
+    m_themeIcon = writeThemeIcon(m_configDirectory);
+    if (!m_programs.isEmpty() && m_saved.startMenuShortcut) setShortcutIcon(startMenuShortcut(m_programs), m_themeIcon);
 }
 void MainWindow::manageLoginStart(const QString& location) {
     m_loginLocation = location; m_settings->setLoginStart(!m_loginLocation.isEmpty());
@@ -927,11 +996,15 @@ void MainWindow::surface() {
     setWindowState(windowState() & ~Qt::WindowMinimized); show(); raise(); activateWindow();
 }
 void MainWindow::refreshTray() {
-    const auto state = m_replay->state(); const bool running = state == ReplayEngine::State::Running, busy = running || state == ReplayEngine::State::Starting;
-    m_traySave->setEnabled(running && m_replay->stats().seconds > 0 && !m_replay->exporting());
-    m_trayToggle->setText(busy ? QStringLiteral("Arrêter le replay") : QStringLiteral("Démarrer le replay"));
+    const auto state = m_replay->state(); const bool running = state == ReplayEngine::State::Running;
+    const bool replaying = m_replay->replaying();
+    m_traySave->setEnabled(running && replaying && m_replay->stats().seconds > 0 && !m_replay->exporting());
+    m_trayToggle->setText(replaying ? QStringLiteral("Arrêter le replay") : QStringLiteral("Démarrer le replay"));
     m_trayToggle->setEnabled(state != ReplayEngine::State::Stopping && m_pages->currentWidget() != m_onboarding);
-    m_tray->setToolTip(busy ? QStringLiteral("Clipsapp · replay en cours") : QStringLiteral("Clipsapp · replay arrêté"));
+    const bool recording = m_replay->recording();
+    m_trayRecord->setText(recording ? QStringLiteral("Arrêter l'enregistrement") : QStringLiteral("Démarrer un enregistrement"));
+    m_trayRecord->setEnabled(recording || (state != ReplayEngine::State::Stopping && m_pages->currentWidget() != m_onboarding && ReplayEngine::supported()));
+    m_tray->setToolTip(recording && replaying ? QStringLiteral("Clipsapp · replay et enregistrement en cours") : recording ? QStringLiteral("Clipsapp · enregistrement en cours") : replaying ? QStringLiteral("Clipsapp · replay en cours") : QStringLiteral("Clipsapp · replay arrêté"));
     // The icon is there from the moment the window is on screen, since the window may then hide
     // behind it. Otherwise it only comes with the notification of a saved clip.
     if (m_saved.closeToTray && QSystemTrayIcon::isSystemTrayAvailable() && !testAttribute(Qt::WA_DontShowOnScreen)) { if (isVisible() || m_trayStart) m_tray->show(); }
@@ -968,20 +1041,24 @@ QJsonObject MainWindow::smokeReport() const {
     const auto& catalog = m_settings->catalog();
     return {{"version", CLIPSAPP_VERSION}, {"configPath", m_store.filePath()}, {"profiles", m_config.profiles.size()}, {"microphones", catalog.microphones.size()}, {"applications", catalog.applications.size()}, {"outputs", catalog.outputs.size()}, {"videoTargets", catalog.videoTargets.size()}, {"captureImplemented", ReplayEngine::supported()}, {"configurationError", m_loadError}};
 }
-void MainWindow::toggleCapture() {
-    const auto state = m_replay->state();
-    if (state == ReplayEngine::State::Starting || state == ReplayEngine::State::Running) stopCapture(); else startCapture();
-}
-void MainWindow::stopCapture() { m_restartPending = false; m_auto.stoppedByUser(); m_replay->stop(); }
-void MainWindow::startCapture() {
-    const auto state = m_replay->state();
+void MainWindow::toggleCapture() { if (m_replay->replaying()) stopCapture(); else startCapture(); }
+// The replay only: a recording under way goes on.
+void MainWindow::stopCapture() { m_restartPending = false; m_auto.stoppedByUser(); m_replay->stopReplay(); updateCapture(); }
+void MainWindow::startCapture(ReplayEngine::Purpose purpose) {
+    const auto state = m_replay->state(); const bool replay = purpose == ReplayEngine::Purpose::Replay;
+    QString error;
+    // The capture already runs for a recording: the replay joins it.
+    if (replay && (state == ReplayEngine::State::Starting || state == ReplayEngine::State::Running) && !m_replay->replaying()) {
+        if (!m_globalHotkey->bind(m_settings->hotkey(), error)) { m_toasts->show(ToastHost::Error, QStringLiteral("Le replay n'a pas démarré"), error); return; }
+        m_replay->startReplay(); m_auto.started(false); updateCapture(); return;
+    }
     if (state == ReplayEngine::State::Starting || state == ReplayEngine::State::Running || state == ReplayEngine::State::Stopping) return;
     if (!saveConfig(false)) return;
-    QString error; m_replayError.clear();
-    if (!m_globalHotkey->bind(m_settings->hotkey(), error) || !m_replay->start(profile(), m_config.libraryPath, error)) {
-        m_globalHotkey->unbind(); qWarning("Replay : non démarré : %s", qUtf8Printable(error));
-        m_toasts->show(ToastHost::Error, QStringLiteral("Le replay n'a pas démarré"), error, {{QStringLiteral("Voir les réglages"), [this] { m_settings->showTab(0); setPage(Settings); }}});
-    } else m_auto.started(false);
+    m_replayError.clear();
+    if ((replay && !m_globalHotkey->bind(m_settings->hotkey(), error)) || !m_replay->start(profile(), m_config.libraryPath, error, purpose)) {
+        m_globalHotkey->unbind(); qWarning("%s : non démarré : %s", replay ? "Replay" : "Enregistrement", qUtf8Printable(error));
+        m_toasts->show(ToastHost::Error, replay ? QStringLiteral("Le replay n'a pas démarré") : QStringLiteral("L'enregistrement n'a pas démarré"), error, {{QStringLiteral("Voir les réglages"), [this] { m_settings->showTab(0); setPage(Settings); }}});
+    } else if (replay) m_auto.started(false);
     updateCapture();
 }
 const SourceTarget* MainWindow::mainScreen() const {
@@ -991,6 +1068,13 @@ const SourceTarget* MainWindow::mainScreen() const {
 }
 bool MainWindow::startAutomatically(const QString& reason) {
     const auto state = m_replay->state();
+    // A recording alone already captures: the replay joins it, with the profile it runs on.
+    if ((state == ReplayEngine::State::Starting || state == ReplayEngine::State::Running) && !m_replay->replaying() && m_saved.activeProfile()) {
+        QString error;
+        if (!m_globalHotkey->bind(QKeySequence::fromString(m_saved.activeProfile()->replay.hotkey, QKeySequence::PortableText), error)) { m_auto.failed(); return false; }
+        qInfo("Replay automatique : démarrage pendant l'enregistrement, %s.", qUtf8Printable(reason));
+        m_replay->startReplay(); m_auto.started(true); updateCapture(); return true;
+    }
     if (state == ReplayEngine::State::Starting || state == ReplayEngine::State::Running || state == ReplayEngine::State::Stopping) return false;
     // Settings being changed are the user's: the replay waits until they are saved or cancelled.
     if (m_firstLaunch || m_pages->currentWidget() == m_onboarding || dirty() || m_replay->exporting() || !ReplayEngine::supported() || !m_saved.activeProfile()) return false;
@@ -1015,7 +1099,8 @@ void MainWindow::autoReplayTick() {
     m_auto.setMode(m_saved.autoReplay);
     const bool games = m_saved.autoReplay == QLatin1String("games") && !m_saved.replayGames.isEmpty();
     const auto running = games ? runningPrograms(m_saved.replayGames) : QStringList();
-    const auto state = m_replay->state(); const bool busy = state == ReplayEngine::State::Starting || state == ReplayEngine::State::Running || state == ReplayEngine::State::Stopping;
+    // A capture for a recording alone is no replay: the games may still start one.
+    const bool busy = m_replay->replaying() || m_replay->state() == ReplayEngine::State::Stopping;
     switch (m_auto.tick(!running.isEmpty(), busy, QDateTime::currentMSecsSinceEpoch())) {
     case AutoReplay::Action::Start: {
         const auto game = gameNameFromApplication(running.first(), {}); const auto name = game.isEmpty() ? QFileInfo(running.first()).completeBaseName() : game;
@@ -1028,7 +1113,7 @@ void MainWindow::autoReplayTick() {
         break;
     }
     case AutoReplay::Action::Stop:
-        qInfo("Replay automatique : arrêt, plus aucun jeu suivi n'est ouvert depuis %lld s.", qlonglong(AutoReplay::graceMs / 1000)); m_replay->stop(); break;
+        qInfo("Replay automatique : arrêt, plus aucun jeu suivi n'est ouvert depuis %lld s.", qlonglong(AutoReplay::graceMs / 1000)); m_replay->stopReplay(); break;
     case AutoReplay::Action::None: break;
     }
 }
@@ -1036,8 +1121,10 @@ void MainWindow::copyDiagnostic() {
     QStringList lines{QStringLiteral("Clipsapp %1").arg(CLIPSAPP_VERSION), systemDescription(), mediaLibraries()};
     for (const auto& adapter : graphicsAdapters()) lines << QStringLiteral("Carte graphique : ") + adapter;
     const auto& p = profile(); const auto& v = p.video; const auto stats = m_replay->stats();
-    lines << QStringLiteral("Profil « %1 » : %2, %3 × %4 à %5 FPS, %6, encodeur %7, %8 %9, effort %10, %11 s gardées, plafond %12 Mio")
-        .arg(p.name, v.targetId.section('|', 0, 0)).arg(v.width).arg(v.height).arg(v.fps).arg(v.codec, v.encoder, v.rateControl).arg(v.rateControl == QLatin1String("quality") ? v.quality : v.bitrateMbps).arg(v.effort).arg(p.replay.durationSeconds).arg(p.replay.memoryLimitMiB);
+    const bool onDisk = p.replay.storage == QLatin1String("disk");
+    lines << QStringLiteral("Profil « %1 » : %2, %3 × %4 à %5 FPS, %6, encodeur %7, %8 %9, effort %10, %11 s gardées %12, plafond %13 Mio")
+        .arg(p.name, v.targetId.section('|', 0, 0)).arg(v.width).arg(v.height).arg(v.fps).arg(v.codec, v.encoder, v.rateControl).arg(v.rateControl == QLatin1String("quality") ? v.quality : v.bitrateMbps).arg(v.effort).arg(p.replay.durationSeconds)
+        .arg(onDisk ? QStringLiteral("sur disque") : QStringLiteral("en mémoire")).arg(onDisk ? p.replay.diskLimitMiB : p.replay.memoryLimitMiB);
     QStringList sources; for (const auto& source : p.sources) sources << QStringLiteral("%1 (%2, %3%4)").arg(source.name, sourceKindKey(source.kind), source.targetId == QLatin1String("@default") ? QStringLiteral("par défaut") : source.targetLabel.left(60), source.enabled ? QString() : QStringLiteral(", désactivée"));
     lines << QStringLiteral("Sources : ") + sources.join(QStringLiteral(", "));
     const QStringList states{QStringLiteral("arrêté"), QStringLiteral("en démarrage"), QStringLiteral("actif"), QStringLiteral("en arrêt"), QStringLiteral("en erreur")};
@@ -1058,6 +1145,8 @@ void MainWindow::captureWholeScreen() {
     // Capturing a window makes Windows draw its yellow border; a whole screen has none.
     const auto* screen = mainScreen();
     if (!screen) { m_toasts->show(ToastHost::Warn, QStringLiteral("Aucun écran disponible"), QStringLiteral("Choisissez la cible dans Réglages › Capture.")); return; }
+    // Changing the target restarts the capture: a recording under way would be cut in two.
+    if (m_replay->recording()) { m_toasts->show(ToastHost::Info, QStringLiteral("Enregistrement en cours"), QStringLiteral("Arrêtez l'enregistrement pour changer ce qui est capturé.")); return; }
     profile().video.targetId = screen->id; profile().video.targetLabel = screen->label;
     m_settings->load(); m_restartPending = true; m_replay->stop();
     m_toasts->show(ToastHost::Info, QStringLiteral("Capture de l'écran entier"), QStringLiteral("Le replay redémarre sur %1. Le buffer repart de zéro.").arg(targetName(profile().video)));
@@ -1075,9 +1164,10 @@ void MainWindow::updateCapture() {
     const bool busy = state == ReplayEngine::State::Starting || state == ReplayEngine::State::Running || state == ReplayEngine::State::Stopping;
     if (state == ReplayEngine::State::Idle && m_restartPending) { m_restartPending = false; QMetaObject::invokeMethod(this, [this] { startCapture(); }, Qt::QueuedConnection); }
     m_settings->setLocked(busy);
-    if (!busy) m_globalHotkey->unbind();
+    // The key that saves a clip belongs to the replay alone, not to a recording without it.
+    if (!m_replay->replaying()) m_globalHotkey->unbind();
     QSet<QString> tracks; for (const auto& source : p.sources) if (source.enabled) tracks.insert(source.trackId);
-    ReplayView view; view.capacity = p.replay.durationSeconds; view.hotkey = p.replay.hotkey; view.seconds = stats.seconds; view.bytes = stats.bytes; view.saving = m_replay->exporting();
+    ReplayView view; view.capacity = p.replay.durationSeconds; view.hotkey = p.replay.hotkey; view.seconds = stats.seconds; view.bytes = stats.bytes; view.onDisk = p.replay.storage == QLatin1String("disk"); view.saving = m_replay->exporting();
     view.state = state == ReplayEngine::State::Starting ? ReplayView::Starting : state == ReplayEngine::State::Running ? ReplayView::Running : state == ReplayEngine::State::Stopping ? ReplayView::Stopping : state == ReplayEngine::State::Error ? ReplayView::Error : ReplayView::Idle;
     view.profileSummary = QStringLiteral("Profil %1 · %2 · %3 dernières secondes · %4 piste%5").arg(p.name, targetName(p.video)).arg(p.replay.durationSeconds).arg(tracks.size()).arg(tracks.size() > 1 ? "s" : "");
     // Stopped, the replay says what will start it by itself.
@@ -1102,10 +1192,12 @@ void MainWindow::updateCapture() {
     }
     view.error = m_replayError.isEmpty() ? QStringLiteral("La capture s'est interrompue. Les clips déjà sauvegardés ne sont pas touchés.") : m_replayError;
     const bool onboarding = m_pages->currentWidget() == m_onboarding;
-    view.canStart = ReplayEngine::supported() && !m_replay->exporting() && !onboarding; view.canSave = state == ReplayEngine::State::Running && stats.seconds > 0;
+    view.canStart = ReplayEngine::supported() && !m_replay->exporting() && !onboarding; view.canSave = state == ReplayEngine::State::Running && m_replay->replaying() && stats.seconds > 0;
     view.blockedReason = !ReplayEngine::supported() ? QStringLiteral("La capture Linux arrivera avec PipeWire et le portail KDE.") : onboarding ? QStringLiteral("Terminez la configuration pour démarrer") : QString();
+    view.replay = m_replay->replaying(); view.recording = m_replay->recording(); view.recordingSeconds = stats.recordingSeconds; view.recordingBytes = stats.recordingBytes; view.recordHotkey = m_saved.recordHotkey;
+    view.canRecord = ReplayEngine::supported() && !onboarding;
     m_strip->apply(view); refreshTray();
-    m_library->setReplayHint(QKeySequence::fromString(p.replay.hotkey, QKeySequence::PortableText), p.replay.durationSeconds, view.canStart, busy);
+    m_library->setReplayHint(QKeySequence::fromString(p.replay.hotkey, QKeySequence::PortableText), p.replay.durationSeconds, view.canStart, m_replay->replaying());
     m_shots->setScreenshotHint(QKeySequence::fromString(m_saved.screenshotHotkey, QKeySequence::PortableText));
 }
 bool MainWindow::smokeCheck(QString& error) {

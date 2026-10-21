@@ -40,7 +40,13 @@ struct VideoSettings {
     QString encoder = "auto";
     bool captureCursor = false;
 };
-struct ReplaySettings { int durationSeconds = 60; int memoryLimitMiB = 512; QString hotkey = "Ctrl+Alt+F10"; };
+struct ReplaySettings {
+    int durationSeconds = 60; int memoryLimitMiB = 512; QString hotkey = "Ctrl+Alt+F10";
+    // Where the buffer lives: "memory", or "disk" in diskFolder (empty: beside Clipsapp), up to diskLimitMiB.
+    QString storage = "memory"; int diskLimitMiB = 16384; QString diskFolder;
+    // The user saw the disk proposed for this profile and kept the memory.
+    bool keepMemory = false;
+};
 struct RecordingProfile {
     QString id;
     QString name;
@@ -50,6 +56,18 @@ struct RecordingProfile {
     QList<AudioSource> sources;
     QString gameName;
     bool detectGame = true;
+};
+// The theme: three colors "#RRGGBB" from which the interface derives every other, and its two
+// gradients. Empty colors are those of the default theme.
+struct ThemeSettings {
+    QString background, accent, text, windowEnd, accentEnd;
+    bool windowGradient = false, accentGradient = false;
+    int angle = 135;
+    bool operator==(const ThemeSettings& other) const {
+        return background == other.background && accent == other.accent && text == other.text && windowEnd == other.windowEnd && accentEnd == other.accentEnd
+            && windowGradient == other.windowGradient && accentGradient == other.accentGradient && angle == other.angle;
+    }
+    bool operator!=(const ThemeSettings& other) const { return !(*this == other); }
 };
 struct AppConfig {
     QString libraryPath;
@@ -95,6 +113,9 @@ struct AppConfig {
     bool screenshotSound = true;
     QString screenshotSoundId = "shutter";
     int screenshotSoundVolume = 50;
+    // The shortcut that starts a recording, and stops it: one key for both, whatever the replay does.
+    QString recordHotkey = "Ctrl+Alt+F9";
+    ThemeSettings theme;
     static AppConfig defaults();
     RecordingProfile* activeProfile();
     const RecordingProfile* activeProfile() const;
@@ -109,5 +130,10 @@ double estimatedBufferMiB(const RecordingProfile& profile);
 // What it usually holds, from a calm game to a busy one. Both ends are the same on a target bitrate.
 struct BufferRange { double low = 0, high = 0; };
 BufferRange usualBufferMiB(const RecordingProfile& profile);
+// The folder of a buffer kept on disk: the one chosen, or "Buffer du replay" beside Clipsapp.
+QString replayDiskFolder(const ReplaySettings& replay);
+// Past this share of the memory of the PC, a buffer in memory weighs on the game: the disk is proposed.
+constexpr double diskBufferMemoryShare = 0.15;
+bool suggestsDiskBuffer(const RecordingProfile& profile, qint64 physicalMemoryBytes);
 }
 

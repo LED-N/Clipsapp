@@ -16,6 +16,7 @@ namespace clipsapp {
 struct FolderWatcher::Worker {
     HANDLE directory = INVALID_HANDLE_VALUE, stop = CreateEventW(nullptr, TRUE, FALSE, nullptr), signal = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     std::thread thread; std::atomic_bool alive{false};
+    std::vector<DWORD> buffer = std::vector<DWORD>(16384); OVERLAPPED overlapped{};
     ~Worker() {
         if (stop) SetEvent(stop);
         if (thread.joinable()) thread.join();
@@ -23,14 +24,17 @@ struct FolderWatcher::Worker {
         if (stop) CloseHandle(stop);
         if (signal) CloseHandle(signal);
     }
+    // Windows keeps what changes only once it has been asked: the first request is made before
+    // watch() returns, so that nothing done just after is missed.
+    bool arm() {
+        constexpr DWORD filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE;
+        ResetEvent(signal); overlapped = {}; overlapped.hEvent = signal;
+        return ReadDirectoryChangesW(directory, buffer.data(), DWORD(buffer.size() * sizeof(DWORD)), TRUE, filter, nullptr, &overlapped, nullptr);
+    }
     void run(FolderWatcher* owner) {
         const auto notify = [owner](QStringList paths) { QMetaObject::invokeMethod(owner, [owner, paths] { emit owner->changed(paths); }, Qt::QueuedConnection); };
-        std::vector<DWORD> buffer(16384);
-        OVERLAPPED overlapped{}; overlapped.hEvent = signal;
-        constexpr DWORD filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE;
-        for (;;) {
-            ResetEvent(signal);
-            if (!ReadDirectoryChangesW(directory, buffer.data(), DWORD(buffer.size() * sizeof(DWORD)), TRUE, filter, nullptr, &overlapped, nullptr)) { notify({}); break; }
+        for (bool armed = true;; armed = arm()) {
+            if (!armed) { notify({}); break; }
             const HANDLE handles[]{signal, stop};
             if (WaitForMultipleObjects(2, handles, FALSE, INFINITE) != WAIT_OBJECT_0) {
                 CancelIoEx(directory, &overlapped); DWORD ignored = 0; GetOverlappedResult(directory, &overlapped, &ignored, TRUE); break;
@@ -64,7 +68,7 @@ void FolderWatcher::watch(const QString& directory) {
     auto worker = std::make_unique<Worker>(); if (!worker->stop || !worker->signal) return;
     worker->directory = CreateFileW(reinterpret_cast<LPCWSTR>(QDir::toNativeSeparators(directory).utf16()), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
-    if (worker->directory == INVALID_HANDLE_VALUE) return;
+    if (worker->directory == INVALID_HANDLE_VALUE || !worker->arm()) return;
     worker->alive = true; auto* state = worker.get(); worker->thread = std::thread([state, this] { state->run(this); });
     m_worker = std::move(worker);
 }

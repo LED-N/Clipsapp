@@ -11,6 +11,7 @@
 #include <functiondiscoverykeys_devpkey.h>
 #include <propsys.h>
 #include <propvarutil.h>
+#include <tlhelp32.h>
 #include <algorithm>
 
 namespace clipsapp {
@@ -112,6 +113,18 @@ SourceCatalog SourceCatalog::discover() {
     }
     if (uninitialize) CoUninitialize();
     std::sort(catalog.applications.begin(), catalog.applications.end(), [](const auto& a, const auto& b) { return a.label.localeAwareCompare(b.label) < 0; });
+    // The programs of the session only: those of the system cannot be inspected and are left out.
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot != INVALID_HANDLE_VALUE) {
+        QSet<QString> running; PROCESSENTRY32W entry{}; entry.dwSize = sizeof(entry);
+        if (Process32FirstW(snapshot, &entry)) do {
+            if (entry.th32ProcessID == static_cast<DWORD>(QCoreApplication::applicationPid())) continue;
+            const auto path = processPath(entry.th32ProcessID); const auto identity = applicationIdentity(path);
+            if (path.isEmpty() || running.contains(identity)) continue;
+            running.insert(identity); catalog.runningApplications.append({path, QFileInfo(path).fileName()});
+        } while (Process32NextW(snapshot, &entry));
+        CloseHandle(snapshot);
+    }
     return catalog;
 }
 }

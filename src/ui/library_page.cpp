@@ -47,7 +47,7 @@ public:
     QSize sizeHint(const QStyleOptionViewItem&, const QModelIndex& index) const override { return {200, index.data(Qt::UserRole + 2).toInt() == 2 ? 44 : 35}; }
     void paint(QPainter* painter, const QStyleOptionViewItem& option, const QModelIndex& index) const override {
         painter->save(); painter->setRenderHint(QPainter::Antialiasing); const int kind = index.data(Qt::UserRole + 2).toInt(); QRectF row = QRectF(option.rect).adjusted(0, 0, 0, -1);
-        if (kind == 2) { painter->fillRect(QRectF(row.left() + 6, row.top() + 4, row.width() - 12, 1), QColor(0x2A, 0x31, 0x3C)); row.setTop(row.top() + 9); }
+        if (kind == 2) { painter->fillRect(QRectF(row.left() + 6, row.top() + 4, row.width() - 12, 1), tk::line); row.setTop(row.top() + 9); }
         if (option.state & (QStyle::State_Selected | QStyle::State_MouseOver)) { painter->setPen(Qt::NoPen); painter->setBrush(tk::selected); painter->drawRoundedRect(row, 6, 6); }
         paintIcon(*painter, kind == 0 ? QStringLiteral("tag") : kind == 1 ? QStringLiteral("plus") : QStringLiteral("undo"), QRectF(row.left() + 10, row.center().y() - 8, 16, 16), tk::text2);
         painter->setFont(uiFont(13)); painter->setPen(tk::text); const auto note = index.data(Qt::UserRole + 1).toString();

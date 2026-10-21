@@ -113,7 +113,7 @@ void ClipTimeline::paintContent(QPainter& painter) {
     painter.setFont(monoFont(10));
     for (qint64 time = (m_viewStart / interval) * interval; time <= std::min(m_info.durationMs, m_viewStart + visibleDuration() + interval); time += interval) {
         const int x = qRound(xAt(time)); const bool major = (time / interval) % 5 == 0;
-        painter.fillRect(QRect(x, m.ruler - 1 - (major ? 9 : 5), 1, major ? 9 : 5), major ? QColor(0x5D, 0x66, 0x75) : tk::lineHover);
+        painter.fillRect(QRect(x, m.ruler - 1 - (major ? 9 : 5), 1, major ? 9 : 5), major ? tk::control : tk::lineHover);
         if (!major) continue;
         const auto text = interval < 200 ? QString::number(time / 1000.0, 'f', interval < 20 ? 2 : 1).replace('.', ',') + QStringLiteral(" s") : timeLabel(time);
         if (x + 4 + painter.fontMetrics().horizontalAdvance(text) > width() - 2) continue;
@@ -133,7 +133,7 @@ void ClipTimeline::paintContent(QPainter& painter) {
     for (int track = 0; track < m_edit.tracks.size(); ++track) {
         const int top = tracksTop + track * m.track - m_scroll; if (top >= height() || top + m.track <= tracksTop) continue;
         const bool mute = m_edit.tracks[track].muted; painter.fillRect(QRect(m.header, top, width() - m.header, 1), tk::raised);
-        const QColor color = mute ? QColor(0x3A, 0x41, 0x4D) : tk::track(track); const double middle = top + m.track / 2.0;
+        const QColor color = mute ? tk::lineHover : tk::track(track); const double middle = top + m.track / 2.0;
         const int analysisTrack = m_analysis.streams.isEmpty() ? track : int(m_analysis.streams.indexOf(m_edit.tracks[track].stream));
         if (analysisTrack >= 0 && analysisTrack < m_analysis.peaks.size() && !m_analysis.peaks[analysisTrack].isEmpty()) {
             const auto& peaks = m_analysis.peaks[analysisTrack];
@@ -159,7 +159,7 @@ void ClipTimeline::paintContent(QPainter& painter) {
         for (const double x : {handle.center().x() - 2.5, handle.center().x() + 1}) painter.fillRect(QRectF(x, handle.center().y() - 8, 1.5, 16), tk::onAccent);
     }
     if (const int limit = scrollLimit(); limit > 0) {
-        const double area = height() - tracksTop, bar = std::max(16.0, area * area / (area + limit)); painter.setPen(Qt::NoPen); painter.setBrush(QColor(0x2E, 0x35, 0x42));
+        const double area = height() - tracksTop, bar = std::max(16.0, area * area / (area + limit)); painter.setPen(Qt::NoPen); painter.setBrush(tk::lineStrong);
         painter.drawRoundedRect(QRectF(width() - 5, tracksTop + (area - bar) * m_scroll / limit, 3, bar), 1.5, 1.5);
     }
 }

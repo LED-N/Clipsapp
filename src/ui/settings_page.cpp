@@ -1,8 +1,11 @@
 #include "settings_page.h"
 #include "source_dialog.h"
+#include "theme_editor.h"
 #include "clip_feedback.h"
 #include "widgets.h"
+#include "core/audio_routing.h"
 #include "core/game_identity.h"
+#include "platform/system_info.h"
 #include <QCursor>
 #include <QDir>
 #include <QFileDialog>
@@ -22,6 +25,7 @@
 #include <QSlider>
 #include <QSpinBox>
 #include <QStackedWidget>
+#include <QStorageInfo>
 #include <QVBoxLayout>
 #include <algorithm>
 
@@ -77,11 +81,11 @@ SettingsPage::SettingsPage(AppConfig& config, const QString& settingsPath, QWidg
     }
     tabRow->addStretch(); head->addLayout(tabRow); layout->addLayout(head); layout->addWidget(separator());
     auto* lockHost = new QVBoxLayout; lockHost->setContentsMargins(24, 16, 24, 0);
-    m_lock = new Banner(Banner::Info, QStringLiteral("lock")); m_lock->setObjectName("settings-locked"); m_lock->setTexts(QStringLiteral("Le replay utilise ce profil"), QStringLiteral("Les réglages restent en lecture seule jusqu'à l'arrêt du replay. Rien n'est perdu."));
-    auto* stop = new Button(QStringLiteral("stop"), QStringLiteral("Arrêter le replay pour modifier")); m_lock->actions()->addWidget(stop); m_lock->hide(); lockHost->addWidget(m_lock); layout->addLayout(lockHost);
+    m_lock = new Banner(Banner::Info, QStringLiteral("lock")); m_lock->setObjectName("settings-locked"); m_lock->setTexts(QStringLiteral("Certains réglages attendent l'arrêt de la capture"), QStringLiteral("Ce qui est capturé, la qualité, le buffer du replay et les sources audio se modifient une fois le replay et l'enregistrement arrêtés. Le reste s'applique tout de suite."));
+    auto* stop = new Button(QStringLiteral("stop"), QStringLiteral("Tout arrêter pour modifier")); m_lock->actions()->addWidget(stop); m_lock->hide(); lockHost->addWidget(m_lock); layout->addLayout(lockHost);
     m_tabs->addWidget(buildCaptureTab()); m_tabs->addWidget(buildAudioTab()); m_tabs->addWidget(buildGeneralTab(settingsPath)); layout->addWidget(m_tabs, 1);
 
-    m_saveBar = new QFrame; m_saveBar->setObjectName("savebar"); m_saveBar->setFixedHeight(60); m_saveBar->setStyleSheet(QStringLiteral("QFrame#savebar { background: #14181E; border: none; border-top: 1px solid #3B4553; }"));
+    m_saveBar = new QFrame; m_saveBar->setObjectName("savebar"); m_saveBar->setFixedHeight(60);
     auto* bar = new QHBoxLayout(m_saveBar); bar->setContentsMargins(24, 0, 24, 0); bar->setSpacing(10);
     auto* dot = new IconBox(QString(), tk::warn, tk::warn, 8); dot->setRound(true); bar->addWidget(dot);
     m_dirtyTitle = label({}, "strong"); m_dirtyTitle->setObjectName("settings-dirty"); bar->addWidget(m_dirtyTitle); m_dirtyDetail = new ElideLabel({}, "t2"); bar->addWidget(m_dirtyDetail, 1);
@@ -105,12 +109,12 @@ QWidget* SettingsPage::buildCaptureTab() {
     auto* content = new QWidget; auto* columns = new QHBoxLayout(content); columns->setContentsMargins(24, 18, 24, 18); columns->setSpacing(16);
     auto* left = new QVBoxLayout; left->setSpacing(16); auto* right = new QVBoxLayout; right->setSpacing(16); columns->addLayout(left, 1); columns->addLayout(right, 1);
 
-    QVBoxLayout* body; left->addWidget(section(QStringLiteral("Ce qui est capturé"), body, &m_captureTag));
+    QVBoxLayout* body; left->addWidget(m_targetSection = section(QStringLiteral("Ce qui est capturé"), body, &m_captureTag));
     m_videoTarget = new ChoiceBox; m_videoTarget->setObjectName("video-target"); m_videoTarget->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon); m_videoTarget->setMinimumContentsLength(18); body->addLayout(field(QStringLiteral("Écran ou fenêtre"), m_videoTarget));
     m_gameName = new QLineEdit; m_gameName->setObjectName("recording-game"); m_gameName->setMaxLength(80); body->addLayout(field(QStringLiteral("Nom du jeu"), m_gameName));
     m_detectGame = new Toggle(QStringLiteral("Reconnaître le jeu capturé quand le nom est vide")); body->addWidget(m_detectGame);
 
-    left->addWidget(section(QStringLiteral("Qualité"), body, &m_qualityTag));
+    left->addWidget(m_qualitySection = section(QStringLiteral("Qualité"), body, &m_qualityTag));
     auto* presets = new QGridLayout; presets->setSpacing(8);
     for (const auto& quality : qualities) {
         const auto weight = quality.level ? QStringLiteral("Qualité constante") : QStringLiteral("%1 Mbit/s").arg(quality.bitrate);
@@ -174,16 +178,48 @@ QWidget* SettingsPage::buildCaptureTab() {
     auto* durationRow = new QHBoxLayout; durationRow->setSpacing(12); m_durationSlider = new QSlider(Qt::Horizontal); m_durationSlider->setRange(15, 600); m_durationSlider->setPageStep(15);
     m_duration = new QSpinBox; m_duration->setObjectName("replay-duration"); m_duration->setRange(15, 600); m_duration->setSuffix(QStringLiteral(" s")); m_duration->setFixedWidth(96); m_duration->setButtonSymbols(QAbstractSpinBox::NoButtons); m_duration->setFont(monoFont(13));
     durationRow->addWidget(m_durationSlider, 1); durationRow->addWidget(m_duration);
-    auto* durationGroup = new QVBoxLayout; durationGroup->setSpacing(6); durationGroup->addWidget(label(QStringLiteral("Secondes gardées en mémoire"), "lbl")); durationGroup->addLayout(durationRow);
+    auto* durationGroup = new QVBoxLayout; durationGroup->setSpacing(6); durationGroup->addWidget(label(QStringLiteral("Secondes gardées"), "lbl")); durationGroup->addLayout(durationRow);
     durationGroup->addWidget(label(QStringLiteral("De 15 s à 10 min. C'est aussi la durée d'un clip sauvegardé."), "hint", true)); body->addLayout(durationGroup);
+    // Where the replay keeps its last seconds. Past a share of the memory of the PC, the disk is proposed.
+    m_storage = new ChoiceBox; m_storage->setObjectName("replay-storage"); m_storage->setFixedWidth(200);
+    m_storage->addItem(QStringLiteral("Mémoire vive"), "memory"); m_storage->addItem(QStringLiteral("Disque · SSD conseillé"), "disk");
+    m_storage->setToolTip(choices("Où le replay garde ses dernières secondes.", {
+        {"Mémoire vive", "Le plus simple, pour un replay de quelques minutes à un débit raisonnable."},
+        {"Disque", "Pour un long replay ou un débit élevé : la mémoire reste au jeu. Un SSD est conseillé ; les fichiers sont effacés à l'arrêt du replay."}}));
+    body->addLayout(field(QStringLiteral("Buffer du replay"), m_storage));
+    auto* proposal = new QFrame; m_diskProposal = proposal; proposal->setObjectName("disk-proposal"); proposal->setProperty("banner", "info"); auto* proposalLayout = new QVBoxLayout(proposal); proposalLayout->setContentsMargins(12, 12, 12, 12); proposalLayout->setSpacing(8);
+    auto* proposalHead = new QHBoxLayout; proposalHead->setSpacing(8); proposalHead->addWidget(new IconLabel(QStringLiteral("info"), tk::info)); m_diskProposalTitle = label({}, "strong"); proposalHead->addWidget(m_diskProposalTitle, 1); proposalLayout->addLayout(proposalHead);
+    m_diskProposalText = label({}, "small", true); proposalLayout->addWidget(m_diskProposalText);
+    auto* proposalActions = new QHBoxLayout; proposalActions->setSpacing(8);
+    auto* useDisk = new Button(QStringLiteral("Passer au disque"), Button::Primary, Button::Small); useDisk->setObjectName("use-disk-buffer");
+    auto* keepMemory = new Button(QStringLiteral("Rester en mémoire"), Button::Ghost, Button::Small); keepMemory->setObjectName("keep-memory-buffer");
+    proposalActions->addWidget(useDisk); proposalActions->addWidget(keepMemory); proposalActions->addStretch(); proposalLayout->addLayout(proposalActions); body->addWidget(proposal); proposal->hide();
     m_memory = new ChoiceBox; m_memory->setObjectName("replay-memory"); m_memory->setFixedWidth(200); for (const int value : {256, 512, 1024, 2048, 4096, 8192}) m_memory->addItem(grouped(value) + QStringLiteral(" Mio"), value);
-    body->addLayout(field(QStringLiteral("Plafond de mémoire"), m_memory));
+    m_memoryField = new QWidget; auto* memoryLayout = field(QStringLiteral("Plafond de mémoire"), m_memory); memoryLayout->setContentsMargins(0, 0, 0, 0); m_memoryField->setLayout(memoryLayout); body->addWidget(m_memoryField);
+    m_diskBox = new QWidget; m_diskBox->setObjectName("disk-buffer"); auto* diskLayout = new QVBoxLayout(m_diskBox); diskLayout->setContentsMargins(0, 0, 0, 0); diskLayout->setSpacing(12);
+    m_diskLimit = new ChoiceBox; m_diskLimit->setObjectName("replay-disk-limit"); m_diskLimit->setFixedWidth(200); for (const int gib : {4, 8, 16, 32, 64}) m_diskLimit->addItem(QStringLiteral("%1 Gio").arg(gib), gib * 1024);
+    diskLayout->addLayout(field(QStringLiteral("Plafond sur le disque"), m_diskLimit));
+    auto* diskFolderRow = new QHBoxLayout; diskFolderRow->setSpacing(12); m_diskFolder = new QLineEdit; m_diskFolder->setObjectName("replay-disk-folder"); m_diskFolder->addAction(icon(QStringLiteral("folder")), QLineEdit::LeadingPosition);
+    m_diskFolder->setPlaceholderText(QDir::toNativeSeparators(replayDiskFolder({}))); diskFolderRow->addWidget(m_diskFolder, 1);
+    auto* diskBrowse = new Button(QStringLiteral("Parcourir…")); diskBrowse->setObjectName("replay-disk-browse"); diskFolderRow->addWidget(diskBrowse);
+    auto* diskFolderGroup = new QVBoxLayout; diskFolderGroup->setSpacing(6); diskFolderGroup->addWidget(label(QStringLiteral("Dossier du buffer"), "lbl")); diskFolderGroup->addLayout(diskFolderRow);
+    m_diskSpace = label({}, "hint", true); m_diskSpace->setObjectName("disk-space"); diskFolderGroup->addWidget(m_diskSpace);
+    diskFolderGroup->addWidget(label(QStringLiteral("Un SSD est préférable : un disque dur peut ralentir les chargements du jeu et peiner aux débits élevés. Laissé vide, c'est le dossier « Buffer du replay » à côté de Clipsapp. Les fichiers sont effacés dès l'arrêt du replay, même après un plantage."), "hint", true));
+    diskLayout->addLayout(diskFolderGroup); body->addWidget(m_diskBox); m_diskBox->hide();
+    connect(useDisk, &QPushButton::clicked, this, [this] { m_storage->setCurrentIndex(m_storage->findData("disk")); });
+    connect(keepMemory, &QPushButton::clicked, this, [this] { profile().replay.keepMemory = true; changed(); });
+    connect(diskBrowse, &QPushButton::clicked, this, [this] {
+        const auto start = m_diskFolder->text().trimmed().isEmpty() ? replayDiskFolder({}) : m_diskFolder->text().trimmed();
+        const auto directory = QFileDialog::getExistingDirectory(this, QStringLiteral("Dossier du buffer du replay"), QDir(start).exists() ? start : QFileInfo(start).absolutePath());
+        if (!directory.isEmpty()) m_diskFolder->setText(QDir::toNativeSeparators(directory));
+    });
+    connect(m_diskFolder, &QLineEdit::textChanged, this, [this] { changed(); });
     m_estimateCalm = new QWidget; auto* calm = new QVBoxLayout(m_estimateCalm); calm->setContentsMargins(0, 0, 0, 0); calm->setSpacing(6);
     m_estimateCalmText = label({}, "hint", true); m_estimateCalmText->setObjectName("memory-estimate"); m_estimateCalmBar = new Bar; calm->addWidget(m_estimateCalmText); calm->addWidget(m_estimateCalmBar); body->addWidget(m_estimateCalm);
     auto* warn = new QFrame; m_estimateWarn = warn; warn->setObjectName("memory-warning"); warn->setProperty("banner", "warn"); auto* warnLayout = new QVBoxLayout(warn); warnLayout->setContentsMargins(12, 12, 12, 12); warnLayout->setSpacing(8);
     auto* warnHead = new QHBoxLayout; warnHead->setSpacing(8); warnHead->addWidget(new IconLabel(QStringLiteral("warn"), tk::warn));
     m_estimateWarnTitle = label({}); m_estimateWarnTitle->setStyleSheet(QStringLiteral("color: #F2B35E; font-weight: 600;")); warnHead->addWidget(m_estimateWarnTitle, 1); m_estimateWarnLimit = monoLabel({}, 12, tk::text2); warnHead->addWidget(m_estimateWarnLimit);
-    warnLayout->addLayout(warnHead); m_estimateWarnBar = new Bar(nullptr, 12); m_estimateWarnBar->setColors(tk::warn, QColor(0x3A, 0x2C, 0x16)); warnLayout->addWidget(m_estimateWarnBar);
+    warnLayout->addLayout(warnHead); m_estimateWarnBar = new Bar(nullptr, 12); m_estimateWarnBar->setColors(tk::warn, tk::warnSoft); warnLayout->addWidget(m_estimateWarnBar);
     m_estimateWarnText = label({}, "warnText", true); warnLayout->addWidget(m_estimateWarnText); body->addWidget(warn);
     auto* hotkeyRow = new QHBoxLayout; hotkeyRow->setSpacing(12); m_hotkeyCaps = new Keycaps; hotkeyRow->addWidget(m_hotkeyCaps);
     m_hotkey = new QKeySequenceEdit; m_hotkey->setObjectName("replay-hotkey"); m_hotkey->setMaximumSequenceLength(1); m_hotkey->hide(); hotkeyRow->addWidget(m_hotkey);
@@ -205,6 +241,21 @@ QWidget* SettingsPage::buildCaptureTab() {
         if (!editing) m_shotKey->setFocus();
     });
     connect(m_shotKey, &QKeySequenceEdit::keySequenceChanged, this, [this] { m_shotCaps->setSequence(m_shotKey->keySequence()); if (m_shotKey->isVisible() && !m_shotKey->keySequence().isEmpty()) m_shotChange->click(); changed(); });
+    // A recording rides on the replay, with the same quality; one key starts it and stops it.
+    right->addWidget(section(QStringLiteral("Enregistrement"), body));
+    auto* recordRow = new QHBoxLayout; recordRow->setSpacing(12); m_recordCaps = new Keycaps; recordRow->addWidget(m_recordCaps);
+    m_recordKey = new QKeySequenceEdit; m_recordKey->setObjectName("record-hotkey"); m_recordKey->setMaximumSequenceLength(1); m_recordKey->hide(); recordRow->addWidget(m_recordKey);
+    m_recordChange = new Button(QStringLiteral("Changer"), Button::Secondary, Button::Small); m_recordChange->setObjectName("record-hotkey-change"); recordRow->addWidget(m_recordChange); recordRow->addStretch();
+    auto* recordGroup = new QVBoxLayout; recordGroup->setSpacing(6); recordGroup->addWidget(label(QStringLiteral("Raccourci pour démarrer et arrêter"), "lbl")); recordGroup->addLayout(recordRow);
+    m_recordHint = label({}, "hint", true); recordGroup->addWidget(m_recordHint); body->addLayout(recordGroup);
+    const auto recordHint = [this](bool editing) { m_recordHint->setText(editing ? QStringLiteral("Appuyez sur la nouvelle combinaison de touches.") : QStringLiteral("Enregistre tout, sans limite de durée, jusqu'à ce que vous l'arrêtiez, dans le dossier du jeu. Même qualité que le replay. L'enregistrement tourne seul, ou à côté du replay : chacun a sa barre en haut, et le replay se démarre ou s'arrête sans couper l'enregistrement.")); };
+    recordHint(false);
+    connect(m_recordChange, &QPushButton::clicked, this, [this, recordHint] {
+        const bool editing = m_recordKey->isVisible();
+        m_recordKey->setVisible(!editing); m_recordCaps->setVisible(editing); m_recordChange->setText(editing ? QStringLiteral("Changer") : QStringLiteral("Terminer")); recordHint(!editing);
+        if (!editing) m_recordKey->setFocus();
+    });
+    connect(m_recordKey, &QKeySequenceEdit::keySequenceChanged, this, [this] { m_recordCaps->setSequence(m_recordKey->keySequence()); if (m_recordKey->isVisible() && !m_recordKey->keySequence().isEmpty()) m_recordChange->click(); changed(); });
     // Where a saved clip goes ends what the replay does: it sits under it.
     right->addWidget(section(QStringLiteral("Dossier des clips et captures d'écran"), body));
     auto* folderRow = new QHBoxLayout; folderRow->setSpacing(12); m_folder = new QLineEdit; m_folder->setObjectName("libraryPath"); m_folder->addAction(icon(QStringLiteral("folder")), QLineEdit::LeadingPosition); folderRow->addWidget(m_folder, 1);
@@ -217,7 +268,7 @@ QWidget* SettingsPage::buildCaptureTab() {
     connect(m_advancedToggle, &QPushButton::clicked, this, [this] { m_advanced->setVisible(!m_advanced->isVisible()); m_advancedToggle->setIconName(m_advanced->isVisible() ? QStringLiteral("down") : QStringLiteral("next")); });
     connect(m_gameName, &QLineEdit::textChanged, this, [this] { changed(); });
     for (auto* toggle : {m_detectGame, m_cursor}) connect(toggle, &QCheckBox::toggled, this, [this] { m_cursor->setText(m_cursor->isChecked() ? QStringLiteral("Visible dans les clips") : QStringLiteral("Masqué dans les clips")); changed(); });
-    for (auto* combo : {m_videoTarget, m_resolution, m_fps, m_codec, m_encoder, m_rateControl, m_quality, m_effort, m_memory}) connect(combo, &QComboBox::currentIndexChanged, this, [this] { changed(); });
+    for (auto* combo : {m_videoTarget, m_resolution, m_fps, m_codec, m_encoder, m_rateControl, m_quality, m_effort, m_memory, m_storage, m_diskLimit}) connect(combo, &QComboBox::currentIndexChanged, this, [this] { changed(); });
     connect(m_bitrate, &QSpinBox::valueChanged, this, [this] { changed(); });
     connect(m_duration, &QSpinBox::valueChanged, this, [this](int value) { QSignalBlocker blocker(m_durationSlider); m_durationSlider->setValue(value); changed(); });
     connect(m_durationSlider, &QSlider::valueChanged, m_duration, &QSpinBox::setValue);
@@ -235,10 +286,10 @@ QWidget* SettingsPage::buildAudioTab() {
     auto* top = new QHBoxLayout; top->setSpacing(10);
     auto* intro = new QLabel(QStringLiteral("Chaque <b style='color:#E9EDF3'>piste</b> devient une ligne réglable dans l'éditeur. Les <b style='color:#E9EDF3'>sources</b> rangées dans une même piste sont mélangées pour de bon.")); intro->setProperty("role", "t2"); intro->setWordWrap(true); top->addWidget(intro, 1);
     intro->setText(intro->text() + QStringLiteral(" Le curseur d'une piste est son <b style='color:#E9EDF3'>volume habituel</b> dans les clips ; l'enregistrement, lui, garde tout à plein niveau."));
-    auto* refresh = new Button(QStringLiteral("refresh"), QStringLiteral("Actualiser")); auto* add = new Button(QStringLiteral("plus"), QStringLiteral("Ajouter une source"), Button::Primary); add->setObjectName("add-source"); top->addWidget(refresh, 0, Qt::AlignTop); top->addWidget(add, 0, Qt::AlignTop);
+    auto* refresh = new Button(QStringLiteral("refresh"), QStringLiteral("Actualiser")); auto* add = new Button(QStringLiteral("plus"), QStringLiteral("Ajouter une source"), Button::Primary); add->setObjectName("add-source"); m_addSource = add; top->addWidget(refresh, 0, Qt::AlignTop); top->addWidget(add, 0, Qt::AlignTop);
     layout->addLayout(top); layout->addSpacing(4);
     m_lanes = new QVBoxLayout; m_lanes->setSpacing(10); layout->addLayout(m_lanes);
-    auto* dashed = new DashedButton(QStringLiteral("plus"), QStringLiteral("Ajouter une source ou une piste")); layout->addWidget(dashed);
+    auto* dashed = new DashedButton(QStringLiteral("plus"), QStringLiteral("Ajouter une source ou une piste")); m_addLane = dashed; layout->addWidget(dashed);
     auto* notes = new QHBoxLayout; notes->setSpacing(8); notes->addWidget(new IconLabel(QStringLiteral("info"), tk::text2, 14), 0, Qt::AlignTop); m_sourceNotes = label({}, "hint", true); notes->addWidget(m_sourceNotes, 1); layout->addLayout(notes); layout->addStretch();
     // The levels of a game's clips, learnt from its exports or kept from the editor: listed, to be forgotten.
     m_gameMixHost = new QWidget; auto* gameMixLayout = new QVBoxLayout(m_gameMixHost); gameMixLayout->setContentsMargins(0, 8, 0, 0); gameMixLayout->setSpacing(8);
@@ -246,14 +297,19 @@ QWidget* SettingsPage::buildAudioTab() {
     gameMixLayout->addWidget(label(QStringLiteral("Les clips de ces jeux s'ouvrent avec leurs propres volumes ; les pistes qui n'y figurent pas gardent leur volume habituel. Oublier un jeu le ramène aux volumes habituels."), "hint", true));
     auto* gameMixWell = card("well"); gameMixWell->setObjectName("game-mixes"); m_gameMixes = new QVBoxLayout(gameMixWell); m_gameMixes->setContentsMargins(1, 4, 1, 4); m_gameMixes->setSpacing(0); gameMixLayout->addWidget(gameMixWell);
     layout->insertWidget(layout->count() - 1, m_gameMixHost); m_gameMixHost->hide();
-    connect(refresh, &QPushButton::clicked, this, [this] { collect(); refreshCatalog(); populateSources(); emit notice(QStringLiteral("Sources audio actualisées"), {}); });
+    connect(refresh, &QPushButton::clicked, this, [this] { refreshSources(); emit notice(QStringLiteral("Sources audio actualisées"), {}); });
     connect(add, &QPushButton::clicked, this, [this] { editSource(-1); }); connect(dashed, &QPushButton::clicked, this, [this] { editSource(-1); });
     return scrolled(content);
 }
 QWidget* SettingsPage::buildGeneralTab(const QString& settingsPath) {
     auto* content = new QWidget; auto* outer = new QHBoxLayout(content); outer->setContentsMargins(24, 16, 24, 16);
     auto* column = new QWidget; column->setMaximumWidth(820); auto* layout = new QVBoxLayout(column); layout->setContentsMargins(0, 0, 0, 0); layout->setSpacing(16); outer->addWidget(column, 1); outer->addStretch(0);
-    QVBoxLayout* body; layout->addWidget(section(QStringLiteral("Après chaque sauvegarde"), body)); body->setSpacing(12);
+    QVBoxLayout* body;
+    // The colors of the application, shown at once in the whole window while they are chosen.
+    layout->addWidget(section(QStringLiteral("Thèmes"), body)); m_themeEditor = new ThemeEditor; body->addWidget(m_themeEditor);
+    connect(m_themeEditor, &ThemeEditor::changed, this, [this](const ThemeColors& colors) { m_config.theme = themeSettings(colors); applyColors(colors); emit themePreviewed(); changed(); });
+    connect(m_themeEditor, &ThemeEditor::notice, this, &SettingsPage::notice);
+    layout->addWidget(section(QStringLiteral("Après chaque sauvegarde"), body)); body->setSpacing(12);
     // A sound for each kind of saving, each with its level, heard as chosen: the game usually covers
     // it, so it is tried here first.
     const auto soundRow = [this, body](const QString& text, const QString& name, QCheckBox*& toggle, QWidget*& options, QComboBox*& choice, QSlider*& volume, QLabel*& percent) {
@@ -402,15 +458,25 @@ void SettingsPage::populateGames() {
     }
 }
 void SettingsPage::setUpdates(bool followed, const QString& version) { m_updateSection->setVisible(followed); m_version->setText(QStringLiteral("Version installée : %1").arg(version)); }
-void SettingsPage::showTab(int index) { if (index < 0 || index >= m_tabs->count()) return; m_tabs->setCurrentIndex(index); for (int tab = 0; tab < m_tabButtons.size(); ++tab) static_cast<QPushButton*>(m_tabButtons[tab])->setChecked(tab == index); }
+void SettingsPage::showTab(int index) {
+    if (index < 0 || index >= m_tabs->count()) return;
+    m_tabs->setCurrentIndex(index); for (int tab = 0; tab < m_tabButtons.size(); ++tab) static_cast<QPushButton*>(m_tabButtons[tab])->setChecked(tab == index);
+    // The applications that play sound change all the time: the audio tab shows those of the moment.
+    if (index == 1) refreshSources();
+}
 int SettingsPage::currentTab() const { return m_tabs->currentIndex(); }
 QKeySequence SettingsPage::hotkey() const { return m_hotkey->keySequence(); }
 bool SettingsPage::setFps(int fps) { const int index = m_fps->findData(fps); if (index < 0) return false; m_fps->setCurrentIndex(index); return true; }
 void SettingsPage::setFolder(const QString& path) { m_folder->setText(QDir::toNativeSeparators(path)); }
 void SettingsPage::setSaved(const AppConfig& saved) { m_saved = saved; refreshDirty(); }
+// While the replay or a recording runs, only what the capture uses waits for it: what is captured,
+// its quality, the buffer of the replay, the audio sources and tracks, and the profile itself. The
+// rest (shortcuts, folder, usual volumes, the whole General tab) applies at once, without restarting it.
 void SettingsPage::setLocked(bool locked) {
     if (locked == m_locked) return;
-    m_locked = locked; m_lock->setVisible(locked); m_tabs->setEnabled(!locked); m_profiles->setEnabled(!locked); m_duplicate->setEnabled(!locked); refreshDirty();
+    m_locked = locked; m_lock->setVisible(locked); m_profiles->setEnabled(!locked); m_duplicate->setEnabled(!locked);
+    for (auto* used : std::initializer_list<QWidget*>{m_targetSection, m_qualitySection, m_durationSlider, m_duration, m_storage, m_diskProposal, m_memoryField, m_diskBox, m_addSource, m_addLane}) used->setEnabled(!locked);
+    populateSources(); refreshDirty();
 }
 void SettingsPage::changed() {
     if (m_loading) return;
@@ -420,6 +486,7 @@ void SettingsPage::refreshCatalog() {
     m_catalog = SourceCatalog::discover(); populateVideoTargets();
     m_sourceNotes->setText(m_catalog.notes.isEmpty() ? QStringLiteral("Seules les applications qui jouent du son apparaissent dans la liste. Une application arrêtée sera enregistrée dès qu'elle émet du son.") : m_catalog.notes.join('\n'));
 }
+void SettingsPage::refreshSources() { if (m_loading) return; collect(); refreshCatalog(); populateSources(); }
 void SettingsPage::populateVideoTargets() {
     QSignalBlocker blocker(m_videoTarget); const auto& video = profile().video;
     m_videoTarget->clear(); m_videoTarget->addItem(QStringLiteral("Choisir un écran ou une fenêtre…"), QString());
@@ -452,11 +519,19 @@ void SettingsPage::load() {
     m_duration->setValue(p.replay.durationSeconds); m_durationSlider->setValue(p.replay.durationSeconds);
     int memoryIndex = m_memory->findData(p.replay.memoryLimitMiB);
     if (memoryIndex < 0) { memoryIndex = 0; while (memoryIndex < m_memory->count() && m_memory->itemData(memoryIndex).toInt() < p.replay.memoryLimitMiB) ++memoryIndex; m_memory->insertItem(memoryIndex, grouped(p.replay.memoryLimitMiB) + QStringLiteral(" Mio"), p.replay.memoryLimitMiB); }
-    m_memory->setCurrentIndex(memoryIndex); m_hotkey->setKeySequence(QKeySequence::fromString(p.replay.hotkey, QKeySequence::PortableText)); updateHotkey();
+    m_memory->setCurrentIndex(memoryIndex);
+    m_storage->setCurrentIndex(std::max(0, m_storage->findData(p.replay.storage)));
+    int diskIndex = m_diskLimit->findData(p.replay.diskLimitMiB);
+    if (diskIndex < 0) { diskIndex = 0; while (diskIndex < m_diskLimit->count() && m_diskLimit->itemData(diskIndex).toInt() < p.replay.diskLimitMiB) ++diskIndex; m_diskLimit->insertItem(diskIndex, QStringLiteral("%1 Gio").arg(QLocale(QLocale::French, QLocale::France).toString(p.replay.diskLimitMiB / 1024.0, 'g', 4)), p.replay.diskLimitMiB); }
+    m_diskLimit->setCurrentIndex(diskIndex); m_diskFolder->setText(QDir::toNativeSeparators(p.replay.diskFolder));
+    m_hotkey->setKeySequence(QKeySequence::fromString(p.replay.hotkey, QKeySequence::PortableText)); updateHotkey();
     setFolder(m_config.libraryPath); m_savedSound->setChecked(m_config.clipSavedSound); m_savedNotify->setChecked(m_config.clipSavedNotification); m_checkUpdates->setChecked(m_config.checkUpdates);
     m_sound->setCurrentIndex(std::max(0, m_sound->findData(m_config.clipSavedSoundId))); m_soundVolume->setValue(m_config.clipSavedSoundVolume); m_soundPercent->setText(QStringLiteral("%1 %").arg(m_config.clipSavedSoundVolume)); m_soundOptions->setEnabled(m_config.clipSavedSound);
     m_shotSound->setChecked(m_config.screenshotSound); m_shotSoundChoice->setCurrentIndex(std::max(0, m_shotSoundChoice->findData(m_config.screenshotSoundId))); m_shotVolume->setValue(m_config.screenshotSoundVolume); m_shotPercent->setText(QStringLiteral("%1 %").arg(m_config.screenshotSoundVolume)); m_shotSoundOptions->setEnabled(m_config.screenshotSound);
     m_shotKey->setKeySequence(QKeySequence::fromString(m_config.screenshotHotkey, QKeySequence::PortableText)); m_shotCaps->setSequence(m_shotKey->keySequence()); populateGameMixes();
+    m_recordKey->setKeySequence(QKeySequence::fromString(m_config.recordHotkey, QKeySequence::PortableText)); m_recordCaps->setSequence(m_recordKey->keySequence());
+    // Given back or loaded, the theme is shown again as it is written.
+    { const auto colors = themeFromSettings(m_config.theme); m_themeEditor->setTheme(colors); applyColors(colors); emit themePreviewed(); }
     m_closeToTray->setChecked(m_config.closeToTray); m_startMenu->setChecked(m_config.startMenuShortcut);
     m_loginStart->setChecked(m_config.launchAtLogin); m_autoReplay->setCurrentIndex(std::max(0, m_autoReplay->findData(m_config.autoReplay))); populateGames();
     populateSources(); m_loading = false; updateEstimate(); updateQuality(); refreshDirty();
@@ -472,11 +547,15 @@ void SettingsPage::collect() {
     p.video.rateControl = m_rateControl->currentData().toString(); p.video.quality = m_quality->currentData().toInt(); p.video.effort = m_effort->currentData().toString();
     p.gameName = m_gameName->text().trimmed(); p.detectGame = m_detectGame->isChecked();
     p.replay.durationSeconds = m_duration->value(); p.replay.memoryLimitMiB = m_memory->currentData().toInt(); p.replay.hotkey = m_hotkey->keySequence().toString(QKeySequence::PortableText);
+    p.replay.storage = m_storage->currentData().toString(); p.replay.diskLimitMiB = m_diskLimit->currentData().toInt(); p.replay.diskFolder = QDir::fromNativeSeparators(m_diskFolder->text().trimmed());
+    // Chosen once, the disk answers the proposal: it comes back if the memory is chosen again.
+    if (p.replay.storage == QLatin1String("disk")) p.replay.keepMemory = false;
     m_config.libraryPath = QDir::fromNativeSeparators(m_folder->text().trimmed());
     m_config.clipSavedSound = m_savedSound->isChecked(); m_config.clipSavedNotification = m_savedNotify->isChecked(); m_config.checkUpdates = m_checkUpdates->isChecked();
     m_config.clipSavedSoundId = m_sound->currentData().toString(); m_config.clipSavedSoundVolume = m_soundVolume->value();
     m_config.screenshotSound = m_shotSound->isChecked(); m_config.screenshotSoundId = m_shotSoundChoice->currentData().toString(); m_config.screenshotSoundVolume = m_shotVolume->value();
     m_config.screenshotHotkey = m_shotKey->keySequence().toString(QKeySequence::PortableText);
+    m_config.recordHotkey = m_recordKey->keySequence().toString(QKeySequence::PortableText);
     m_config.closeToTray = m_closeToTray->isChecked(); m_config.startMenuShortcut = m_startMenu->isChecked();
     m_config.launchAtLogin = m_loginStart->isChecked(); m_config.autoReplay = m_autoReplay->currentData().toString();
 }
@@ -490,11 +569,42 @@ void SettingsPage::updateQuality() {
 }
 void SettingsPage::updateEstimate() {
     if (m_loading) return;
-    const auto& p = profile(); const double estimated = estimatedBufferMiB(p); const int limit = p.replay.memoryLimitMiB; const bool over = estimated > limit;
-    m_estimateCalm->setVisible(!over); m_estimateWarn->setVisible(over);
+    const auto& p = profile(); const bool disk = p.replay.storage == QLatin1String("disk");
+    const double estimated = estimatedBufferMiB(p); const int limit = disk ? p.replay.diskLimitMiB : p.replay.memoryLimitMiB; const bool over = estimated > limit;
+    m_estimateCalm->setVisible(!over); m_estimateWarn->setVisible(over); m_memoryField->setVisible(!disk); m_diskBox->setVisible(disk);
     // A constant quality has no fixed weight: the page gives what it usually fills, from a calm
     // game to a busy one, and what its ceiling would fill at most.
     const bool constant = p.video.rateControl == "quality"; const auto usual = usualBufferMiB(p); const int low = qRound(usual.low), high = qRound(usual.high);
+    const QLocale french(QLocale::French, QLocale::France); const auto gib = [&french](double mib) { return french.toString(mib / 1024, 'f', 1) + QStringLiteral(" Gio"); };
+    // A buffer that would take a good share of the memory of the PC: the disk is proposed, once.
+    const qint64 installed = physicalMemoryBytes();
+    const bool propose = !disk && !p.replay.keepMemory && suggestsDiskBuffer(p, installed); m_diskProposal->setVisible(propose);
+    if (propose) {
+        m_diskProposalTitle->setText(QStringLiteral("Un replay de ≈ %1 en mémoire").arg(gib(usual.high)));
+        m_diskProposalText->setText(QStringLiteral("C'est %1 % de la mémoire de ce PC (%2). Gardé sur le disque, il laisse cette mémoire au jeu ; un SSD est conseillé.")
+            .arg(qRound(usual.high * 1048576.0 * 100 / double(installed))).arg(gib(installed / 1048576.0)));
+    }
+    if (disk) {
+        // The folder may not exist yet: the space is that of the drive that will hold it.
+        QString folder = replayDiskFolder(p.replay); while (!QDir(folder).exists() && QFileInfo(folder).absolutePath() != folder) folder = QFileInfo(folder).absolutePath();
+        const QStorageInfo volume(folder); QStringList notes;
+        if (volume.isValid()) {
+            notes << QStringLiteral("%1 libres sur ce disque.").arg(gib(volume.bytesAvailable() / 1048576.0));
+            if (volume.bytesAvailable() / 1048576.0 < std::min<double>(estimated, limit) + 256) notes << QStringLiteral("Pas assez de place pour ce replay : libérez-en ou choisissez un autre dossier.");
+        }
+        if (rotationalDrive(folder) == 1) notes << QStringLiteral("Ce dossier est sur un disque dur : un SSD est préférable.");
+        m_diskSpace->setText(notes.join(' ')); m_diskSpace->setVisible(!notes.isEmpty());
+        const auto amount = constant && low != high ? QStringLiteral("≈ %1 à %2").arg(french.toString(usual.low / 1024, 'f', 1), gib(usual.high)) : QStringLiteral("≈ %1").arg(gib(constant ? usual.high : estimated));
+        if (!over) {
+            m_estimateCalmText->setText(constant ? QStringLiteral("Espace estimé sur le disque : %1 selon le jeu, %2 au plus, sur un plafond de %3.").arg(amount, gib(estimated), gib(limit)) : QStringLiteral("Espace estimé sur le disque : %1 sur un plafond de %2.").arg(amount, gib(limit)));
+            m_estimateCalmBar->setValue((constant ? usual.high : estimated) / limit); return;
+        }
+        int next = 0; for (int index = 0; index < m_diskLimit->count(); ++index) if (!next && m_diskLimit->itemData(index).toInt() >= estimated) next = m_diskLimit->itemData(index).toInt();
+        m_estimateWarnTitle->setText(QStringLiteral("Espace estimé sur le disque : %1").arg(amount)); m_estimateWarnLimit->setText(QStringLiteral("plafond %1").arg(gib(limit)));
+        m_estimateWarnBar->setValue(1); m_estimateWarnBar->setMarker(limit / estimated);
+        m_estimateWarnText->setText(QStringLiteral("Au-delà du plafond, les secondes les plus anciennes sont perdues. Réduisez la durée ou le débit") + (next ? QStringLiteral(", ou montez le plafond à %1.").arg(gib(next)) : QStringLiteral(".")));
+        return;
+    }
     const auto amount = constant && low != high ? QStringLiteral("≈ %1 à %2 Mio").arg(grouped(low), grouped(high)) : QStringLiteral("≈ %1 Mio").arg(grouped(constant ? high : qRound(estimated)));
     if (!over) { m_estimateCalmText->setText(constant ? QStringLiteral("Mémoire estimée : %1 selon le jeu, %2 au plus, sur un plafond de %3.").arg(amount, grouped(qRound(estimated)), grouped(limit)) : QStringLiteral("Mémoire estimée : %1 sur un plafond de %2. Le GPU et le moteur en utilisent un peu plus.").arg(amount, grouped(limit))); m_estimateCalmBar->setValue((constant ? usual.high : estimated) / limit); return; }
     int next = 0; for (int index = 0; index < m_memory->count(); ++index) if (!next && m_memory->itemData(index).toInt() >= estimated) next = m_memory->itemData(index).toInt();
@@ -508,7 +618,7 @@ void SettingsPage::populateSources() {
     for (int track = 0; track < p.tracks.size(); ++track) {
         QList<int> rows; for (int row = 0; row < p.sources.size(); ++row) if (p.sources[row].trackId == p.tracks[track].id) rows.append(row);
         auto* lane = card(); lane->setObjectName(QStringLiteral("audio-lane-%1").arg(track)); auto* laneLayout = new QHBoxLayout(lane); laneLayout->setContentsMargins(1, 1, 1, 1); laneLayout->setSpacing(0);
-        auto* head = new QFrame; head->setObjectName("laneHead"); head->setFixedWidth(196); head->setStyleSheet(QStringLiteral("QFrame#laneHead { background: #111419; border: none; border-right: 1px solid #242A34; border-top-left-radius: 7px; border-bottom-left-radius: 7px; }"));
+        auto* head = new QFrame; head->setObjectName("laneHead"); head->setFixedWidth(196); head->setStyleSheet(QStringLiteral("QFrame#laneHead { background: %1; border: none; border-right: 1px solid %2; border-top-left-radius: 7px; border-bottom-left-radius: 7px; }").arg(tk::header.name(), tk::line.name()));
         auto* headLayout = new QVBoxLayout(head); headLayout->setContentsMargins(16, 12, 16, 12); headLayout->setSpacing(3); auto* number = caption(QStringLiteral("Piste %1").arg(track + 1)); headLayout->addWidget(number);
         auto* nameRow = new QHBoxLayout; nameRow->setSpacing(8); nameRow->addWidget(new Swatch(tk::track(track))); nameRow->addWidget(new ElideLabel(p.tracks[track].name, "h2"), 1); headLayout->addLayout(nameRow);
         headLayout->addWidget(label(rows.size() > 1 ? QStringLiteral("%1 sources mélangées").arg(rows.size()) : QStringLiteral("1 source"), "hint")); headLayout->addStretch();
@@ -531,13 +641,15 @@ void SettingsPage::populateSources() {
         auto* sources = new QVBoxLayout; sources->setContentsMargins(0, 0, 0, 0); sources->setSpacing(0);
         for (int position = 0; position < rows.size(); ++position) {
             const int row = rows[position]; const auto& source = p.sources[row];
-            if (position) { auto* line = separator(); line->setStyleSheet(QStringLiteral("background: #1E242C;")); sources->addWidget(line); }
+            if (position) { auto* line = separator(); line->setStyleSheet(QStringLiteral("background: %1;").arg(tk::lineSoft.name())); sources->addWidget(line); }
             QString state = QStringLiteral("À choisir"); Tag::Variant variant = Tag::Warn;
             if (source.kind == SourceKind::ApplicationMix) { state = QStringLiteral("Automatique"); variant = Tag::Ok; }
             else if (source.targetId == "@default") { const bool present = !m_catalog.audioTargets(source.kind).isEmpty(); state = present ? QStringLiteral("Par défaut") : QStringLiteral("Périphérique absent"); variant = present ? Tag::Info : Tag::Err; }
             else if (!source.targetId.isEmpty()) {
-                bool available = false;
-                for (const auto& target : m_catalog.audioTargets(source.kind)) if (QDir::toNativeSeparators(target.id).compare(QDir::toNativeSeparators(source.targetId), Qt::CaseInsensitive) == 0) available = true;
+                // An application is available while it is open, even silent.
+                bool available = source.kind == SourceKind::Application && !m_catalog.runningApplication(source.targetId).id.isEmpty();
+                for (const auto& target : m_catalog.audioTargets(source.kind))
+                    if (source.kind != SourceKind::Application && QDir::toNativeSeparators(target.id).compare(QDir::toNativeSeparators(source.targetId), Qt::CaseInsensitive) == 0) available = true;
                 state = available ? QStringLiteral("Disponible") : source.kind == SourceKind::Application ? QStringLiteral("Application arrêtée") : QStringLiteral("Périphérique absent");
                 variant = available ? Tag::Ok : source.kind == SourceKind::Application ? Tag::Warn : Tag::Err;
             }
@@ -546,9 +658,10 @@ void SettingsPage::populateSources() {
                 const auto exclusions = applicationExclusions(source, p); QStringList names; for (const auto& path : exclusions) names.append(QFileInfo(path).fileName());
                 target = exclusions.isEmpty() ? QStringLiteral("Toutes les applications") : QStringLiteral("Toutes les applications sauf %1 : %2").arg(exclusions.size()).arg(names.join(QStringLiteral(", ")));
             } else if (source.targetId == "@default" && source.kind == SourceKind::Microphone) target = QStringLiteral("Microphone par défaut · suit le système");
-            auto* line = new QWidget; line->setFixedHeight(54); auto* lineLayout = new QHBoxLayout(line); lineLayout->setContentsMargins(14, 0, 12, 0); lineLayout->setSpacing(12);
+            // During a capture, the sources wait for it: the row is shown, not changed.
+            auto* line = new QWidget; line->setFixedHeight(54); line->setEnabled(!m_locked); auto* lineLayout = new QHBoxLayout(line); lineLayout->setContentsMargins(14, 0, 12, 0); lineLayout->setSpacing(12);
             lineLayout->addWidget(new IconBox(sourceIcon(source.kind)));
-            auto* texts = new QVBoxLayout; texts->setSpacing(0); texts->addStretch(); auto* name = new ElideLabel(source.name, "strong"); if (!source.enabled) name->setStyleSheet(QStringLiteral("color: #7C8696; font-weight: 600;"));
+            auto* texts = new QVBoxLayout; texts->setSpacing(0); texts->addStretch(); auto* name = new ElideLabel(source.name, "strong"); if (!source.enabled) name->setStyleSheet(QStringLiteral("color: %1; font-weight: 600;").arg(tk::muted.name()));
             texts->addWidget(name); texts->addWidget(new ElideLabel(target, "small")); texts->addStretch(); lineLayout->addLayout(texts, 1);
             auto* tagHost = new QWidget; tagHost->setFixedWidth(150); auto* tagLayout = new QHBoxLayout(tagHost); tagLayout->setContentsMargins(0, 0, 0, 0); tagLayout->addWidget(new Tag(state, variant), 0, Qt::AlignCenter); lineLayout->addWidget(tagHost);
             auto* enabled = new Toggle; enabled->setObjectName(QStringLiteral("source-enabled-%1").arg(row)); enabled->setChecked(source.enabled); enabled->setToolTip(QStringLiteral("Inclure %1 dans les clips").arg(source.name)); enabled->setAccessibleName(enabled->toolTip()); lineLayout->addWidget(enabled);
@@ -563,9 +676,10 @@ void SettingsPage::populateSources() {
     }
 }
 void SettingsPage::editSource(int index) {
-    collect(); const auto& p = profile();
+    // The list offered is that of the moment, not the one read when Clipsapp started.
+    collect(); refreshCatalog(); const auto& p = profile();
     SourceDialog dialog(m_catalog, p, index >= 0 ? &p.sources[index] : nullptr, this);
-    if (dialog.exec() != QDialog::Accepted) return;
+    if (dialog.exec() != QDialog::Accepted) { populateSources(); return; }
     const auto track = dialog.newTrack(); if (!track.id.isEmpty()) profile().tracks.append(track);
     if (index < 0) profile().sources.append(dialog.source()); else profile().sources[index] = dialog.source();
     pruneTracks(); populateSources(); changed();
@@ -593,7 +707,9 @@ void SettingsPage::refreshDirty() {
         const bool size = p.video.width != saved->video.width || p.video.height != saved->video.height;
         for (const bool differs : {size, p.video.fps != saved->video.fps, p.video.codec != saved->video.codec, p.video.encoder != saved->video.encoder, p.video.bitrateMbps != saved->video.bitrateMbps, p.video.rateControl != saved->video.rateControl, p.video.quality != saved->video.quality, p.video.effort != saved->video.effort, p.video.captureCursor != saved->video.captureCursor}) { quality |= differs; note(differs, QStringLiteral("qualité")); }
         note(p.replay.durationSeconds != saved->replay.durationSeconds, QStringLiteral("durée du replay")); note(p.replay.memoryLimitMiB != saved->replay.memoryLimitMiB, QStringLiteral("plafond de mémoire")); note(p.replay.hotkey != saved->replay.hotkey, QStringLiteral("raccourci"));
-        replay = p.replay.durationSeconds != saved->replay.durationSeconds || p.replay.memoryLimitMiB != saved->replay.memoryLimitMiB || p.replay.hotkey != saved->replay.hotkey;
+        const bool buffer = p.replay.storage != saved->replay.storage || p.replay.diskLimitMiB != saved->replay.diskLimitMiB || p.replay.diskFolder != saved->replay.diskFolder || p.replay.keepMemory != saved->replay.keepMemory;
+        note(buffer, QStringLiteral("buffer du replay"));
+        replay = buffer || p.replay.durationSeconds != saved->replay.durationSeconds || p.replay.memoryLimitMiB != saved->replay.memoryLimitMiB || p.replay.hotkey != saved->replay.hotkey;
         auto current = p, before = *saved; current.video = before.video; current.replay = before.replay; current.gameName = before.gameName; current.detectGame = before.detectGame;
         note(json(current) != json(before), QStringLiteral("audio"));
     }
@@ -603,6 +719,8 @@ void SettingsPage::refreshDirty() {
     note(m_config.clipSavedSoundId != m_saved.clipSavedSoundId || m_config.clipSavedSoundVolume != m_saved.clipSavedSoundVolume, QStringLiteral("son de sauvegarde"));
     note(m_config.screenshotSound != m_saved.screenshotSound || m_config.screenshotSoundId != m_saved.screenshotSoundId || m_config.screenshotSoundVolume != m_saved.screenshotSoundVolume, QStringLiteral("son des screenshots"));
     note(m_config.screenshotHotkey != m_saved.screenshotHotkey, QStringLiteral("raccourci des screenshots"));
+    note(m_config.recordHotkey != m_saved.recordHotkey, QStringLiteral("raccourci de l'enregistrement"));
+    note(m_config.theme != m_saved.theme, QStringLiteral("thème"));
     note(m_config.gameMixes != m_saved.gameMixes, QStringLiteral("volumes par jeu"));
     note(m_config.checkUpdates != m_saved.checkUpdates, QStringLiteral("mises à jour"));
     note(!sameMix(m_config.defaultMix, m_saved.defaultMix), QStringLiteral("volumes habituels"));
@@ -611,6 +729,6 @@ void SettingsPage::refreshDirty() {
     if (!count && m_config.toJson() != m_saved.toJson()) { count = 1; groups.append(QStringLiteral("réglages")); }
     m_captureTag->setVisible(capture); m_qualityTag->setVisible(quality); m_replayTag->setVisible(replay);
     m_dirtyTitle->setText(count > 1 ? QStringLiteral("%1 modifications non enregistrées").arg(count) : QStringLiteral("1 modification non enregistrée"));
-    static_cast<ElideLabel*>(m_dirtyDetail)->setFullText(QStringLiteral("· ") + groups.join(QStringLiteral(", "))); m_saveBar->setVisible(count > 0 && !m_locked);
+    static_cast<ElideLabel*>(m_dirtyDetail)->setFullText(QStringLiteral("· ") + groups.join(QStringLiteral(", "))); m_saveBar->setVisible(count > 0);
 }
 }

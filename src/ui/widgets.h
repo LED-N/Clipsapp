@@ -144,13 +144,14 @@ class Bar : public QWidget {
 public:
     explicit Bar(QWidget* parent = nullptr, int height = 6);
     void setValue(double value);
-    void setColors(const QColor& fill, const QColor& track = tk::selected) { m_fill = fill; m_track = track; update(); }
+    // An invalid color is the theme's, read when the bar is painted: the accent (or its gradient) and its track.
+    void setColors(const QColor& fill, const QColor& track = QColor()) { m_fill = fill; m_track = track; update(); }
     void setMarker(double position) { m_marker = position; update(); }
     double value() const { return m_value; }
 protected:
     void paintEvent(QPaintEvent*) override;
 private:
-    double m_value = 0, m_marker = -1; QColor m_fill = tk::accent, m_track = tk::selected;
+    double m_value = 0, m_marker = -1; QColor m_fill, m_track;
 };
 
 class Keycaps : public QWidget {
@@ -255,6 +256,8 @@ public:
     void setHeadingTexts(const QString& title, const QString& subtitle);
     // Fits the panel to its content again and keeps it centred on its window.
     void refit();
+    // Without the scrim, at the top right of its window: what it changes stays in sight behind it.
+    void setAside() { m_aside = true; }
     QVBoxLayout* headerLayout() const { return m_header; }
     QVBoxLayout* body() const { return m_body; }
     QHBoxLayout* footer() const { return m_footer; }
@@ -265,7 +268,7 @@ protected:
     void hideEvent(QHideEvent* event) override;
 private:
     QVBoxLayout* m_header; QVBoxLayout* m_body; QHBoxLayout* m_footer; QHBoxLayout* m_footerLeft; QHBoxLayout* m_headingRow;
-    QLabel* m_title = nullptr; QLabel* m_subtitle = nullptr; QPointer<QWidget> m_scrim;
+    QLabel* m_title = nullptr; QLabel* m_subtitle = nullptr; QPointer<QWidget> m_scrim; bool m_aside = false;
 };
 
 // One question, one field. Returns false when the user backs out.

@@ -1,17 +1,23 @@
 #include "audio_routing.h"
 #include <QHash>
+#include <QRegularExpression>
 #include <QSet>
 #include <algorithm>
 namespace clipsapp {
-namespace { QString identity(QString path) { return path.replace('\\', '/').toCaseFolded(); } }
+QString applicationIdentity(const QString& executable) {
+    static const QRegularExpression version(QStringLiteral("\\d+(?:\\.\\d+)+"));
+    auto parts = QString(executable).replace('\\', '/').toCaseFolded().split('/');
+    for (int index = 0; index + 1 < parts.size(); ++index) parts[index].replace(version, QStringLiteral("#"));
+    return parts.join('/');
+}
 QList<quint32> includedAudioRoots(const QList<AudioProcess>& processes, const QList<quint32>& sessions,
                                 const QStringList& exclusions, quint32 ownPid) {
     QHash<quint32, AudioProcess> graph; QSet<QString> paths;
-    for (const auto& path : exclusions) paths.insert(identity(path));
+    for (const auto& path : exclusions) paths.insert(applicationIdentity(path));
     QSet<quint32> blocked, hasBlockedChild;
     for (const auto& process : processes) {
         graph.insert(process.pid, process);
-        if (process.pid == ownPid || paths.contains(identity(process.executable))) blocked.insert(process.pid);
+        if (process.pid == ownPid || paths.contains(applicationIdentity(process.executable))) blocked.insert(process.pid);
     }
     auto ancestors = [&](quint32 pid) {
         QList<quint32> result; QSet<quint32> seen;

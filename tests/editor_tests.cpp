@@ -38,6 +38,7 @@
 #include "ui/theme.h"
 #include "ui/thumbnail_cache.h"
 #include "ui/clip_list.h"
+#include "platform/system_info.h"
 #include "ui/library_page.h"
 #include "ui/discord_batch.h"
 #include "ui/discord_dialog.h"
@@ -56,6 +57,9 @@
 #include "ui/image_markup.h"
 #include "platform/windows_video.h"
 #include <QKeySequenceEdit>
+#include <QClipboard>
+#include <QThreadPool>
+#include <QColorDialog>
 #include <QStackedWidget>
 #include <QtEndian>
 #include <QToolTip>
@@ -571,6 +575,9 @@ private slots:
             QVERIFY(window.findChild<QPushButton*>("empty-start-replay")->isVisible()); QVERIFY(window.grab().save(previewPath("library-empty.png"))); window.close();
         }
         MainWindow window(configPath); window.setAttribute(Qt::WA_DontShowOnScreen); window.show(); QVERIFY(!window.findChild<QWidget*>("onboarding")->isVisible());
+        // The recording has its button beside the replay, and its own shortcut in the settings.
+        auto* record = window.findChild<QPushButton*>("record-toggle"); QVERIFY(record); QVERIFY(record->isVisible()); QVERIFY(record->isEnabled()); QCOMPARE(record->text(), QStringLiteral("Enregistrer"));
+        QCOMPARE(window.findChild<QKeySequenceEdit*>("record-hotkey")->keySequence(), QKeySequence::fromString("Ctrl+Alt+F9", QKeySequence::PortableText));
         window.setPage(MainWindow::Settings); auto* fps = window.findChild<QComboBox*>("fps"); auto* saveBar = window.findChild<QWidget*>("savebar"); QVERIFY(fps); QVERIFY(saveBar);
         QCOMPARE(fps->currentData().toInt(), 60); QVERIFY(saveBar->isHidden()); QVERIFY(window.findChild<QPushButton*>("quality-1")->isChecked());
         window.findChild<QPushButton*>("quality-0")->click(); QCOMPARE(fps->currentData().toInt(), 30); QVERIFY(window.findChild<QPushButton*>("quality-0")->isChecked()); QVERIFY(!window.findChild<QPushButton*>("quality-1")->isChecked());
@@ -614,7 +621,148 @@ private slots:
         QCOMPARE(stored.activeProfile()->video.bitrateMbps, 200); QCOMPARE(stored.activeProfile()->video.effort, QString("thorough"));
         // Back on a target bitrate, the level leaves the page and the preset is recognised again.
         mode->setCurrentIndex(0); window.findChild<QSpinBox*>("bitrate")->setValue(50); QVERIFY(level->isHidden()); QVERIFY(window.findChild<QPushButton*>("quality-2")->isChecked());
+        // Ten minutes at 300 Mbit/s weigh on the memory of a PC: past a share of it, the disk is proposed, and can be declined.
+        window.findChild<QSpinBox*>("replay-duration")->setValue(600); window.findChild<QSpinBox*>("bitrate")->setValue(300);
+        auto expected = AppConfig::defaults().profiles.first(); expected.video.width = 2560; expected.video.height = 1440; expected.video.bitrateMbps = 300; expected.replay.durationSeconds = 600;
+        auto* proposal = window.findChild<QWidget*>("disk-proposal"); QVERIFY(proposal); QCOMPARE(proposal->isVisible(), suggestsDiskBuffer(expected, physicalMemoryBytes()));
+        if (proposal->isVisible()) {
+            for (auto* area : window.findChildren<QScrollArea*>()) if (area->isVisible() && area->widget()->isAncestorOf(proposal)) area->ensureWidgetVisible(proposal);
+            QTest::qWait(50); QVERIFY(window.grab().save(previewPath("settings-disk-proposal.png")));
+            window.findChild<QPushButton*>("keep-memory-buffer")->click(); QVERIFY(!proposal->isVisible());
+        }
+        window.findChild<QSpinBox*>("bitrate")->setValue(50);
+        // On the disk, the buffer has its own ceiling and folder, beside Clipsapp unless another is chosen; the memory ceiling leaves.
+        auto* storage = window.findChild<QComboBox*>("replay-storage"); auto* diskBox = window.findChild<QWidget*>("disk-buffer"); QVERIFY(storage); QVERIFY(diskBox);
+        QVERIFY(!diskBox->isVisible()); QVERIFY(memory->isVisible());
+        storage->setCurrentIndex(storage->findData("disk")); QVERIFY(diskBox->isVisible()); QVERIFY(!memory->isVisible()); QVERIFY(!proposal->isVisible());
+        QVERIFY(window.findChild<QLineEdit*>("replay-disk-folder")->placeholderText().endsWith(QStringLiteral("Buffer du replay")));
+        QVERIFY2(window.findChild<QLabel*>("disk-space")->text().contains(QStringLiteral("libres")), qPrintable(window.findChild<QLabel*>("disk-space")->text()));
+        QVERIFY2(estimate->text().startsWith(QStringLiteral("Espace estimé sur le disque")), qPrintable(estimate->text()));
+        for (auto* area : window.findChildren<QScrollArea*>()) if (area->isVisible() && area->widget()->isAncestorOf(diskBox)) area->ensureWidgetVisible(diskBox);
+        QTest::qWait(50); QVERIFY(window.grab().save(previewPath("settings-disk.png")));
         window.findChild<QPushButton*>("settings-revert")->click(); QVERIFY(saveBar->isHidden()); window.close();
+    }
+    void eachThemeColorsTheWholeWindowWhileItIsOpen() {
+        QTemporaryDir directory; const auto library = directory.filePath("clips");
+        for (const auto& game : {QStringLiteral("ARC Raiders"), QStringLiteral("FC 27")}) { QVERIFY(QDir().mkpath(library + '/' + game)); for (int index = 0; index < 3; ++index) QVERIFY(QFile::copy(m_source, QStringLiteral("%1/%2/%2-clip-%3.mp4").arg(library, game).arg(index))); }
+        { auto config = AppConfig::defaults(); config.libraryPath = library; QString error; QVERIFY(ConfigStore(directory.filePath("config")).save(config, error)); }
+        MainWindow window(directory.filePath("config")); window.setAttribute(Qt::WA_DontShowOnScreen); window.show();
+        auto* list = window.findChild<ClipListView*>("clip-library"); QTRY_COMPARE_WITH_TIMEOUT(clipPaths(list).size(), 6, 8000); QTest::qWait(400);
+        ReplayView view; view.state = ReplayView::Running; view.seconds = 60; view.capacity = 60; view.bytes = 27 << 20; view.canSave = true; view.hotkey = "Alt+F10"; view.recordHotkey = "Ctrl+Alt+F9"; view.liveSummary = QStringLiteral("ARC Raiders détecté · 1440p 60 FPS · h264_nvenc");
+        for (const auto& preset : themePresets()) {
+            applyColors(preset.colors); window.findChild<ReplayStrip*>()->apply(view);
+            window.setPage(MainWindow::Library); QTest::qWait(150); QVERIFY(window.grab().save(previewPath(QStringLiteral("theme-%1-library.png").arg(preset.id))));
+            window.setPage(MainWindow::Settings); QTest::qWait(150); QVERIFY(window.grab().save(previewPath(QStringLiteral("theme-%1-settings.png").arg(preset.id))));
+        }
+        applyColors(ThemeColors{}); window.close();
+        // The thumbnails and analyses of its clips end here, rather than during the next test.
+        QThreadPool::globalInstance()->waitForDone(15000);
+    }
+    void aThemeIsChosenTriedSharedAndKept() {
+        QTemporaryDir directory; const auto configPath = directory.filePath("config");
+        { auto config = AppConfig::defaults(); config.libraryPath = directory.filePath("clips"); QString error; QVERIFY(ConfigStore(configPath).save(config, error)); }
+        MainWindow window(configPath); window.setAttribute(Qt::WA_DontShowOnScreen); window.show(); QCOMPARE(tk::accent, ThemeColors{}.accent);
+        window.setPage(MainWindow::Settings); window.findChild<QPushButton*>("settings-tab-2")->click();
+        const auto violet = themePresets().at(1); QCOMPARE(violet.id, QStringLiteral("violet"));
+        // A theme picked shows at once in the whole window, as a change to save.
+        window.findChild<QPushButton*>("theme-preset-violet")->click(); QCOMPARE(tk::accent, violet.colors.accent); QVERIFY(tk::windowGradient);
+        QVERIFY(window.findChild<QPushButton*>("theme-preset-violet")->isChecked()); QVERIFY(window.findChild<QLabel*>("settings-dirty")->isVisible());
+        for (auto* area : window.findChildren<QScrollArea*>()) if (area->isVisible() && area->widget()->isAncestorOf(window.findChild<QWidget*>("theme-editor"))) area->ensureWidgetVisible(window.findChild<QWidget*>("theme-editor"), 0, 0);
+        QTest::qWait(100); QVERIFY(window.grab().save(previewPath("settings-appearance-violet.png")));
+        // In the picker, each color tried is the theme's at once; cancelled, the one before comes back.
+        bool tried = false;
+        QTimer::singleShot(300, &window, [&] {
+            auto* picker = window.findChild<QDialog*>("color-picker"); if (!picker) return;
+            auto* code = picker->findChild<QLineEdit*>("color-code"); code->selectAll(); QTest::keyClicks(code, QStringLiteral("#FF5A36"));
+            tried = tk::accent == QColor(0xFF, 0x5A, 0x36); QTest::qWait(50); picker->grab().save(previewPath("theme-color-picker.png")); window.grab().save(previewPath("theme-color-trying.png")); picker->reject();
+        });
+        window.findChild<QPushButton*>("theme-accent")->click(); QVERIFY(tried); QCOMPARE(tk::accent, violet.colors.accent);
+        // Copied, it is one line; given back, the default theme returns; pasted, even inside a message, it comes back whole.
+        window.findChild<QPushButton*>("theme-copy")->click(); const auto code = QApplication::clipboard()->text(); QVERIFY(code.startsWith(QStringLiteral("clipsapp-theme-")));
+        window.findChild<QPushButton*>("theme-reset")->click(); QCOMPARE(tk::accent, ThemeColors{}.accent);
+        QApplication::clipboard()->setText(QStringLiteral("Essaie mon thème : %1 !").arg(code)); window.findChild<QPushButton*>("theme-paste")->click(); QCOMPARE(tk::accent, violet.colors.accent);
+        QApplication::clipboard()->setText(QStringLiteral("rien")); window.findChild<QPushButton*>("theme-paste")->click(); QCOMPARE(tk::accent, violet.colors.accent);
+        // Saved, it is in the settings, and its icon is written for the Start menu.
+        window.findChild<QPushButton*>("settings-save")->click();
+        AppConfig stored; QString error; QVERIFY(ConfigStore(configPath).load(stored, error)); QCOMPARE(themeFromSettings(stored.theme), violet.colors);
+        const auto icons = QDir(configPath).entryList({QStringLiteral("Clipsapp-*.ico")}, QDir::Files); QCOMPARE(icons.size(), 1);
+        QVERIFY(QIcon(QDir(configPath).filePath(icons.first())).availableSizes().contains(QSize(256, 256)));
+        // Tried and given back, the saved theme returns.
+        window.findChild<QPushButton*>("theme-preset-amber")->click(); QCOMPARE(tk::accent, themePresets().at(3).colors.accent);
+        window.findChild<QPushButton*>("settings-revert")->click(); QCOMPARE(tk::accent, violet.colors.accent);
+        // Back to the default theme, the program's own icon serves again.
+        window.findChild<QPushButton*>("theme-reset")->click(); window.findChild<QPushButton*>("settings-save")->click();
+        QVERIFY(QDir(configPath).entryList({QStringLiteral("Clipsapp-*.ico")}, QDir::Files).isEmpty()); QCOMPARE(tk::accent, ThemeColors{}.accent);
+        window.close(); QThreadPool::globalInstance()->waitForDone(15000);
+    }
+    void duringACaptureOnlyWhatItUsesWaits() {
+        QTemporaryDir directory; const auto configPath = directory.filePath("config");
+        { auto config = AppConfig::defaults(); config.libraryPath = directory.filePath("clips"); QString error; QVERIFY(ConfigStore(configPath).save(config, error)); }
+        MainWindow window(configPath); window.setAttribute(Qt::WA_DontShowOnScreen); window.show(); window.setPage(MainWindow::Settings);
+        auto* settings = window.findChild<SettingsPage*>(); QVERIFY(settings); settings->setLocked(true);
+        // The audio rows are drawn again; those they replace go with the next event.
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        const auto enabled = [&window](const char* name) { auto* widget = window.findChild<QWidget*>(name); return widget && widget->isEnabled(); };
+        // What the capture uses waits: what is captured, its quality, the replay's buffer, the sources, the profile.
+        for (const char* name : {"video-target", "quality-0", "replay-duration", "replay-storage", "replay-memory", "add-source", "source-edit-0"}) QVERIFY2(!enabled(name), name);
+        QVERIFY(!window.findChild<QComboBox*>("profile-choice") || !window.findChild<QComboBox*>("profile-choice")->isEnabled());
+        // The rest applies at once: shortcuts, folder, usual volumes, themes and the whole General tab.
+        for (const char* name : {"record-hotkey-change", "screenshot-hotkey-change", "libraryPath", "track-mix-0", "theme-preset-violet", "clip-saved-sound", "settings-tab-0", "settings-tab-1", "settings-tab-2"}) QVERIFY2(enabled(name), name);
+        QVERIFY(window.findChild<QWidget*>("settings-locked")->isVisible());
+        window.findChild<QPushButton*>("settings-tab-0")->click(); QTest::qWait(100); QVERIFY(window.grab().save(previewPath("settings-locked-capture.png")));
+        window.findChild<QPushButton*>("settings-tab-1")->click(); QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete); QTest::qWait(100); QVERIFY(window.grab().save(previewPath("settings-locked-audio.png")));
+        // Changed and saved during the capture, without stopping it.
+        window.findChild<QPushButton*>("settings-tab-2")->click(); window.findChild<QPushButton*>("theme-preset-violet")->click();
+        QVERIFY(window.findChild<QWidget*>("savebar")->isVisible()); window.findChild<QPushButton*>("settings-save")->click();
+        AppConfig stored; QString error; QVERIFY(ConfigStore(configPath).load(stored, error)); QCOMPARE(themeFromSettings(stored.theme), themePresets().at(1).colors);
+        settings->setLocked(false); QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete); for (const char* name : {"video-target", "replay-duration", "add-source", "source-edit-0"}) QVERIFY2(enabled(name), name);
+        window.findChild<QPushButton*>("theme-reset")->click(); window.findChild<QPushButton*>("settings-save")->click(); window.close();
+    }
+    void aThemeTravelsAsOneLineAndStaysDark() {
+        auto colors = themePresets().at(1).colors; ThemeColors read;
+        QVERIFY(readThemeCode(themeCode(colors), read)); QCOMPARE(read, colors);
+        QVERIFY(readThemeCode(QStringLiteral("> CLIPSAPP-THEME-0f0b17-a98bff-eeeaf7-0-0-90"), read)); QVERIFY(!read.windowGradient); QVERIFY(!read.accentGradient); QCOMPARE(read.angle, 90);
+        QVERIFY(!readThemeCode(QStringLiteral("clipsapp-theme-zzzzzz"), read));
+        // A light background is darkened, a dark text lightened: the themes stay dark for now.
+        colors.background = QColor(Qt::white); colors.text = QColor(Qt::black); const auto dark = darkTheme(colors);
+        QVERIFY(dark.background.lightnessF() <= 0.221); QVERIFY(dark.text.lightnessF() >= 0.719);
+        QCOMPARE(themeFromSettings(themeSettings(ThemeColors{})), ThemeColors{}); QVERIFY(themeSettings(ThemeColors{}).background.isEmpty());
+    }
+    void theStripShowsTheReplayAndTheRecordingEachInItsOwnBox() {
+        ReplayStrip strip; strip.resize(1400, 60); strip.setAttribute(Qt::WA_DontShowOnScreen); strip.show();
+        auto* replayBox = strip.findChild<QWidget*>("replay-status"); auto* recordBox = strip.findChild<QWidget*>("record-status");
+        auto* record = strip.findChild<QPushButton*>("record-toggle"); auto* primary = strip.findChild<QPushButton*>("replay-primary"); auto* secondary = strip.findChild<QPushButton*>("replay-secondary");
+        ReplayView view; view.hotkey = "Alt+F10"; view.recordHotkey = "Ctrl+Alt+F9"; view.capacity = 60; view.liveSummary = QStringLiteral("1440p 60 FPS · h264_nvenc"); view.profileSummary = QStringLiteral("Profil Principal · Écran 1");
+        const auto shot = [&](const QString& name) { QApplication::processEvents(); QVERIFY(strip.grab().save(previewPath(name))); };
+        // Nothing runs: the replay's box says so; one button records, the other starts the replay.
+        strip.apply(view); QVERIFY(replayBox->isVisible()); QVERIFY(!recordBox->isVisible()); QCOMPARE(record->text(), QStringLiteral("Enregistrer")); QCOMPARE(primary->text(), QStringLiteral("Démarrer le replay")); QVERIFY(!secondary->isVisible()); shot("strip-idle.png");
+        // The replay alone, in green: save and stop it.
+        view.state = ReplayView::Running; view.seconds = 60; view.bytes = 27 << 20; view.canSave = true; strip.apply(view);
+        QVERIFY(replayBox->isVisible()); QVERIFY(!recordBox->isVisible()); QCOMPARE(primary->text(), QStringLiteral("Sauvegarder le clip")); QVERIFY(secondary->isVisible()); QCOMPARE(secondary->text(), QStringLiteral("Arrêter replay")); shot("strip-replay.png");
+        // The recording alone, in red: no replay bar, the replay can be started, nothing stops a replay that does not run.
+        view.replay = false; view.recording = true; view.recordingSeconds = 79; view.recordingBytes = 31 << 20; view.seconds = 0; view.canSave = false; strip.apply(view);
+        QVERIFY(!replayBox->isVisible()); QVERIFY(recordBox->isVisible()); QCOMPARE(record->text(), QStringLiteral("Arrêter l'enregistrement")); QCOMPARE(primary->text(), QStringLiteral("Démarrer le replay")); QVERIFY(!secondary->isVisible()); shot("strip-recording.png");
+        // Both: two boxes side by side, each with its own buttons.
+        view.replay = true; view.seconds = 60; view.canSave = true; strip.apply(view);
+        QVERIFY(replayBox->isVisible()); QVERIFY(recordBox->isVisible()); QCOMPARE(primary->text(), QStringLiteral("Sauvegarder le clip")); QVERIFY(secondary->isVisible()); QCOMPARE(secondary->text(), QStringLiteral("Arrêter replay"));
+        // At any width, refreshed again and again as the replay does twice a second, it keeps one look,
+        // and that look fits: it never hesitates between the full one and the compact one.
+        for (const auto& shown : {std::pair{true, false}, std::pair{true, true}}) {
+            auto steady = view; steady.replay = shown.first; steady.recording = shown.second; steady.seconds = 60; steady.bytes = 220 << 20; steady.liveSummary = QStringLiteral("EA SPORTS FC™ 27 détecté · 1440p 60 FPS · h264_nvenc");
+            for (int width = 980; width <= 1400; width += 20) {
+                strip.apply(steady); QApplication::processEvents(); strip.resize(width, 60); QApplication::processEvents();
+                const auto first = secondary->text(); strip.apply(steady); QApplication::processEvents(); strip.apply(steady); QApplication::processEvents();
+                QVERIFY2(secondary->text() == first, qPrintable(QStringLiteral("%1 px : %2 puis %3").arg(width).arg(first, secondary->text())));
+                for (auto* layout : strip.findChildren<QLayout*>()) layout->invalidate(); strip.layout()->invalidate();
+                QVERIFY2(strip.layout()->minimumSize().width() <= width, qPrintable(QStringLiteral("%1 px, replay %2, enregistrement %3, %4 : %5 nécessaires").arg(width).arg(shown.first).arg(shown.second).arg(secondary->text()).arg(strip.layout()->minimumSize().width())));
+            }
+        }
+        // Both fit the window at its usual width and at its narrowest, beside the brand.
+        for (const int width : {1220, 980}) {
+            strip.resize(width, 60); QApplication::processEvents(); strip.apply(view); QApplication::processEvents(); strip.resize(width, 60); QApplication::processEvents();
+            QVERIFY2(strip.layout()->minimumSize().width() <= width, qPrintable(QStringLiteral("%1 > %2").arg(strip.layout()->minimumSize().width()).arg(width)));
+            QCOMPARE(strip.width(), width); shot(QStringLiteral("strip-both-%1.png").arg(width));
+        }
     }
     void closingTheWindowLeavesTheApplicationBehindItsIconUntilQuit() {
         QTemporaryDir directory; const auto configPath = directory.filePath("config"); QString error;
@@ -629,7 +777,7 @@ private slots:
         window.setPage(MainWindow::Settings); window.findChild<QPushButton*>("settings-tab-2")->click();
         auto* sound = window.findChild<QCheckBox*>("clip-saved-sound"); sound->setChecked(!sound->isChecked()); window.findChild<QPushButton*>("settings-save")->click(); QVERIFY(tray->isVisible());
         QStringList entries; for (const auto* action : menu->actions()) if (!action->isSeparator()) entries.append(action->text());
-        QCOMPARE(entries, QStringList({QStringLiteral("Ouvrir Clipsapp"), QStringLiteral("Sauvegarder le clip"), QStringLiteral("Prendre un screenshot"), QStringLiteral("Démarrer le replay"), QStringLiteral("Quitter Clipsapp")}));
+        QCOMPARE(entries, QStringList({QStringLiteral("Ouvrir Clipsapp"), QStringLiteral("Sauvegarder le clip"), QStringLiteral("Prendre un screenshot"), QStringLiteral("Démarrer un enregistrement"), QStringLiteral("Démarrer le replay"), QStringLiteral("Quitter Clipsapp")}));
         QVERIFY(!menu->actions().at(2)->isEnabled());
         // Closing hides the window and ends nothing; unsaved settings are not asked about, they are still there.
         sound->setChecked(!sound->isChecked()); QVERIFY(!window.close()); QVERIFY(window.isHidden()); QVERIFY(tray->isVisible());
@@ -842,7 +990,7 @@ private slots:
         auto* idle = add(view); QCOMPARE(primary(idle)->text(), QStringLiteral("Démarrer le replay")); QVERIFY(primary(idle)->isEnabled()); QVERIFY(secondary(idle)->isHidden());
         view.state = ReplayView::Starting; auto* starting = add(view); QCOMPARE(primary(starting)->text(), QStringLiteral("Sauvegarder le clip")); QVERIFY(!primary(starting)->isEnabled()); QCOMPARE(secondary(starting)->text(), QStringLiteral("Annuler"));
         view.state = ReplayView::Running; view.canSave = true; view.seconds = 42.2; view.bytes = 137888563; auto* filling = add(view);
-        QVERIFY(primary(filling)->isEnabled()); QCOMPARE(secondary(filling)->text(), QStringLiteral("Arrêter")); QCOMPARE(filling->findChild<QLabel*>("replay-seconds")->text(), QStringLiteral("42 s sur 60 s"));
+        QVERIFY(primary(filling)->isEnabled()); QCOMPARE(secondary(filling)->text(), QStringLiteral("Arrêter replay")); QCOMPARE(filling->findChild<QLabel*>("replay-seconds")->text(), QStringLiteral("42 s sur 60 s"));
         view.seconds = 60.4; view.bytes = 197132288; auto* full = add(view); QCOMPARE(full->findChild<QLabel*>("replay-seconds")->text(), QStringLiteral("60 s prêtes"));
         view.saving = true; auto* saving = add(view); QCOMPARE(primary(saving)->text(), QStringLiteral("Sauvegarde…")); QVERIFY(!primary(saving)->isEnabled());
         view.saving = false; view.warning = QStringLiteral("La capture de fenêtre ajoute un cadre jaune aux clips."); view.canFixWarning = true; auto* warned = add(view);
@@ -1025,7 +1173,9 @@ private slots:
         // Taken at the size of the clip, filed with its game, listed among the screenshots.
         const auto folder = library + "/Screenshots/ARC Raiders";
         QTRY_COMPARE_WITH_TIMEOUT(QDir(folder).entryList({"*.png"}, QDir::Files).size(), 1, 5000);
-        const QImage taken(QDir(folder).filePath(QDir(folder).entryList({"*.png"}, QDir::Files).first())); QCOMPARE(taken.size(), QSize(320, 192));
+        // The file is listed as soon as it is created: it is read once it is written.
+        const auto takenPath = QDir(folder).filePath(QDir(folder).entryList({"*.png"}, QDir::Files).first());
+        QTRY_COMPARE_WITH_TIMEOUT(QImage(takenPath).size(), QSize(320, 192), 5000);
         auto* shots = window.findChild<ClipListView*>("screenshot-library"); QTRY_COMPARE_WITH_TIMEOUT(clipPaths(shots).size(), 1, 5000);
         // With a framing set, only the framed part is kept.
         width->setValue(160); window.findChild<QSpinBox*>("crop-height")->setValue(96); window.findChild<QPushButton*>("editor-screenshot")->click();
@@ -1105,6 +1255,10 @@ private slots:
         // The journal built into the program: newest first, the version in use among them, every version readable.
         const auto releases = bundledChangelog(); QVERIFY(releases.size() >= 4); QCOMPARE(releases.first().version, QStringLiteral(CLIPSAPP_VERSION)); QCOMPARE(releases.last().version, QStringLiteral("0.8.0"));
         for (const auto& release : releases) QVERIFY2(!parseReleaseNotes(release.notes).isEmpty(), qPrintable(release.version));
+        // A new feature ends on where it is found: the place is given apart, shown under it.
+        const auto features = parseReleaseNotes(releases.first().notes).first(); QCOMPARE(features.title, QStringLiteral("Nouveautés"));
+        for (const auto& item : features.items) { QVERIFY2(item.where.startsWith(QStringLiteral("Réglages → ")), qPrintable(item.lead + QStringLiteral(" | where=") + item.where + QStringLiteral(" | text=") + item.text)); QVERIFY(!item.text.contains(QStringLiteral("Réglages →"))); }
+        QCOMPARE(features.items[1].lead, QStringLiteral("Thèmes")); QCOMPARE(features.items[1].where, QStringLiteral("Réglages → Général → Thèmes"));
         QCOMPARE(changelogReleases(sample).size(), 1); QCOMPARE(changelogReleases(sample).first().version, QStringLiteral("0.8.3"));
         const auto composite = [&](QWidget* dialog) { QImage shot = window.grab().toImage(); QPainter painter(&shot); painter.drawPixmap(dialog->mapToGlobal(QPoint()) - window.mapToGlobal(QPoint()), dialog->grab()); return shot; };
         const auto hasText = [](QWidget* widget, const QString& text) { for (auto* found : widget->findChildren<QLabel*>()) if (found->text() == text) return true; return false; };

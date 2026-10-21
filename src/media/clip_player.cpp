@@ -145,7 +145,9 @@ void ClipPlayer::run(QString path) {
             }
             const auto image = picture(position);
             { QMutexLocker lock(&m_mutex); if (m_seekSerial != serial) continue; m_snapshot.image = image; m_snapshot.positionMs = position;
-              m_snapshot.loaded = true; m_snapshot.loading = m_seekSerial != serial || m_playing != playing; m_snapshot.playing = playing; m_snapshot.direct = direct; }
+              // An image made for a request already replaced (a new size, a new edit) is not the one awaited:
+              // the player keeps watching until that one comes.
+              m_snapshot.loaded = true; m_snapshot.loading = m_seekSerial != serial || m_playing != playing || m_revision != revision; m_snapshot.playing = playing; m_snapshot.direct = direct; }
             if (!playing) {
                 QMutexLocker lock(&m_mutex); if (!m_stop && m_revision == revision) m_wake.wait(&m_mutex);
             } else pause.wait(presentation.isEmpty() ? 5 : 1);

@@ -5,4 +5,8 @@ namespace clipsapp {
 QString systemDescription();
 QStringList graphicsAdapters();
 QString mediaLibraries();
+// The memory installed in the PC, in bytes; 0 if unknown.
+qint64 physicalMemoryBytes();
+// Whether the drive holding this folder is a hard drive (1), not one (0), or cannot be told (-1).
+int rotationalDrive(const QString& folder);
 }

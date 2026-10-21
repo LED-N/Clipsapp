@@ -1,5 +1,6 @@
 #include "replay_buffer.h"
 #include <algorithm>
+#include <utility>
 
 namespace clipsapp {
 ReplayBuffer::ReplayBuffer(qint64 durationUs, qint64 limitBytes)
@@ -28,6 +29,14 @@ void ReplayBuffer::push(EncodedPacket packet) {
         if (m_keys.size() < 2) { clear(); break; } // One GOP exceeds the cap; wait for the next keyframe.
         m_keys.pop_front(); discardBefore(m_keys.front());
     }
+}
+QList<EncodedPacket> ReplayBuffer::fromLastKeyframe() const {
+    if (m_keys.empty()) return {};
+    const qint64 key = m_keys.back(); QList<EncodedPacket> result;
+    for (const auto& packet : m_packets) if (packet.stream == 0 ? packet.dtsUs >= key : packet.ptsUs >= key) result.append(packet);
+    // At the same instant, the picture comes first: the recording starts on it.
+    std::stable_sort(result.begin(), result.end(), [](const auto& a, const auto& b) { return std::make_pair(a.dtsUs, a.stream != 0) < std::make_pair(b.dtsUs, b.stream != 0); });
+    return result;
 }
 ReplaySnapshot ReplayBuffer::snapshot() const {
     ReplaySnapshot result;

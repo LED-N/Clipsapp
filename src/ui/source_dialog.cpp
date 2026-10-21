@@ -1,4 +1,5 @@
 #include "source_dialog.h"
+#include "core/audio_routing.h"
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -69,12 +70,13 @@ SourceDialog::SourceDialog(const SourceCatalog& catalog, const RecordingProfile&
     exclusionLayout->addWidget(label(QStringLiteral("Exclure aussi"), "lbl"));
     m_exclusions = new QListWidget; m_exclusions->setObjectName("application-exclusions"); m_exclusions->setItemDelegate(new ExclusionDelegate(m_exclusions)); m_exclusions->setFixedHeight(104); m_exclusions->setSelectionMode(QAbstractItemView::NoSelection); m_exclusions->setFocusPolicy(Qt::NoFocus);
     m_exclusions->setStyleSheet(QStringLiteral("QListWidget { background: #0F1217; border: 1px solid #242A34; border-radius: 8px; }")); exclusionLayout->addWidget(m_exclusions);
-    QSet<QString> seen, active; for (const auto& target : m_catalog.applications) active.insert(QDir::fromNativeSeparators(target.id).toCaseFolded());
+    // An application is listed once, under its current path, even when it was excluded before an update.
+    QSet<QString> seen, active; for (const auto& target : m_catalog.applications) active.insert(applicationIdentity(target.id));
     const auto addExclusion = [this, &seen, &active](const QString& path, const QString& name, bool checkedByDefault = false) {
-        const auto key = QDir::fromNativeSeparators(path).toCaseFolded(); if (path.isEmpty() || seen.contains(key)) return; seen.insert(key);
+        const auto key = applicationIdentity(path); if (path.isEmpty() || seen.contains(key)) return; seen.insert(key);
         auto* item = new QListWidgetItem(name.isEmpty() ? QFileInfo(path).fileName() : name, m_exclusions); item->setData(Qt::UserRole, path); item->setToolTip(path); item->setFlags(Qt::ItemIsEnabled);
-        item->setData(Qt::UserRole + 1, active.contains(key) ? QStringLiteral("joue du son") : QStringLiteral("arrêtée"));
-        bool checked = checkedByDefault; for (const auto& excluded : m_original.excludedApplications) if (QDir::fromNativeSeparators(excluded).compare(QDir::fromNativeSeparators(path), Qt::CaseInsensitive) == 0) checked = true;
+        item->setData(Qt::UserRole + 1, active.contains(key) ? QStringLiteral("joue du son") : !m_catalog.runningApplication(path).id.isEmpty() ? QStringLiteral("ouverte") : QStringLiteral("arrêtée"));
+        bool checked = checkedByDefault; for (const auto& excluded : m_original.excludedApplications) if (applicationIdentity(excluded) == key) checked = true;
         item->setCheckState(checked ? Qt::Checked : Qt::Unchecked);
     };
     for (const auto& target : m_catalog.applications) addExclusion(target.id, target.label);
@@ -84,7 +86,7 @@ SourceDialog::SourceDialog(const SourceCatalog& catalog, const RecordingProfile&
     auto* browseExclusion = new Button(QStringLiteral("plus"), QStringLiteral("Choisir un programme…"), Button::Ghost, Button::Small); browseExclusion->setPadding(4); exclusionLayout->addWidget(browseExclusion, 0, Qt::AlignLeft);
     connect(browseExclusion, &QPushButton::clicked, this, [this] {
         const auto path = QFileDialog::getOpenFileName(this, QStringLiteral("Exclure une application"), {}, QStringLiteral("Applications Windows (*.exe)")); if (path.isEmpty()) return;
-        for (int row = 0; row < m_exclusions->count(); ++row) if (m_exclusions->item(row)->data(Qt::UserRole).toString().compare(path, Qt::CaseInsensitive) == 0) { m_exclusions->item(row)->setCheckState(Qt::Checked); return; }
+        for (int row = 0; row < m_exclusions->count(); ++row) if (applicationIdentity(m_exclusions->item(row)->data(Qt::UserRole).toString()) == applicationIdentity(path)) { m_exclusions->item(row)->setCheckState(Qt::Checked); return; }
         auto* item = new QListWidgetItem(QFileInfo(path).fileName(), m_exclusions); item->setData(Qt::UserRole, path); item->setToolTip(path); item->setFlags(Qt::ItemIsEnabled); item->setCheckState(Qt::Checked); m_exclusions->scrollToItem(item);
     });
     body()->addWidget(panel);
@@ -124,6 +126,14 @@ void SourceDialog::populateTargets() {
     }
     if (current == m_original.kind && !m_original.targetId.isEmpty()) {
         int index = m_target->findData(m_original.targetId);
+        // An application updated since it was chosen is offered under its new path, which is saved with the source.
+        if (index < 0 && current == SourceKind::Application)
+            for (int row = 1; row < m_target->count() && index < 0; ++row) if (applicationIdentity(m_target->itemData(row).toString()) == applicationIdentity(m_original.targetId)) index = row;
+        // Open but silent, like a browser between two videos: it is there, under its current path.
+        if (const auto running = m_catalog.runningApplication(m_original.targetId); index < 0 && current == SourceKind::Application && !running.id.isEmpty()) {
+            m_target->addItem(running.label + QStringLiteral(" (ouverte, sans son pour l'instant)"), running.id); index = m_target->count() - 1;
+            m_target->setItemData(index, running.label, Qt::UserRole + 1);
+        }
         if (index < 0) {
             m_target->addItem(m_original.targetLabel + QStringLiteral(" (indisponible actuellement)"), m_original.targetId); index = m_target->count() - 1;
             m_target->setItemData(index, m_original.targetLabel, Qt::UserRole + 1);

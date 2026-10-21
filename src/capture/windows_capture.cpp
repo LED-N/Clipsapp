@@ -1,17 +1,25 @@
 #include "replay_engine.h"
 #include "core/replay_buffer.h"
 #include "platform/fine_wait.h"
+#include "platform/replay_disk.h"
 #include "platform/windows_audio.h"
 #include "platform/windows_video.h"
+#include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QMutex>
 #include <QMutexLocker>
 #include <QSaveFile>
 #include <QScopeGuard>
+#include <QStorageInfo>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 extern "C" {
@@ -87,8 +95,10 @@ ExportResult writeSnapshot(const ReplaySnapshot& snapshot, const QList<Stream>& 
         check(avformat_write_header(format, nullptr), QStringLiteral("En-tête du clip"));
         Packet packet;
         for (const auto& item : snapshot.packets) {
-            check(av_new_packet(packet.p, int(item.data.size())), QStringLiteral("Paquet du clip"));
-            std::memcpy(packet.p->data, item.data.constData(), size_t(item.data.size()));
+            // Read one at a time: a buffer kept on disk never comes back into memory as a whole.
+            const auto data = item.payload();
+            check(av_new_packet(packet.p, int(data.size())), QStringLiteral("Paquet du clip"));
+            std::memcpy(packet.p->data, data.constData(), size_t(data.size()));
             packet.p->stream_index = item.stream;
             const auto timeBase = format->streams[item.stream]->time_base;
             packet.p->pts = av_rescale_q(item.ptsUs - snapshot.startUs, microseconds, timeBase);
@@ -105,12 +115,146 @@ ExportResult writeSnapshot(const ReplaySnapshot& snapshot, const QList<Stream>& 
     if (format) avformat_free_context(format);
     return result;
 }
+// A recording written as it comes, by a thread of its own, in fragmented MP4: each fragment (one per
+// group of pictures, every 2 s) is complete on disk as soon as it is written, so a recording cut by
+// a crash or a power failure stays readable up to its last fragment. It starts on a picture a video
+// can start on, and keeps 1 GiB free on its drive.
+class Recording {
+public:
+    Recording(QString path, const QList<Stream>& streams) : m_path(std::move(path)) {
+        try {
+            if (QFile::exists(m_path)) throw std::runtime_error("Le fichier de l'enregistrement existe déjà.");
+            check(avformat_alloc_output_context2(&m_format, nullptr, "mp4", nullptr), QStringLiteral("Création de l'enregistrement"));
+            for (const auto& stream : streams) {
+                auto* output = avformat_new_stream(m_format, nullptr); if (!output) throw std::bad_alloc();
+                check(avcodec_parameters_copy(output->codecpar, stream.parameters.get()), QStringLiteral("Copie de la piste"));
+                output->time_base = stream.timeBase;
+                av_dict_set(&output->metadata, "handler_name", stream.title.toUtf8().constData(), 0);
+                if (output->codecpar->codec_id == AV_CODEC_ID_HEVC) output->codecpar->codec_tag = MKTAG('h', 'v', 'c', '1');
+                output->disposition = stream.parameters->codec_type == AVMEDIA_TYPE_VIDEO ? AV_DISPOSITION_DEFAULT : 0;
+            }
+            check(avio_open(&m_format->pb, m_path.toUtf8().constData(), AVIO_FLAG_WRITE), QStringLiteral("Ouverture de « %1 »").arg(QDir::toNativeSeparators(m_path)));
+            // A fragment goes to the file as soon as it is complete, not when the write buffer fills.
+            m_format->flush_packets = 1;
+            AVDictionary* options = nullptr; av_dict_set(&options, "movflags", "frag_keyframe+empty_moov+default_base_moof", 0);
+            const int status = avformat_write_header(m_format, &options); av_dict_free(&options); check(status, QStringLiteral("En-tête de l'enregistrement"));
+        } catch (...) { close(); QFile::remove(m_path); throw; }
+        m_thread = std::thread([this] { run(); });
+    }
+    ~Recording() { stop(); if (m_thread.joinable()) m_thread.join(); close(); }
+    // Never waits: a disk far behind stops the recording rather than the capture.
+    void push(EncodedPacket packet) {
+        {
+            std::lock_guard lock(m_mutex);
+            if (m_stopping) return;
+            if (m_pending > pendingLimit) { m_error = QStringLiteral("Le disque n'écrit pas assez vite"); m_stopping = true; }
+            else { m_pending += packet.bytes(); m_queue.push_back(std::move(packet)); }
+        }
+        m_changed.notify_all();
+    }
+    // What was given is written, then the file is completed.
+    void stop() { { std::lock_guard lock(m_mutex); m_stopping = true; } m_changed.notify_all(); }
+    bool done() const { return m_done; }
+    void wait() { if (m_thread.joinable()) m_thread.join(); }
+    double seconds() const { return m_seconds; }
+    qint64 bytes() const { return m_bytes; }
+    RecordingResult result() const { std::lock_guard lock(m_mutex); return {m_path, m_error, m_seconds, m_kept}; }
+private:
+    static constexpr qint64 pendingLimit = 512LL * 1048576;
+    void run() {
+        Packet packet; qint64 base = -1; auto nextSpaceCheck = std::chrono::steady_clock::now();
+        const auto fail = [this](const QString& error) { std::lock_guard lock(m_mutex); if (m_error.isEmpty()) m_error = error; m_stopping = true; };
+        for (;;) {
+            std::deque<EncodedPacket> batch;
+            {
+                std::unique_lock lock(m_mutex);
+                m_changed.wait(lock, [&] { return m_stopping || !m_queue.empty(); });                if (m_queue.empty()) break;
+                batch.swap(m_queue);
+            }
+            qint64 handled = 0; bool broken; { std::lock_guard lock(m_mutex); broken = !m_error.isEmpty(); }
+            for (const auto& item : batch) {
+                handled += item.bytes();
+                if (broken) continue;
+                // It starts on a picture a video can start on; the sound before it is not kept.
+                if (base < 0 && !(item.stream == 0 && item.keyframe)) continue;
+                if (base < 0) base = item.dtsUs;
+                if (item.ptsUs < base && item.stream != 0) continue;
+                try {
+                    const auto data = item.payload();
+                    check(av_new_packet(packet.p, int(data.size())), QStringLiteral("Paquet de l'enregistrement"));
+                    std::memcpy(packet.p->data, data.constData(), size_t(data.size()));
+                    packet.p->stream_index = item.stream; const auto timeBase = m_format->streams[item.stream]->time_base;
+                    packet.p->pts = av_rescale_q(item.ptsUs - base, microseconds, timeBase); packet.p->dts = av_rescale_q(item.dtsUs - base, microseconds, timeBase);
+                    packet.p->duration = av_rescale_q(item.durationUs, microseconds, timeBase); if (item.keyframe) packet.p->flags |= AV_PKT_FLAG_KEY;
+                    check(av_interleaved_write_frame(m_format, packet.p), QStringLiteral("Écriture de l'enregistrement")); av_packet_unref(packet.p);
+                    if (item.stream == 0) m_seconds = std::max<double>(m_seconds, (item.ptsUs + item.durationUs - base) / 1000000.0);
+                    m_kept = true;
+                } catch (const std::exception& error) { av_packet_unref(packet.p); fail(QString::fromUtf8(error.what())); broken = true; }
+            }
+            m_bytes = avio_tell(m_format->pb);
+            { std::lock_guard lock(m_mutex); m_pending -= handled; }
+            // The drive is looked at every 10 s: below 1 GiB free, the recording ends there, complete.
+            if (std::chrono::steady_clock::now() >= nextSpaceCheck) {
+                nextSpaceCheck = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+                const QStorageInfo volume(QFileInfo(m_path).absolutePath());
+                if (volume.isValid() && volume.bytesAvailable() < 1073741824LL) fail(QStringLiteral("Le disque est presque plein"));
+            }
+        }
+        if (m_kept) {
+            const int status = av_write_trailer(m_format); avio_flush(m_format->pb);
+            if (status < 0 || m_format->pb->error < 0) fail(QStringLiteral("Fin de l'enregistrement incomplète"));
+            m_bytes = avio_tell(m_format->pb);
+        }
+        close();
+        // Stopped before its first picture, a recording leaves nothing behind.
+        if (!m_kept) { QFile::remove(m_path); std::lock_guard lock(m_mutex); if (m_error.isEmpty()) m_error = QStringLiteral("Arrêté avant sa première image"); }
+        m_done = true;
+    }
+    void close() {
+        if (!m_format) return;
+        if (m_format->pb) avio_closep(&m_format->pb);
+        avformat_free_context(m_format); m_format = nullptr;
+    }
+    QString m_path;
+    AVFormatContext* m_format = nullptr;
+    mutable std::mutex m_mutex; std::condition_variable m_changed;
+    std::deque<EncodedPacket> m_queue; qint64 m_pending = 0; bool m_stopping = false; QString m_error;
+    std::atomic<double> m_seconds{0}; std::atomic<qint64> m_bytes{0}; std::atomic_bool m_kept{false}, m_done{false};
+    std::thread m_thread;
+};
 class WindowsCapture final : public CaptureBackend {
 public:
     WindowsCapture(RecordingProfile profile, bool synthetic = false)
-        : m_profile(std::move(profile)), m_synthetic(synthetic), m_buffer(qint64(m_profile.replay.durationSeconds) * 1000000, qint64(m_profile.replay.memoryLimitMiB) * 1048576) {}
+        : m_profile(std::move(profile)), m_synthetic(synthetic),
+          m_buffer(qint64(m_profile.replay.durationSeconds) * 1000000, qint64(onDisk() ? m_profile.replay.diskLimitMiB : m_profile.replay.memoryLimitMiB) * 1048576) {}
     CaptureStats stats() const override {
-        QMutexLocker lock(&m_mutex); return {m_buffer.seconds(), m_buffer.bytes(), m_frames, m_encoder, m_warning, m_lost, m_silent};
+        QMutexLocker lock(&m_mutex);
+        const bool recording = m_recording && !m_recording->done();
+        return {m_buffer.seconds(), m_buffer.bytes(), m_frames, m_encoder, m_warning, m_lost, m_silent, recording, recording ? m_recording->seconds() : 0, recording ? m_recording->bytes() : 0, m_bufferError};
+    }
+    QString startRecording(const QString& path) override {
+        QMutexLocker lock(&m_mutex);
+        if (m_recording) return QStringLiteral("Un enregistrement est déjà en cours.");
+        if (m_streams.isEmpty()) return QStringLiteral("Le replay démarre encore. Réessayez dans un instant.");
+        try {
+            auto recording = std::make_unique<Recording>(path, m_streams);
+            // It begins with the group of pictures already in the buffer: up to 2 s before it was asked.
+            for (auto& packet : m_buffer.fromLastKeyframe()) recording->push(std::move(packet));
+            m_recording = std::move(recording);
+        } catch (const std::exception& error) { return QStringLiteral("Enregistrement impossible : ") + QString::fromUtf8(error.what()); }
+        return {};
+    }
+    void stopRecording() override { QMutexLocker lock(&m_mutex); if (m_recording) m_recording->stop(); }
+    void setBuffering(bool on) override {
+        QMutexLocker lock(&m_mutex); m_buffering = on; m_bufferError.clear();
+        // Stopped, the replay lets go of its seconds: their memory, or their files on disk.
+        if (!on) m_buffer.clear();
+    }
+    RecordingResult takeRecording() override {
+        QMutexLocker lock(&m_mutex);
+        // Its thread has ended: letting it go waits for nothing.
+        if (m_recording && m_recording->done()) { m_finished = m_recording->result(); m_recording.reset(); }
+        return std::exchange(m_finished, {});
     }
     ExportTask prepareSave(const QString& path) const override {
         ReplaySnapshot snapshot; QList<Stream> streams;
@@ -122,9 +266,20 @@ public:
             QMutexLocker lock(&m_mutex);
             m_buffer.clear(); m_streams.clear(); m_frames = 0;
             m_encoder.clear(); m_warning.clear(); m_lost = 0; m_silent.clear();
+            // Its files go with the last packet that uses them, once a clip being saved is written.
+            m_disk.reset();
+        });
+        // Before that, a recording under way is completed: what was encoded is all in its file.
+        const auto recordingEnd = qScopeGuard([this] {
+            std::unique_ptr<Recording> recording; { QMutexLocker lock(&m_mutex); recording.swap(m_recording); }
+            if (!recording) return;
+            recording->stop(); recording->wait();
+            QMutexLocker lock(&m_mutex); m_finished = recording->result();
         });
         try {
             const auto& video = m_profile.video;
+            // A capture that only records sets its buffer up when the replay is started, if ever.
+            if (onDisk() && m_buffering) openDisk();
             std::unique_ptr<WindowsVideo> nativeVideo;
             Frame frame;
             if (m_synthetic) {
@@ -299,16 +454,48 @@ private:
             item.ptsUs = av_rescale_q(packet.p->pts, encoder->time_base, microseconds); item.dtsUs = av_rescale_q(packet.p->dts, encoder->time_base, microseconds);
             const auto duration = packet.p->duration > 0 ? packet.p->duration : (stream == 0 ? 1 : 1024);
             item.durationUs = av_rescale_q(duration, encoder->time_base, microseconds); item.keyframe = packet.p->flags & AV_PKT_FLAG_KEY;
-            item.data = QByteArray(reinterpret_cast<const char*>(packet.p->data), packet.p->size);
-            { QMutexLocker lock(&m_mutex); m_buffer.push(std::move(item)); }
+            QByteArray data(reinterpret_cast<const char*>(packet.p->data), packet.p->size);
+            // The recording gets the bytes themselves, shared, not their place on disk.
+            auto live = item; live.data = data;
+            bool buffering = m_buffering;
+            // Started during a recording, a replay on disk sets its buffer up now. If it cannot, the
+            // replay keeps nothing and says why; the recording goes on.
+            if (buffering && onDisk() && !m_disk) {
+                try { openDisk(); }
+                catch (const std::exception& error) { QMutexLocker lock(&m_mutex); m_bufferError = QString::fromUtf8(error.what()); m_buffering = buffering = false; m_disk.reset(); }
+            }
+            if (buffering && m_disk) {
+                if (const auto failure = m_disk->error(); !failure.isEmpty())
+                    throw std::runtime_error(QStringLiteral("Le buffer sur disque ne peut plus être écrit (%1). Libérez de la place ou choisissez un autre dossier.").arg(failure).toStdString());
+                m_disk->store(item, std::move(data));
+            } else if (buffering) item.data = std::move(data);
+            { QMutexLocker lock(&m_mutex); if (m_recording) m_recording->push(std::move(live)); if (m_buffering) m_buffer.push(std::move(item)); }
             av_packet_unref(packet.p);
         }
         if (status != AVERROR(EAGAIN) && status != AVERROR_EOF) check(status, QStringLiteral("Sortie de l'encodeur"));
+    }
+    bool onDisk() const { return m_profile.replay.storage == QLatin1String("disk"); }
+    // The folder of the buffer on disk, with room for what it should hold. Throws otherwise.
+    void openDisk() {
+        const auto folder = replayDiskFolder(m_profile.replay); auto disk = std::make_unique<ReplayDisk>(folder);
+        // What it should hold, a little more for safety; never more than its ceiling.
+        const qint64 needed = std::min<qint64>(m_profile.replay.diskLimitMiB, qint64(std::ceil(estimatedBufferMiB(m_profile))) + 256) * 1048576;
+        const QStorageInfo volume(folder);
+        if (volume.isValid() && volume.bytesAvailable() < needed)
+            throw std::runtime_error(QStringLiteral("Pas assez de place pour le buffer dans « %1 » : %2 Gio libres, %3 Gio nécessaires. Libérez de la place, choisissez un autre dossier ou réduisez la durée.")
+                .arg(QDir::toNativeSeparators(folder)).arg(volume.bytesAvailable() / 1073741824.0, 0, 'f', 1).arg(needed / 1073741824.0, 0, 'f', 1).toStdString());
+        m_disk = std::move(disk);
     }
     RecordingProfile m_profile;
     bool m_synthetic;
     mutable QMutex m_mutex;
     ReplayBuffer m_buffer;
+    // Only while the replay runs, on the disk; used by the capture thread alone.
+    std::unique_ptr<ReplayDisk> m_disk;
+    // The recording under way, and the last one that ended, until it is taken.
+    std::unique_ptr<Recording> m_recording; RecordingResult m_finished;
+    // Whether the replay keeps its seconds, and why it could not.
+    std::atomic_bool m_buffering{true}; QString m_bufferError;
     QList<Stream> m_streams;
     QString m_encoder, m_warning;
     quint64 m_frames = 0;

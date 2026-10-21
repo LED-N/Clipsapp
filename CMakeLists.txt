@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(Clipsapp VERSION 0.8.3 LANGUAGES CXX)
+project(Clipsapp VERSION 0.8.4 LANGUAGES CXX)
 
 # The GitHub repository whose releases the published application follows for its updates,
 # written "owner/name". Left empty, the application never looks for updates.
@@ -34,11 +34,11 @@ target_include_directories(clipsapp_core PUBLIC src)
 target_link_libraries(clipsapp_core PUBLIC Qt6::Core)
 if(WIN32)
     target_compile_definitions(clipsapp_core PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-    target_link_libraries(clipsapp_core PRIVATE user32 version dbghelp)
+    target_link_libraries(clipsapp_core PRIVATE user32 version dbghelp ole32 shell32 uuid)
 endif()
 
 if(WIN32)
-    set(CLIPSAPP_PLATFORM_SOURCE src/platform/windows_catalog.cpp src/platform/windows_audio.cpp src/platform/windows_audio.h src/platform/windows_video.cpp src/platform/windows_video.h src/capture/windows_capture.cpp src/capture/audio_stream.cpp src/capture/audio_stream.h)
+    set(CLIPSAPP_PLATFORM_SOURCE src/platform/windows_catalog.cpp src/platform/windows_audio.cpp src/platform/windows_audio.h src/platform/windows_video.cpp src/platform/windows_video.h src/capture/windows_capture.cpp src/capture/audio_stream.cpp src/capture/audio_stream.h src/platform/replay_disk.cpp src/platform/replay_disk.h)
     set(CLIPSAPP_FFMPEG_ROOT "${CMAKE_SOURCE_DIR}/.tools/ffmpeg/ffmpeg-n9.0.2-24-gfd5d616c29-win64-lgpl-shared-9.0" CACHE PATH "FFmpeg shared SDK")
     foreach(component avcodec avformat avutil swresample swscale)
         find_library(CLIPSAPP_${component} NAMES ${component} PATHS "${CLIPSAPP_FFMPEG_ROOT}/lib" NO_DEFAULT_PATH REQUIRED)
@@ -77,6 +77,7 @@ endif()
 set(CLIPSAPP_APP_SOURCES
     src/ui/main_window.cpp src/ui/main_window.h
     src/ui/theme.cpp src/ui/theme.h
+    src/ui/theme_editor.cpp src/ui/theme_editor.h
     src/ui/widgets.cpp src/ui/widgets.h
     src/ui/replay_strip.cpp src/ui/replay_strip.h
     src/ui/thumbnail_cache.cpp src/ui/thumbnail_cache.h
@@ -152,11 +153,11 @@ if(BUILD_TESTING)
     target_link_libraries(clipsapp_trash_probe PRIVATE clipsapp_core)
     set_target_properties(clipsapp_trash_probe PROPERTIES WIN32_EXECUTABLE FALSE)
     if(WIN32)
-        qt_add_executable(clipsapp_media_tests tests/media_tests.cpp src/capture/replay_engine.cpp src/capture/replay_engine.h src/capture/windows_capture.cpp src/platform/windows_audio.cpp src/platform/windows_video.cpp src/capture/audio_stream.cpp)
+        qt_add_executable(clipsapp_media_tests tests/media_tests.cpp src/capture/replay_engine.cpp src/capture/replay_engine.h src/capture/windows_capture.cpp src/platform/windows_audio.cpp src/platform/windows_video.cpp src/capture/audio_stream.cpp src/platform/replay_disk.cpp)
         target_compile_definitions(clipsapp_media_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
         target_link_libraries(clipsapp_media_tests PRIVATE clipsapp_core clipsapp_media Qt6::Test Qt6::Gui Qt6::Concurrent ole32 uuid user32 mmdevapi)
         add_test(NAME clipsapp_media_tests COMMAND clipsapp_media_tests)
-        set_tests_properties(clipsapp_media_tests PROPERTIES TIMEOUT 35)
+        set_tests_properties(clipsapp_media_tests PROPERTIES TIMEOUT 60)
         qt_add_executable(clipsapp_editor_tests tests/editor_tests.cpp ${CLIPSAPP_APP_SOURCES})
         qt_add_resources(clipsapp_editor_tests "changelog" PREFIX "/" FILES CHANGELOG.md)
         target_compile_definitions(clipsapp_editor_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN CLIPSAPP_VERSION="${PROJECT_VERSION}")
@@ -182,10 +183,16 @@ if(BUILD_TESTING)
         target_compile_definitions(clipsapp_preview_probe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN CLIPSAPP_VERSION="${PROJECT_VERSION}")
         target_link_libraries(clipsapp_preview_probe PRIVATE clipsapp_editor clipsapp_media Qt6::Widgets Qt6::Concurrent Qt6::Network ole32 uuid user32 mmdevapi winmm)
         set_target_properties(clipsapp_preview_probe PROPERTIES WIN32_EXECUTABLE FALSE)
+        # The images of the README, made by hand from the real interface.
+        qt_add_executable(clipsapp_readme_images tests/readme_images.cpp ${CLIPSAPP_APP_SOURCES})
+        target_compile_definitions(clipsapp_readme_images PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN CLIPSAPP_VERSION="${PROJECT_VERSION}")
+        target_link_libraries(clipsapp_readme_images PRIVATE clipsapp_editor clipsapp_media Qt6::Widgets Qt6::Concurrent Qt6::Network ole32 uuid user32 mmdevapi winmm)
+        qt_add_resources(clipsapp_readme_images "changelog" PREFIX "/" FILES CHANGELOG.md)
+        set_target_properties(clipsapp_readme_images PROPERTIES WIN32_EXECUTABLE FALSE)
         qt_add_executable(clipsapp_application_mix_probe tests/application_mix_probe.cpp src/platform/windows_audio.cpp src/capture/audio_stream.cpp)
         target_compile_definitions(clipsapp_application_mix_probe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
         target_link_libraries(clipsapp_application_mix_probe PRIVATE clipsapp_editor clipsapp_media ole32 uuid mmdevapi)
-        qt_add_executable(clipsapp_capture_probe tests/capture_probe.cpp src/capture/windows_capture.cpp src/platform/windows_audio.cpp src/platform/windows_video.cpp src/platform/windows_catalog.cpp src/capture/audio_stream.cpp)
+        qt_add_executable(clipsapp_capture_probe tests/capture_probe.cpp src/capture/windows_capture.cpp src/platform/windows_audio.cpp src/platform/windows_video.cpp src/platform/windows_catalog.cpp src/capture/audio_stream.cpp src/platform/replay_disk.cpp)
         target_compile_definitions(clipsapp_capture_probe PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
         target_link_libraries(clipsapp_capture_probe PRIVATE clipsapp_core clipsapp_media Qt6::Gui Qt6::Concurrent ole32 uuid user32 mmdevapi)
         set_target_properties(clipsapp_player_probe clipsapp_compatibility_probe clipsapp_memory_probe clipsapp_capture_probe PROPERTIES WIN32_EXECUTABLE FALSE)

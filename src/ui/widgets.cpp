@@ -35,7 +35,10 @@ QLabel* caption(const QString& text) {
     auto* result = label(text.toUpper(), "cap"); auto font = uiFont(11, QFont::Bold); font.setLetterSpacing(QFont::PercentageSpacing, 107); result->setFont(font); return result;
 }
 QLabel* monoLabel(const QString& text, int pixels, const QColor& color, int weight) {
-    auto* result = label(text); result->setFont(monoFont(pixels, weight)); result->setStyleSheet(QStringLiteral("color: %1;").arg(color.name())); return result;
+    // The colors of the theme go by role, so that they follow it when it changes.
+    auto* result = label(text, color == tk::text2 ? "t2" : color == tk::text3 ? "t3" : nullptr); result->setFont(monoFont(pixels, weight));
+    if (color != tk::text && color != tk::text2 && color != tk::text3) result->setStyleSheet(QStringLiteral("color: %1;").arg(color.name()));
+    return result;
 }
 QFrame* card(const char* kind) { auto* frame = new QFrame; frame->setProperty("card", kind); return frame; }
 QFrame* separator(bool vertical) { auto* line = new QFrame; line->setProperty("line", vertical ? "v" : "h"); if (vertical) line->setFixedWidth(1); else line->setFixedHeight(1); return line; }
@@ -89,21 +92,21 @@ void Button::paintEvent(QPaintEvent*) {
     QColor background = Qt::transparent, border = Qt::transparent, foreground = tk::text;
     switch (m_variant) {
     case Secondary:
-        background = off ? QColor(0x13, 0x17, 0x1C) : down ? tk::press : over ? tk::hover : tk::raised; border = off ? tk::lineSoft : over ? tk::lineHover : tk::lineStrong; break;
+        background = off ? tk::mix(tk::window, tk::raised, 0.4) : down ? tk::press : over ? tk::hover : tk::raised; border = off ? tk::lineSoft : over ? tk::lineHover : tk::lineStrong; break;
     case Primary:
-        background = border = off ? QColor(0x17, 0x32, 0x29) : down ? tk::accentPress : over ? tk::accentHover : tk::accent; foreground = off ? QColor(0x4F, 0x7A, 0x69) : tk::onAccent; break;
+        background = border = off ? tk::accentOff : down ? tk::accentPress : over ? tk::accentHover : tk::accent; foreground = off ? tk::onAccentOff : tk::onAccent; break;
     case Ghost:
         if (!off) background = down ? tk::hover : over ? tk::raised : QColor(Qt::transparent);
         foreground = over || down ? tk::text : tk::text2; break;
     case Danger:
-        background = off ? QColor(0x13, 0x17, 0x1C) : down ? QColor(0x4A, 0x22, 0x27) : over ? tk::dangerSoft : tk::dangerBg; border = off ? tk::lineSoft : over ? QColor(0x7A, 0x38, 0x40) : tk::dangerLine; foreground = tk::danger; break;
+        background = off ? tk::mix(tk::window, tk::raised, 0.4) : down ? tk::mix(tk::dangerSoft, tk::danger, 0.1) : over ? tk::dangerSoft : tk::dangerBg; border = off ? tk::lineSoft : over ? tk::mix(tk::dangerLine, tk::danger, 0.15) : tk::dangerLine; foreground = tk::danger; break;
     case DangerSolid:
         background = border = off ? tk::dangerSoft : over ? QColor(0xEE, 0x82, 0x87) : QColor(0xE5, 0x66, 0x6D); foreground = QColor(0x2A, 0x08, 0x0B); break;
     case Segment:
         if (on) background = tk::selected;
         foreground = on || over ? tk::text : tk::text2; break;
     case Tool:
-        if (on) { background = tk::warnSoft; border = QColor(0x5A, 0x44, 0x20); foreground = tk::warn; }
+        if (on) { background = tk::warnSoft; border = tk::mix(tk::warnLine, tk::warn, 0.1); foreground = tk::warn; }
         else { if (over) background = tk::chip; foreground = over ? tk::text : tk::text2; }
         break;
     }
@@ -111,6 +114,8 @@ void Button::paintEvent(QPaintEvent*) {
     if (off && m_variant != Primary) foreground = tk::textOff;
     const double radius = m_variant == Segment || m_variant == Tool ? 5 : 6;
     painter.setPen(border.alpha() ? QPen(border, 1) : QPen(Qt::NoPen)); painter.setBrush(background);
+    // A theme with a gradient gives it to its main buttons; hovered or pressed, they take its first color.
+    if (m_variant == Primary && tk::accentGradient && !off && !down && !over) { painter.setPen(Qt::NoPen); painter.setBrush(accentBrush(rect())); }
     painter.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), radius, radius);
     if (m_keyboardFocus && hasFocus()) { painter.setPen(QPen(tk::info, 2)); painter.setBrush(Qt::NoBrush); painter.drawRoundedRect(QRectF(rect()).adjusted(1, 1, -1, -1), radius, radius); }
 
@@ -134,8 +139,8 @@ void Button::paintEvent(QPaintEvent*) {
 Tag::Tag(const QString& text, Variant variant, QWidget* parent) : QWidget(parent), m_text(text), m_variant(variant) { setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed); }
 QSize Tag::measure(const QString& text, bool icon) { return {QFontMetrics(uiFont(11, QFont::DemiBold)).horizontalAdvance(text) + 14 + (icon ? 17 : 0), 20}; }
 void Tag::paint(QPainter& painter, const QRectF& rect, const QString& text, Variant variant, const QString& iconName) {
-    static constexpr QColor backgrounds[]{tk::chip, tk::accentSoft, tk::warnSoft, tk::dangerSoft, tk::infoSoft, tk::window};
-    static constexpr QColor foregrounds[]{tk::text2, tk::accent, tk::warn, tk::danger, tk::info, tk::text};
+    const QColor backgrounds[]{tk::chip, tk::accentSoft, tk::warnSoft, tk::dangerSoft, tk::infoSoft, tk::window};
+    const QColor foregrounds[]{tk::text2, tk::accent, tk::warn, tk::danger, tk::info, tk::text};
     painter.save(); painter.setRenderHint(QPainter::Antialiasing); painter.setPen(Qt::NoPen); painter.setBrush(backgrounds[variant]); painter.drawRoundedRect(rect, 4, 4);
     double x = rect.x() + 7;
     if (!iconName.isEmpty()) { paintIcon(painter, iconName, QRectF(x, rect.y() + (rect.height() - 12) / 2, 12, 12), foregrounds[variant]); x += 17; }
@@ -173,7 +178,7 @@ RadioRow::RadioRow(const QString& title, const QString& detail, QWidget* parent)
 }
 void RadioRow::paintEvent(QPaintEvent*) {
     QPainter painter(this); painter.setRenderHint(QPainter::Antialiasing); const bool on = isChecked();
-    if (on || underMouse()) { painter.setPen(on ? QPen(QColor(0x2A, 0x31, 0x3C), 1) : QPen(Qt::NoPen)); painter.setBrush(tk::surface); painter.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 8, 8); }
+    if (on || underMouse()) { painter.setPen(on ? QPen(tk::line, 1) : QPen(Qt::NoPen)); painter.setBrush(tk::surface); painter.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 8, 8); }
     const QRectF radio(12.75, (height() - 18) / 2.0 + 0.75, 16.5, 16.5);
     painter.setPen(QPen(on ? tk::accent : tk::control, 1.5)); painter.setBrush(Qt::NoBrush); painter.drawEllipse(radio);
     if (on) { painter.setPen(Qt::NoPen); painter.setBrush(tk::accent); painter.drawEllipse(radio.center(), 4, 4); }
@@ -200,7 +205,7 @@ void Tile::paintEvent(QPaintEvent*) {
     QPainter painter(this); painter.setRenderHint(QPainter::Antialiasing); if (!isEnabled()) painter.setOpacity(0.45);
     const bool on = isChecked(), over = underMouse() && isEnabled();
     const QColor background = on ? tk::accentSoft : m_raised ? (over ? tk::raised : tk::surface) : (over ? tk::surface : tk::field);
-    painter.setPen(QPen(on ? tk::accent : over ? tk::lineHover : QColor(0x2A, 0x31, 0x3C), 1)); painter.setBrush(background);
+    painter.setPen(QPen(on ? tk::accent : over ? tk::lineHover : tk::line, 1)); painter.setBrush(background);
     painter.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), m_centered ? 6 : 8, m_centered ? 6 : 8);
     if (hasFocus() && property("keyboardFocus").toBool()) { painter.setPen(QPen(tk::info, 2)); painter.setBrush(Qt::NoBrush); painter.drawRoundedRect(QRectF(rect()).adjusted(1, 1, -1, -1), 7, 7); }
     if (m_centered) {
@@ -219,7 +224,7 @@ void Tile::paintEvent(QPaintEvent*) {
     }
     const double left = m_picture ? 10 : 12; double y = 10;
     if (m_picture) {
-        const QRectF picture(left + 0.5, y + 0.5, width() - left * 2 - 1, 63); QPen pen(QColor(0x2A, 0x31, 0x3C), 1); if (m_pictureDashed) pen.setStyle(Qt::DashLine);
+        const QRectF picture(left + 0.5, y + 0.5, width() - left * 2 - 1, 63); QPen pen(tk::line, 1); if (m_pictureDashed) pen.setStyle(Qt::DashLine);
         QLinearGradient gradient(picture.topLeft(), picture.bottomRight()); gradient.setColorAt(0, QColor(0x1F, 0x35, 0x40)); gradient.setColorAt(0.5, QColor(0x12, 0x20, 0x27)); gradient.setColorAt(1, QColor(0x33, 0x40, 0x5A));
         painter.setPen(pen); painter.setBrush(m_pictureDashed ? QBrush(Qt::NoBrush) : QBrush(gradient)); painter.drawRoundedRect(picture, 5, 5);
         if (!m_pictureIcon.isEmpty()) paintIcon(painter, m_pictureIcon, QRectF(picture.center().x() - 8, picture.center().y() - 8, 16, 16), tk::text3);
@@ -260,8 +265,8 @@ void Bar::setValue(double value) { value = std::clamp(value, 0.0, 1.0); if (std:
 void Bar::paintEvent(QPaintEvent*) {
     QPainter painter(this); painter.setRenderHint(QPainter::Antialiasing); painter.setPen(Qt::NoPen); if (!isEnabled()) painter.setOpacity(0.4);
     const double thickness = m_marker >= 0 ? height() - 6 : height(), top = (height() - thickness) / 2.0, radius = thickness / 2;
-    painter.setBrush(m_track); painter.drawRoundedRect(QRectF(0, top, width(), thickness), radius, radius);
-    if (m_value > 0) { painter.setBrush(m_fill); painter.drawRoundedRect(QRectF(0, top, std::max(thickness, width() * m_value), thickness), radius, radius); }
+    painter.setBrush(m_track.isValid() ? m_track : tk::selected); painter.drawRoundedRect(QRectF(0, top, width(), thickness), radius, radius);
+    if (m_value > 0) { const QRectF fill(0, top, std::max(thickness, width() * m_value), thickness); painter.setBrush(m_fill.isValid() ? QBrush(m_fill) : accentBrush(QRectF(0, top, width(), thickness))); painter.drawRoundedRect(fill, radius, radius); }
     if (m_marker >= 0) { painter.setBrush(tk::text); painter.drawRect(QRectF(std::clamp(width() * m_marker, 0.0, width() - 2.0), 0, 2, height())); }
 }
 
@@ -350,7 +355,7 @@ QValidator::State TimeField::validate(QString& input, int&) const {
 }
 
 Banner::Banner(Kind kind, const QString& iconName, QWidget* parent) : QFrame(parent) {
-    static const char* names[]{"ok", "info", "warn", "err"}; static constexpr QColor colors[]{tk::accent, tk::info, tk::warn, tk::danger};
+    static const char* names[]{"ok", "info", "warn", "err"}; const QColor colors[]{tk::accent, tk::info, tk::warn, tk::danger};
     setProperty("banner", names[kind]); auto* layout = new QHBoxLayout(this); layout->setContentsMargins(14, 10, 10, 10); layout->setSpacing(12);
     layout->addWidget(new IconLabel(iconName, colors[kind]), 0, Qt::AlignVCenter);
     auto* texts = new QVBoxLayout; texts->setSpacing(1); m_title = label({}, "strong"); m_detail = label({}, "small", true); texts->addWidget(m_title); texts->addWidget(m_detail); layout->addLayout(texts, 1);
@@ -401,6 +406,7 @@ void ModalDialog::paintEvent(QPaintEvent*) {
 void ModalDialog::showEvent(QShowEvent* event) {
     if (auto* owner = parentWidget()) {
         auto* top = owner->window(); adjustSize();
+        if (m_aside) { move(top->mapToGlobal(QPoint(top->width() - width() - 24, 72))); QDialog::showEvent(event); return; }
         if (!m_scrim) { m_scrim = new Scrim(top); m_scrim->setGeometry(top->rect()); m_scrim->show(); m_scrim->raise(); for (auto* surface : top->findChildren<VideoSurface*>()) surface->setDimmed(true); }
         move(top->mapToGlobal(top->rect().center()) - QPoint(width() / 2, height() / 2));
     }
@@ -429,7 +435,7 @@ public:
     Toast(ToastHost::Kind kind, const QString& title, const QString& text, QList<ToastAction> actions, const QString& iconName, QWidget* parent) : QFrame(parent) {
         setObjectName("toast"); setFixedWidth(360);
         setStyleSheet(QStringLiteral("QFrame#toast { background: #1A1F27; border: 1px solid %1; border-radius: 8px; }").arg(kind == ToastHost::Error ? "#5A2A30" : kind == ToastHost::Warn ? "#4D3B1C" : "#323A47"));
-        static const char* names[]{"ok", "share", "warn", "err"}; static constexpr QColor colors[]{tk::accent, tk::info, tk::warn, tk::danger};
+        static const char* names[]{"ok", "share", "warn", "err"}; const QColor colors[]{tk::accent, tk::info, tk::warn, tk::danger};
         auto* layout = new QHBoxLayout(this); layout->setContentsMargins(14, 12, 10, 12); layout->setSpacing(12);
         layout->addWidget(new IconLabel(iconName.isEmpty() ? QString::fromLatin1(names[kind]) : iconName, colors[kind]), 0, Qt::AlignTop);
         auto* texts = new QVBoxLayout; texts->setSpacing(2); auto* heading = label(title, "bold", true); heading->setObjectName("toast-title"); texts->addWidget(heading);

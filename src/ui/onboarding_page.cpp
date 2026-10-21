@@ -18,7 +18,7 @@ public:
 protected:
     void paintEvent(QPaintEvent*) override {
         QPainter painter(this); painter.setRenderHint(QPainter::Antialiasing); const bool current = m_state == 1, done = m_state == 2;
-        painter.setPen(QPen(current ? tk::accentLine : tk::line, 1)); painter.setBrush(current ? QColor(0x12, 0x1A, 0x1A) : done ? tk::surface : QColor(Qt::transparent));
+        painter.setPen(QPen(current ? tk::accentLine : tk::line, 1)); painter.setBrush(current ? tk::mix(tk::window, tk::accent, 0.05) : done ? tk::surface : QColor(Qt::transparent));
         painter.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 10, 10);
         const QRectF mark(16, 14, 26, 26);
         if (done) { painter.setPen(Qt::NoPen); painter.setBrush(tk::accent); painter.drawEllipse(mark); painter.setPen(QPen(tk::onAccent, 2.2, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin)); painter.drawPolyline(QPolygonF{{24.5, 27.5}, {27.5, 30.5}, {33.5, 24}}); return; }

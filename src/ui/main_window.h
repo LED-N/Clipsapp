@@ -67,6 +67,8 @@ public:
     void armShortcuts();
     // A screenshot of the captured screen, as the shortcut takes it.
     void takeScreenshot();
+    // What the recording shortcut does: starts a recording, the replay with it if it is stopped, or stops it.
+    void toggleRecording();
     // A crash report left by the previous launch.
     void announceCrash(const QString& report);
     // Brings the window back from the notification area, as when the application is started again.
@@ -105,13 +107,16 @@ private:
     void screenshotFromClip(const QString& path, qint64 positionMs, const QRect& crop);
     void screenshotDone();
     void bindScreenshotHotkey(bool announce);
+    void bindRecordHotkey(bool announce);
+    // The logo in the colors of the theme, on the window and its icon; with "files", the Start menu's too.
+    void refreshIcons(bool files);
     // The game a clip or a screenshot belongs to: its classification, or its folder. Empty when it has none.
     QString gameOf(const QString& path) const;
     TrackMix mixForClip(const QString& path) const;
     void adoptGameMix(const QString& game, const TrackMix& mix);
     void viewClips(const QStringList& playlist, int index, bool fromEditor = false);
     void toggleCapture();
-    void startCapture();
+    void startCapture(ReplayEngine::Purpose purpose = ReplayEngine::Purpose::Replay);
     // The replay the user stops: what starts it by itself waits until its reason comes again.
     void stopCapture();
     bool startAutomatically(const QString& reason);
@@ -168,16 +173,16 @@ private:
     int m_libraryFilter = 0; QString m_libraryGame;
     bool m_firstLaunch = false, m_relaunch = false;
     UpdateService* m_updates; Button* m_updateButton;
-    QSystemTrayIcon* m_tray; QAction* m_traySave; QAction* m_trayToggle;
+    QSystemTrayIcon* m_tray; QAction* m_traySave; QAction* m_trayToggle; QAction* m_trayRecord;
     QString m_programs; bool m_quitting = false, m_quitOnClose = false; TrackMix m_mixAsked;
-    QString m_configDirectory, m_loginLocation, m_scanWarning; bool m_trayStart = false, m_sharesScanned = false;
+    QString m_configDirectory, m_loginLocation, m_scanWarning, m_themeIcon; bool m_trayStart = false, m_sharesScanned = false;
     AutoReplay m_auto; QTimer* m_autoWatch; bool m_autoArmed = false;
     // The folder of the clips, followed for what the Explorer adds, renames or removes in it.
     FolderWatcher* m_folderWatch; QTimer* m_folderSettle; bool m_folderLibrary = false, m_folderSharing = false, m_folderShots = false;
     // Screenshots: their page, their editor, what the folder holds, the shortcut and the capture under way.
     LibraryPage* m_shots; ScreenshotEditor* m_shotEditor; ImageViewer* m_imageViewer = nullptr; QList<ClipEntry> m_images; QSet<QString> m_freshShots;
     QFutureWatcher<LibraryScan>* m_imageScan; bool m_imageRescanPending = false, m_imagesScanned = false;
-    GlobalHotkey* m_shotHotkey; bool m_shortcutsArmed = false; QFutureWatcher<QString>* m_shotTask;
+    GlobalHotkey* m_shotHotkey; GlobalHotkey* m_recordHotkey; bool m_shortcutsArmed = false; QFutureWatcher<QString>* m_shotTask;
     QWidget* m_shotsNav; QVBoxLayout* m_shotSubNav; QWidget* m_shotSubNavHost; int m_shotFilter = 0; QString m_shotGame, m_mixAskedGame, m_shotLabel;
 };
 }

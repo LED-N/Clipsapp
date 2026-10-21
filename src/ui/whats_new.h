@@ -8,7 +8,11 @@ namespace clipsapp {
 // The notes of a release, as the changelog writes them: sections in bold or as headings, items as bullets.
 struct NoteItem {
     // "**Screenshots** : text" gives a lead and a text; an item without such a lead has its text only.
-    QString lead, text;
+    // A text that ends on where it is found ("Réglages → Capture → Replay") gives that place apart.
+    QString lead, text, where;
+    // After a lead, the text starts with a capital to stand on its own line; "afterLead" keeps it as
+    // written, for when it follows the lead on the same line.
+    QString afterLead;
     QStringList details;
 };
 struct NoteSection { QString title; QStringList paragraphs; QList<NoteItem> items; };

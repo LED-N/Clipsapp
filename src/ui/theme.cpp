@@ -1,6 +1,16 @@
 #include "theme.h"
+#include "core/config.h"
+#include <QBuffer>
+#include <QCryptographicHash>
+#include <QDataStream>
+#include <QDir>
+#include <QFile>
+#include <QImage>
+#include <QRegularExpression>
 #include <QApplication>
 #include <QHash>
+#include <QLinearGradient>
+#include <QLineF>
 #include <QPainter>
 #include <QPalette>
 #include <QStyle>
@@ -176,7 +186,9 @@ QIcon icon(const QString& name, const QColor& color) {
 }
 void paintLogo(QPainter& painter, const QRectF& box) {
     painter.save(); painter.setRenderHint(QPainter::Antialiasing); painter.translate(box.topLeft()); painter.scale(box.width() / 26.0, box.height() / 26.0);
-    painter.setPen(Qt::NoPen); painter.setBrush(tk::accent); painter.drawRoundedRect(QRectF(1, 1, 24, 24), 7, 7);
+    // In the colors of the theme, its gradient crossing the logo when it has one.
+    QLinearGradient gradient(1, 1, 25, 25); gradient.setColorAt(0, tk::accent); gradient.setColorAt(1, tk::accentGradient ? tk::accentEnd : tk::accent);
+    painter.setPen(Qt::NoPen); painter.setBrush(gradient); painter.drawRoundedRect(QRectF(1, 1, 24, 24), 7, 7);
     painter.setBrush(tk::onAccent); painter.drawRoundedRect(QRectF(7.5, 7.5, 2.4, 11), 1.2, 1.2);
     painter.drawPolygon(QPolygonF{{12, 7.6}, {12, 18.4}, {19.4, 13}}); painter.restore();
 }
@@ -192,6 +204,237 @@ void setStyleProperty(QWidget* widget, const char* name, const QVariant& value) 
     if (widget->property(name) == value) return;
     widget->setProperty(name, value); widget->style()->unpolish(widget); widget->style()->polish(widget); widget->update();
 }
+QColor tk::mix(const QColor& from, const QColor& to, double amount) {
+    const auto blend = [amount](double a, double b) { return int(std::lround(a + (b - a) * amount)); };
+    return QColor(blend(from.red(), to.red()), blend(from.green(), to.green()), blend(from.blue(), to.blue()));
+}
+bool ThemeColors::operator==(const ThemeColors& other) const {
+    return background == other.background && accent == other.accent && text == other.text && windowGradient == other.windowGradient && windowEnd == other.windowEnd
+        && accentGradient == other.accentGradient && accentEnd == other.accentEnd && angle == other.angle;
+}
+QList<ThemePreset> themePresets() {
+    const auto theme = [](unsigned background, unsigned accent, unsigned text, unsigned windowEnd = 0, unsigned accentEnd = 0) {
+        ThemeColors colors; colors.background = tk::rgb(background); colors.accent = tk::rgb(accent); colors.text = tk::rgb(text);
+        colors.windowGradient = windowEnd != 0; colors.windowEnd = windowEnd ? tk::rgb(windowEnd) : colors.background;
+        colors.accentGradient = accentEnd != 0; colors.accentEnd = accentEnd ? tk::rgb(accentEnd) : colors.accent;
+        return colors;
+    };
+    return {
+        {QStringLiteral("clipsapp"), QStringLiteral("Clipsapp"), ThemeColors{}},
+        {QStringLiteral("violet"), QStringLiteral("Violet"), theme(0x0F0B17, 0xA98BFF, 0xEEEAF7, 0x1C1030, 0xD48BFF)},
+        {QStringLiteral("night"), QStringLiteral("Bleu nuit"), theme(0x090E18, 0x5EA8FF, 0xE8EEF8, 0x0E1A30)},
+        {QStringLiteral("amber"), QStringLiteral("Ambre"), theme(0x100D0A, 0xF5B24A, 0xF3EEE7, 0x1E150B, 0xF57E4A)},
+        {QStringLiteral("rose"), QStringLiteral("Rose"), theme(0x120B10, 0xFF7EB6, 0xF5EBF1, 0x22101C)},
+    };
+}
+namespace {
+// Every color from the three of the theme. The default theme keeps the values it was drawn with.
+void derive(const ThemeColors& colors) {
+    using namespace tk;
+    const QColor b = colors.background, a = colors.accent, t = colors.text;
+    if (b == ThemeColors{}.background && a == ThemeColors{}.accent && t == ThemeColors{}.text) {
+        window = rgb(0x0C0E12); rail = rgb(0x101318); surface = rgb(0x14181E); raised = rgb(0x1A1F27); hover = rgb(0x212732); press = rgb(0x282F3B); field = rgb(0x0F1217); header = rgb(0x111419);
+        line = rgb(0x242A34); lineSoft = rgb(0x1E242C); lineStrong = rgb(0x323A47); lineHover = rgb(0x3B4553); control = rgb(0x4A5464); chip = rgb(0x1F242D); selected = rgb(0x262D38);
+        text = rgb(0xE9EDF3); text2 = rgb(0xA1AABA); text3 = rgb(0x8A94A5); textOff = rgb(0x566070); muted = rgb(0x7C8696);
+        accent = rgb(0x6FE3B4); accentHover = rgb(0x8BEBC4); accentPress = rgb(0x55CFA0); onAccent = rgb(0x05261A); accentSoft = rgb(0x12302A); accentLine = rgb(0x2F7A5F); liveBg = rgb(0x11251F); liveLine = rgb(0x1D3F33);
+        accentOff = rgb(0x173229); onAccentOff = rgb(0x4F7A69); highlight = rgb(0x1D4A3B);
+        warnSoft = rgb(0x352812); warnBg = rgb(0x241D10); warnLine = rgb(0x4D3B1C); warnText = rgb(0xE9D3B0);
+        dangerSoft = rgb(0x3A1C1F); dangerBg = rgb(0x2A171A); dangerLine = rgb(0x5A2A30); infoSoft = rgb(0x1A2640); infoLine = rgb(0x2B3D63);
+    } else {
+        // Surfaces and lines rise from the background toward the text: they keep its hue, light or dark.
+        const auto up = [&](double amount) { return mix(b, t, amount); };
+        window = b; rail = up(0.018); surface = up(0.040); raised = up(0.066); hover = up(0.098); press = up(0.130); field = up(0.013); header = up(0.024);
+        line = up(0.110); lineSoft = up(0.083); lineStrong = up(0.172); lineHover = up(0.213); control = up(0.282); chip = up(0.088); selected = up(0.120);
+        text = t; text2 = mix(t, b, 0.33); text3 = mix(t, b, 0.42); textOff = mix(t, b, 0.66); muted = mix(t, b, 0.48);
+        // The accent and what is written on it, dark on a light accent, light on a dark one.
+        const bool light = a.lightnessF() > 0.5;
+        accent = a; accentHover = mix(a, light ? QColor(Qt::white) : t, 0.2); accentPress = mix(a, b, 0.14); onAccent = light ? mix(a, QColor(Qt::black), 0.86) : mix(a, QColor(Qt::white), 0.92);
+        accentSoft = mix(b, a, 0.14); accentLine = mix(b, a, 0.40); liveBg = mix(b, a, 0.07); liveLine = mix(b, a, 0.17);
+        accentOff = mix(b, a, 0.12); onAccentOff = mix(b, a, 0.42); highlight = mix(b, a, 0.24);
+        // Warnings, errors and information keep their color, on a ground taken from the background.
+        warnSoft = mix(b, warn, 0.16); warnBg = mix(b, warn, 0.10); warnLine = mix(b, warn, 0.27); warnText = mix(t, warn, 0.30);
+        dangerSoft = mix(b, danger, 0.16); dangerBg = mix(b, danger, 0.11); dangerLine = mix(b, danger, 0.28); infoSoft = mix(b, info, 0.11); infoLine = mix(b, info, 0.24);
+    }
+    windowGradient = colors.windowGradient; windowEnd = colors.windowGradient ? colors.windowEnd : window;
+    accentGradient = colors.accentGradient; accentEnd = colors.accentGradient ? colors.accentEnd : accent; gradientAngle = colors.angle;
+}
+// The two ends of a gradient at this angle (0: left to right, 90: top to bottom), in the box's own units.
+QLineF gradientLine(const QRectF& box, int angle) {
+    const double radians = angle * 3.141592653589793 / 180, dx = std::cos(radians) / 2, dy = std::sin(radians) / 2;
+    return {box.center().x() - dx * box.width(), box.center().y() - dy * box.height(), box.center().x() + dx * box.width(), box.center().y() + dy * box.height()};
+}
+QString styleSheet() {
+    using namespace tk;
+    const auto axis = gradientLine(QRectF(0, 0, 1, 1), gradientAngle);
+    const auto ground = windowGradient ? QStringLiteral("qlineargradient(x1:%1, y1:%2, x2:%3, y2:%4, stop:0 %5, stop:1 %6)").arg(axis.x1()).arg(axis.y1()).arg(axis.x2()).arg(axis.y2()).arg(window.name(), windowEnd.name()) : window.name();
+    QString sheet = QStringLiteral(R"(
+        QWidget { color: {text}; }
+        QWidget:disabled { color: {textOff}; }
+        QMainWindow, QDialog { background: {ground}; }
+        QToolTip { background: {raised}; color: {text}; border: 1px solid {lineStrong}; padding: 7px 10px; }
+        QLabel { background: transparent; }
+        QLabel[role="t2"] { color: {text2}; }
+        QLabel[role="t3"] { color: {text3}; }
+        QLabel[role="small"], QLabel[role="hint"], QLabel[role="lbl"] { color: {text2}; }
+        QLabel[role="small3"], QLabel[role="cap"] { color: {text3}; }
+        QLabel[role="danger"] { color: {danger}; }
+        QLabel[role="warn"] { color: {warn}; }
+        QLabel[role="warnText"] { color: {warnText}; }
+        QLabel:disabled { color: {textOff}; }
+        QFrame[card="true"] { background: {surface}; border: 1px solid {line}; border-radius: 8px; }
+        QFrame[card="well"] { background: {field}; border: 1px solid {line}; border-radius: 8px; }
+        QFrame[card="panel"] { background: {header}; border: 1px solid {line}; border-radius: 8px; }
+        QFrame[card="bar"] { background: {raised}; border: 1px solid {lineHover}; border-radius: 10px; }
+        QFrame[banner="ok"] { background: {liveBg}; border: 1px solid {liveLine}; border-radius: 8px; }
+        QFrame[banner="info"] { background: {infoSoft}; border: 1px solid {infoLine}; border-radius: 8px; }
+        QFrame[banner="warn"] { background: {warnBg}; border: 1px solid {warnLine}; border-radius: 8px; }
+        QFrame[banner="err"] { background: {dangerBg}; border: 1px solid {dangerLine}; border-radius: 8px; }
+        QFrame[line="h"] { background: {line}; border: none; max-height: 1px; min-height: 1px; }
+        QFrame[line="v"] { background: {line}; border: none; max-width: 1px; min-width: 1px; }
+        QFrame#strip { background: {rail}; border: none; border-bottom: 1px solid {line}; }
+        QFrame#sidebar { background: {rail}; border: none; border-right: 1px solid {line}; }
+        QFrame#savebar { background: {surface}; border: none; border-top: 1px solid {lineHover}; }
+        QLineEdit, QComboBox, QAbstractSpinBox { background: {field}; border: 1px solid {lineStrong}; border-radius: 6px; padding: 0 10px; min-height: 30px; selection-background-color: {highlight}; selection-color: {text}; }
+        QLineEdit:hover, QComboBox:hover, QAbstractSpinBox:hover { border-color: {control}; }
+        QLineEdit:focus, QComboBox:focus, QAbstractSpinBox:focus { border: 2px solid {accent}; padding: 0 9px; }
+        QLineEdit:disabled, QComboBox:disabled, QAbstractSpinBox:disabled { background: {header}; border-color: {lineSoft}; color: {textOff}; }
+        QLineEdit[bare="true"], QLineEdit[bare="true"]:focus, QLineEdit[bare="true"]:hover { background: transparent; border: none; padding: 0; min-height: 0; }
+        QKeySequenceEdit > QLineEdit { min-width: 140px; }
+        QComboBox::drop-down { width: 28px; border: none; }
+        QComboBox::down-arrow { image: none; }
+        QComboBox QAbstractItemView { background: {raised}; border: 1px solid {lineStrong}; padding: 4px; outline: 0; selection-background-color: {selected}; selection-color: {text}; }
+        QComboBox QAbstractItemView::item { min-height: 30px; padding: 0 8px; border-radius: 5px; }
+        QComboBox QAbstractItemView::item:selected { background: {selected}; }
+        QMenu { background: {raised}; border: 1px solid {lineStrong}; border-radius: 8px; padding: 4px; }
+        QMenu::item { padding: 6px 28px 6px 10px; border-radius: 5px; background: transparent; }
+        QMenu::item:selected { background: {selected}; }
+        QMenu::item:disabled { color: {textOff}; }
+        QMenu::item[danger="true"] { color: {danger}; }
+        QMenu::separator { height: 1px; background: {line}; margin: 4px 6px; }
+        QMenu::icon { padding-left: 8px; }
+        QMenu::indicator { width: 0; }
+        QScrollArea { background: transparent; border: none; }
+        QScrollArea > QWidget > QWidget { background: transparent; }
+        QAbstractItemView { background: transparent; border: none; outline: 0; }
+        QScrollBar:vertical { background: transparent; width: 10px; margin: 2px 3px 2px 3px; }
+        QScrollBar::handle:vertical { background: {lineStrong}; min-height: 30px; border-radius: 2px; }
+        QScrollBar::handle:vertical:hover { background: {lineHover}; }
+        QScrollBar:horizontal { background: {raised}; height: 8px; margin: 0; border-radius: 4px; }
+        QScrollBar::handle:horizontal { background: {lineStrong}; min-width: 30px; border-radius: 3px; margin: 1px; }
+        QScrollBar::handle:horizontal:hover { background: {lineHover}; }
+        QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+        QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
+        QSlider { min-height: 16px; }
+        QSlider::groove:horizontal { height: 4px; background: {lineStrong}; border-radius: 2px; }
+        QSlider::sub-page:horizontal { background: {accent}; border-radius: 2px; }
+        QSlider::handle:horizontal { width: 10px; height: 10px; margin: -5px 0; border-radius: 7px; background: {text}; border: 2px solid {window}; }
+        QSlider::handle:horizontal:focus { border-color: {info}; }
+        QSlider::sub-page:horizontal:disabled, QSlider::handle:horizontal:disabled { background: {textOff}; }
+    )");
+    const std::pair<const char*, QColor> tokens[]{
+        {"text2", text2}, {"text3", text3}, {"textOff", textOff}, {"text", text}, {"window", window}, {"raised", raised}, {"surface", surface}, {"field", field}, {"header", header},
+        {"rail", rail}, {"lineStrong", lineStrong}, {"lineHover", lineHover}, {"lineSoft", lineSoft}, {"line", line}, {"control", control}, {"selected", selected}, {"highlight", highlight},
+        {"accent", accent}, {"liveBg", liveBg}, {"liveLine", liveLine}, {"warnText", warnText}, {"warnBg", warnBg}, {"warnLine", warnLine}, {"warn", warn},
+        {"dangerBg", dangerBg}, {"dangerLine", dangerLine}, {"danger", danger}, {"infoSoft", infoSoft}, {"infoLine", infoLine}, {"info", info}};
+    sheet.replace(QStringLiteral("{ground}"), ground);
+    for (const auto& [name, color] : tokens) sheet.replace(QStringLiteral("{%1}").arg(QLatin1String(name)), color.name());
+    return sheet;
+}
+void applyPalette(QApplication& application) {
+    QPalette palette;
+    palette.setColor(QPalette::Window, tk::window); palette.setColor(QPalette::WindowText, tk::text);
+    palette.setColor(QPalette::Base, tk::field); palette.setColor(QPalette::AlternateBase, tk::surface);
+    palette.setColor(QPalette::Text, tk::text); palette.setColor(QPalette::Button, tk::raised);
+    palette.setColor(QPalette::ButtonText, tk::text); palette.setColor(QPalette::Highlight, tk::highlight);
+    palette.setColor(QPalette::HighlightedText, tk::text); palette.setColor(QPalette::PlaceholderText, tk::text3);
+    palette.setColor(QPalette::ToolTipBase, tk::raised); palette.setColor(QPalette::ToolTipText, tk::text);
+    palette.setColor(QPalette::Disabled, QPalette::Text, tk::textOff); palette.setColor(QPalette::Disabled, QPalette::WindowText, tk::textOff);
+    palette.setColor(QPalette::Disabled, QPalette::ButtonText, tk::textOff);
+    application.setPalette(palette);
+}
+}
+QBrush accentBrush(const QRectF& box) {
+    if (!tk::accentGradient) return tk::accent;
+    const auto line = gradientLine(box, 0); QLinearGradient gradient(line.p1(), line.p2());
+    gradient.setColorAt(0, tk::accent); gradient.setColorAt(1, tk::accentEnd); return gradient;
+}
+ThemeColors darkTheme(ThemeColors colors) {
+    const auto atMost = [](QColor color, double lightness) { return color.lightnessF() > lightness ? QColor::fromHslF(color.hslHueF(), color.hslSaturationF(), lightness).toRgb() : color; };
+    const auto atLeast = [](QColor color, double lightness) { return color.lightnessF() < lightness ? QColor::fromHslF(color.hslHueF(), color.hslSaturationF(), lightness).toRgb() : color; };
+    colors.background = atMost(colors.background, 0.22); colors.windowEnd = atMost(colors.windowEnd, 0.22); colors.text = atLeast(colors.text, 0.72);
+    colors.angle = ((colors.angle % 360) + 360) % 360;
+    return colors;
+}
+ThemeColors themeFromSettings(const ThemeSettings& settings) {
+    ThemeColors colors; const auto read = [](const QString& name, const QColor& fallback) { const QColor color(name); return name.isEmpty() || !color.isValid() ? fallback : color; };
+    colors.background = read(settings.background, colors.background); colors.accent = read(settings.accent, colors.accent); colors.text = read(settings.text, colors.text);
+    colors.windowEnd = read(settings.windowEnd, colors.background); colors.accentEnd = read(settings.accentEnd, colors.accent);
+    colors.windowGradient = settings.windowGradient; colors.accentGradient = settings.accentGradient; colors.angle = settings.angle;
+    return darkTheme(colors);
+}
+ThemeSettings themeSettings(const ThemeColors& colors) {
+    ThemeSettings settings; if (colors == ThemeColors{}) return settings;
+    const auto name = [](const QColor& color) { return color.name().toUpper(); };
+    settings.background = name(colors.background); settings.accent = name(colors.accent); settings.text = name(colors.text);
+    settings.windowGradient = colors.windowGradient; settings.accentGradient = colors.accentGradient; settings.angle = colors.angle;
+    if (colors.windowGradient) settings.windowEnd = name(colors.windowEnd);
+    if (colors.accentGradient) settings.accentEnd = name(colors.accentEnd);
+    return settings;
+}
+// clipsapp-theme-0F0B17-A98BFF-EEEAF7-1C1030-D48BFF-135: background, accent, text, the second color of
+// each gradient ("0" without one), and the angle of the background's. One word, which survives a chat.
+QString themeCode(const ThemeColors& colors) {
+    const auto hex = [](const QColor& color) { return color.name().mid(1).toUpper(); };
+    return QStringLiteral("clipsapp-theme-%1-%2-%3-%4-%5-%6").arg(hex(colors.background), hex(colors.accent), hex(colors.text),
+        colors.windowGradient ? hex(colors.windowEnd) : QStringLiteral("0"), colors.accentGradient ? hex(colors.accentEnd) : QStringLiteral("0")).arg(colors.angle);
+}
+bool readThemeCode(const QString& text, ThemeColors& colors) {
+    static const QRegularExpression code(QStringLiteral("clipsapp-theme-([0-9a-f]{6})-([0-9a-f]{6})-([0-9a-f]{6})-([0-9a-f]{6}|0)-([0-9a-f]{6}|0)-(\\d{1,3})"), QRegularExpression::CaseInsensitiveOption);
+    const auto match = code.match(text); if (!match.hasMatch()) return false;
+    ThemeColors read; const auto color = [&match](int index) { return QColor(QLatin1Char('#') + match.captured(index)); };
+    read.background = color(1); read.accent = color(2); read.text = color(3);
+    read.windowGradient = match.captured(4) != QLatin1String("0"); read.windowEnd = read.windowGradient ? color(4) : read.background;
+    read.accentGradient = match.captured(5) != QLatin1String("0"); read.accentEnd = read.accentGradient ? color(5) : read.accent;
+    read.angle = match.captured(6).toInt() % 360;
+    colors = darkTheme(read); return true;
+}
+QString writeThemeIcon(const QString& directory) {
+    QDir folder(directory);
+    for (const auto& old : folder.entryList({QStringLiteral("Clipsapp-*.ico")}, QDir::Files)) folder.remove(old);
+    if (tk::accent == ThemeColors{}.accent && !tk::accentGradient) return {};
+    // An .ico made of PNG images, one per size Windows asks for, from the taskbar to large icons.
+    QList<QByteArray> images; const QList<int> sizes{16, 20, 24, 32, 40, 48, 64, 256};
+    for (const int size : sizes) {
+        QImage image(size, size, QImage::Format_ARGB32_Premultiplied); image.fill(Qt::transparent);
+        { QPainter painter(&image); paintLogo(painter, QRectF(0, 0, size, size)); }
+        QByteArray png; QBuffer buffer(&png); buffer.open(QIODevice::WriteOnly); image.save(&buffer, "PNG"); images.append(png);
+    }
+    QByteArray ico; QDataStream out(&ico, QIODevice::WriteOnly); out.setByteOrder(QDataStream::LittleEndian);
+    out << quint16(0) << quint16(1) << quint16(images.size());
+    quint32 offset = 6 + 16 * quint32(images.size());
+    for (int index = 0; index < images.size(); ++index) {
+        const int size = sizes[index];
+        out << quint8(size >= 256 ? 0 : size) << quint8(size >= 256 ? 0 : size) << quint8(0) << quint8(0) << quint16(1) << quint16(32) << quint32(images[index].size()) << offset;
+        offset += quint32(images[index].size());
+    }
+    for (const auto& image : images) out.writeRawData(image.constData(), int(image.size()));
+    // Named after its colors: Windows keeps icons by file, a new name shows the new one at once.
+    const auto path = folder.filePath(QStringLiteral("Clipsapp-%1.ico").arg(QString::fromLatin1(QCryptographicHash::hash(themeCode(ThemeColors{tk::window, tk::accent, tk::text, tk::windowGradient, tk::windowEnd, tk::accentGradient, tk::accentEnd, tk::gradientAngle}).toUtf8(), QCryptographicHash::Sha1).toHex().left(10))));
+    QFile file(path); if (!folder.mkpath(QStringLiteral(".")) || !file.open(QIODevice::WriteOnly) || file.write(ico) != ico.size()) return {};
+    return path;
+}
+void applyColors(const ThemeColors& colors) {
+    // Writing the style sheet again draws every window again: only when the theme changes.
+    static ThemeColors applied; static bool any = false;
+    auto* application = qobject_cast<QApplication*>(QCoreApplication::instance());
+    if (any && applied == colors && application && !application->styleSheet().isEmpty()) return;
+    applied = colors; any = true;
+    derive(colors);
+    if (!application) return;
+    applyPalette(*application); application->setStyleSheet(styleSheet());
+    // What draws itself reads the colors when it paints: it only needs to be painted again.
+    for (auto* widget : QApplication::allWidgets()) widget->update();
+}
 void applyTheme(QApplication& application) {
     application.setStyle("Fusion");
     QFont font;
@@ -201,76 +444,6 @@ void applyTheme(QApplication& application) {
     font.setFamilies({QStringLiteral("Noto Sans"), QStringLiteral("sans-serif")});
 #endif
     font.setPixelSize(13); application.setFont(font);
-    QPalette palette;
-    palette.setColor(QPalette::Window, tk::window); palette.setColor(QPalette::WindowText, tk::text);
-    palette.setColor(QPalette::Base, tk::field); palette.setColor(QPalette::AlternateBase, tk::surface);
-    palette.setColor(QPalette::Text, tk::text); palette.setColor(QPalette::Button, tk::raised);
-    palette.setColor(QPalette::ButtonText, tk::text); palette.setColor(QPalette::Highlight, QColor(0x1D, 0x4A, 0x3B));
-    palette.setColor(QPalette::HighlightedText, tk::text); palette.setColor(QPalette::PlaceholderText, tk::text3);
-    palette.setColor(QPalette::ToolTipBase, tk::raised); palette.setColor(QPalette::ToolTipText, tk::text);
-    palette.setColor(QPalette::Disabled, QPalette::Text, tk::textOff); palette.setColor(QPalette::Disabled, QPalette::WindowText, tk::textOff);
-    palette.setColor(QPalette::Disabled, QPalette::ButtonText, tk::textOff);
-    application.setPalette(palette);
-    application.setStyleSheet(QStringLiteral(R"(
-        QWidget { color: #E9EDF3; }
-        QWidget:disabled { color: #566070; }
-        QMainWindow, QDialog { background: #0C0E12; }
-        QToolTip { background: #1A1F27; color: #E9EDF3; border: 1px solid #323A47; padding: 7px 10px; }
-        QLabel { background: transparent; }
-        QLabel[role="t2"] { color: #A1AABA; }
-        QLabel[role="t3"] { color: #8A94A5; }
-        QLabel[role="small"], QLabel[role="hint"], QLabel[role="lbl"] { color: #A1AABA; }
-        QLabel[role="small3"], QLabel[role="cap"] { color: #8A94A5; }
-        QLabel[role="danger"] { color: #F2777C; }
-        QLabel[role="warn"] { color: #F2B35E; }
-        QLabel[role="warnText"] { color: #E9D3B0; }
-        QLabel:disabled { color: #566070; }
-        QFrame[card="true"] { background: #14181E; border: 1px solid #242A34; border-radius: 8px; }
-        QFrame[card="well"] { background: #0F1217; border: 1px solid #242A34; border-radius: 8px; }
-        QFrame[card="panel"] { background: #111419; border: 1px solid #242A34; border-radius: 8px; }
-        QFrame[card="bar"] { background: #1A1F27; border: 1px solid #3B4553; border-radius: 10px; }
-        QFrame[banner="ok"] { background: #11251F; border: 1px solid #1D3F33; border-radius: 8px; }
-        QFrame[banner="info"] { background: #1A2640; border: 1px solid #2B3D63; border-radius: 8px; }
-        QFrame[banner="warn"] { background: #241D10; border: 1px solid #4D3B1C; border-radius: 8px; }
-        QFrame[banner="err"] { background: #2A171A; border: 1px solid #5A2A30; border-radius: 8px; }
-        QFrame[line="h"] { background: #242A34; border: none; max-height: 1px; min-height: 1px; }
-        QFrame[line="v"] { background: #242A34; border: none; max-width: 1px; min-width: 1px; }
-        QLineEdit, QComboBox, QAbstractSpinBox { background: #0F1217; border: 1px solid #323A47; border-radius: 6px; padding: 0 10px; min-height: 30px; selection-background-color: #1D4A3B; selection-color: #E9EDF3; }
-        QLineEdit:hover, QComboBox:hover, QAbstractSpinBox:hover { border-color: #4A5464; }
-        QLineEdit:focus, QComboBox:focus, QAbstractSpinBox:focus { border: 2px solid #6FE3B4; padding: 0 9px; }
-        QLineEdit:disabled, QComboBox:disabled, QAbstractSpinBox:disabled { background: #111419; border-color: #1E242C; color: #566070; }
-        QLineEdit[bare="true"], QLineEdit[bare="true"]:focus, QLineEdit[bare="true"]:hover { background: transparent; border: none; padding: 0; min-height: 0; }
-        QKeySequenceEdit > QLineEdit { min-width: 140px; }
-        QComboBox::drop-down { width: 28px; border: none; }
-        QComboBox::down-arrow { image: none; }
-        QComboBox QAbstractItemView { background: #1A1F27; border: 1px solid #323A47; padding: 4px; outline: 0; selection-background-color: #262D38; selection-color: #E9EDF3; }
-        QComboBox QAbstractItemView::item { min-height: 30px; padding: 0 8px; border-radius: 5px; }
-        QComboBox QAbstractItemView::item:selected { background: #262D38; }
-        QMenu { background: #1A1F27; border: 1px solid #323A47; border-radius: 8px; padding: 4px; }
-        QMenu::item { padding: 6px 28px 6px 10px; border-radius: 5px; background: transparent; }
-        QMenu::item:selected { background: #262D38; }
-        QMenu::item:disabled { color: #566070; }
-        QMenu::item[danger="true"] { color: #F2777C; }
-        QMenu::separator { height: 1px; background: #2A313C; margin: 4px 6px; }
-        QMenu::icon { padding-left: 8px; }
-        QMenu::indicator { width: 0; }
-        QScrollArea { background: transparent; border: none; }
-        QScrollArea > QWidget > QWidget { background: transparent; }
-        QAbstractItemView { background: transparent; border: none; outline: 0; }
-        QScrollBar:vertical { background: transparent; width: 10px; margin: 2px 3px 2px 3px; }
-        QScrollBar::handle:vertical { background: #2E3542; min-height: 30px; border-radius: 2px; }
-        QScrollBar::handle:vertical:hover { background: #3B4553; }
-        QScrollBar:horizontal { background: #1A1F27; height: 8px; margin: 0; border-radius: 4px; }
-        QScrollBar::handle:horizontal { background: #323A47; min-width: 30px; border-radius: 3px; margin: 1px; }
-        QScrollBar::handle:horizontal:hover { background: #3B4553; }
-        QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
-        QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
-        QSlider { min-height: 16px; }
-        QSlider::groove:horizontal { height: 4px; background: #323A47; border-radius: 2px; }
-        QSlider::sub-page:horizontal { background: #6FE3B4; border-radius: 2px; }
-        QSlider::handle:horizontal { width: 10px; height: 10px; margin: -5px 0; border-radius: 7px; background: #E9EDF3; border: 2px solid #0C0E12; }
-        QSlider::handle:horizontal:focus { border-color: #8FB8FF; }
-        QSlider::sub-page:horizontal:disabled, QSlider::handle:horizontal:disabled { background: #566070; }
-    )"));
+    applyColors(ThemeColors{});
 }
 }

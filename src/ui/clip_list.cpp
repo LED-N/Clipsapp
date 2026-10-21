@@ -83,7 +83,7 @@ QMimeData* ClipListModel::mimeData(const QModelIndexList& indexes) const {
 ClipRowDelegate::ClipRowDelegate(ClipListView* view, ThumbnailCache* cache) : QStyledItemDelegate(view), m_view(view), m_cache(cache) {}
 void ClipRowDelegate::paintBackground(QPainter* painter, const QRectF& row, const QStyleOptionViewItem& option) const {
     const bool selected = option.state & QStyle::State_Selected, hovered = option.state & QStyle::State_MouseOver;
-    if (selected || hovered) { painter->setPen(Qt::NoPen); painter->setBrush(selected ? (hovered ? QColor(0x13, 0x2E, 0x26) : QColor(0x10, 0x26, 0x1F)) : tk::surface); painter->drawRoundedRect(row, 8, 8); }
+    if (selected || hovered) { painter->setPen(Qt::NoPen); painter->setBrush(selected ? (hovered ? tk::mix(tk::surface, tk::accent, 0.12) : tk::mix(tk::surface, tk::accent, 0.08)) : tk::surface); painter->drawRoundedRect(row, 8, 8); }
     if (m_view->keyboardFocus() && m_view->hasFocus() && m_view->currentIndex() == option.index) { painter->setPen(QPen(tk::info, 2)); painter->setBrush(Qt::NoBrush); painter->drawRoundedRect(row.adjusted(1, 1, -1, -1), 7, 7); }
 }
 bool ClipRowDelegate::paintThumbnail(QPainter* painter, const QRectF& rect, const QModelIndex& index, double radius, bool duration) const {

@@ -135,6 +135,15 @@ private slots:
         QCOMPARE(includedAudioRoots(processes, sessions, {"C:/Discord/Discord.exe"}, 99), QList<quint32>({11, 30}));
         QCOMPARE(includedAudioRoots(processes, {21, 100}, {"C:/Discord/Discord.exe"}, 99).size(), 0);
     }
+    void anUpdatedApplicationKeepsItsIdentity() {
+        // Discord moves to a new versioned folder at each update: its source and its exclusion follow it.
+        QCOMPARE(applicationIdentity("C:\\Users\\A\\AppData\\Local\\Discord\\app-1.0.9261\\Discord.exe"), applicationIdentity("c:/users/a/appdata/local/discord/app-1.0.9262/discord.exe"));
+        QVERIFY(applicationIdentity("C:/Discord/app-1.0.9262/Discord.exe") != applicationIdentity("C:/Discord/app-1.0.9262/Update.exe"));
+        QVERIFY(applicationIdentity("C:/DiscordPTB/app-1.0.9262/Discord.exe") != applicationIdentity("C:/Discord/app-1.0.9262/Discord.exe"));
+        QCOMPARE(applicationIdentity("C:/Games/Game.v1.2.exe"), QString("c:/games/game.v1.2.exe"));
+        const QList<AudioProcess> processes{{10, 1, "C:/Game.exe"}, {20, 1, "C:/Discord/app-1.0.9262/Discord.exe"}};
+        QCOMPARE(includedAudioRoots(processes, {10, 20}, {"C:\\Discord\\app-1.0.9261\\Discord.exe"}, 99), QList<quint32>({10}));
+    }
     void replayCutsAtAKeyframeAndOrdersAllTracks() {
         ReplayBuffer buffer(3000000, 1048576);
         for (int second = 0; second < 8; ++second) {
@@ -144,6 +153,58 @@ private slots:
         const auto snapshot = buffer.snapshot(); QCOMPARE(snapshot.startUs, 4000000); QCOMPARE(snapshot.endUs, 8000000);
         QVERIFY(snapshot.packets.first().stream == 0); QVERIFY(snapshot.packets.first().keyframe);
         qint64 previous = -1; for (const auto& packet : snapshot.packets) { QVERIFY(packet.dtsUs >= snapshot.startUs); QVERIFY(packet.dtsUs >= previous); previous = packet.dtsUs; }
+    }
+    void aBufferOnDiskCountsItsBytesAndLetsGoOfItsFiles() {
+        // A file of the disk buffer, in memory for the test: it stays while a packet points into it.
+        struct File final : PacketFile {
+            QByteArray bytes; std::shared_ptr<int> alive = std::make_shared<int>();
+            QByteArray read(qint64 offset, int size) const override { return bytes.mid(offset, size); }
+        };
+        auto file = std::make_shared<File>(); file->bytes = QByteArray(400, 'v'); const std::weak_ptr<int> alive = file->alive;
+        ReplayBuffer buffer(3000000, 1048576);
+        for (int second = 0; second < 8; ++second) {
+            EncodedPacket packet{0, second * 1000000LL, second * 1000000LL, 1000000, second % 2 == 0, {}};
+            packet.file = file; packet.offset = second * 50; packet.size = 50; buffer.push(std::move(packet));
+        }
+        QCOMPARE(buffer.bytes(), 4 * (50 + qint64(sizeof(EncodedPacket)) + 64));
+        {
+            const auto snapshot = buffer.snapshot(); QCOMPARE(snapshot.packets.first().payload(), QByteArray(50, 'v'));
+            // A clip still being saved keeps the file once the replay has let go of it; it goes with the clip.
+            file.reset(); buffer.clear(); QVERIFY(!alive.expired());
+        }
+        QVERIFY(alive.expired());
+    }
+    void theBufferPlaceIsASettingAndTheDiskIsProposedPastAShareOfTheMemory() {
+        auto config = AppConfig::defaults(); auto& replay = config.profiles.first().replay;
+        QCOMPARE(replay.storage, QString("memory")); QCOMPARE(QFileInfo(replayDiskFolder(replay)).fileName(), QStringLiteral("Buffer du replay"));
+        replay.storage = "disk"; replay.diskLimitMiB = 32768; replay.diskFolder = "D:/Buffer"; replay.keepMemory = true;
+        AppConfig loaded; QString error; QVERIFY2(AppConfig::fromJson(config.toJson(), loaded, error), qPrintable(error));
+        const auto& back = loaded.profiles.first().replay; QCOMPARE(back.storage, QString("disk")); QCOMPARE(back.diskLimitMiB, 32768); QCOMPARE(back.diskFolder, QString("D:/Buffer")); QVERIFY(back.keepMemory);
+        QCOMPARE(replayDiskFolder(back), QString("D:/Buffer"));
+        replay.diskFolder = "relatif"; QVERIFY(!config.validationErrors().isEmpty()); replay.diskFolder.clear(); replay.storage = "cloud"; QVERIFY(!config.validationErrors().isEmpty());
+        // One minute at 25 Mbit/s is about 190 MiB: nothing to say on 16 GiB. Ten minutes at 200 Mbit/s are about 14 GiB: the disk is proposed.
+        auto profile = AppConfig::defaults().profiles.first(); const qint64 sixteen = 16LL << 30;
+        QVERIFY(!suggestsDiskBuffer(profile, sixteen)); QVERIFY(!suggestsDiskBuffer(profile, 0));
+        profile.video.bitrateMbps = 200; profile.replay.durationSeconds = 600; QVERIFY(suggestsDiskBuffer(profile, sixteen));
+    }
+    void aRecordingStartsOnTheLastPictureAVideoCanStartOn() {
+        ReplayBuffer buffer(60000000, 1048576); QVERIFY(buffer.fromLastKeyframe().isEmpty());
+        for (int second = 0; second < 5; ++second) {
+            buffer.push({1, second * 1000000LL, second * 1000000LL, 1000000, true, QByteArray(10, 'a')});
+            buffer.push({0, second * 1000000LL, second * 1000000LL, 1000000, second % 2 == 0, QByteArray(50, 'v')});
+        }
+        // Keys at 0, 2 and 4 s: it starts at 4 s, the picture before the sound of the same instant.
+        const auto packets = buffer.fromLastKeyframe(); QCOMPARE(packets.size(), 2);
+        QCOMPARE(packets.first().stream, 0); QVERIFY(packets.first().keyframe); QCOMPARE(packets.first().dtsUs, 4000000); QCOMPARE(packets.last().stream, 1);
+    }
+    void theRecordingKeyIsASettingOfItsOwn() {
+        auto config = AppConfig::defaults(); QCOMPARE(config.recordHotkey, QString("Ctrl+Alt+F9")); QVERIFY(config.validationErrors().isEmpty());
+        config.recordHotkey = "Ctrl+Shift+R"; AppConfig loaded; QString error; QVERIFY(AppConfig::fromJson(config.toJson(), loaded, error)); QCOMPARE(loaded.recordHotkey, QString("Ctrl+Shift+R"));
+        config.recordHotkey = config.screenshotHotkey; QVERIFY(!config.validationErrors().isEmpty());
+        config.recordHotkey = config.profiles.first().replay.hotkey; QVERIFY(!config.validationErrors().isEmpty());
+        // A file from before the recording, whose replay already took its key, gets the next free one.
+        auto old = AppConfig::defaults(); old.profiles.first().replay.hotkey = "Ctrl+Alt+F9"; auto json = old.toJson(); json.remove("recording");
+        QVERIFY2(AppConfig::fromJson(json, loaded, error), qPrintable(error)); QCOMPARE(loaded.recordHotkey, QString("Ctrl+Alt+F8"));
     }
     void reorderedPicturesStartOnScreenTimeAndNeverEndOnAHole() {
         // Two B-frames between references, as an encoder hands them out: decoded two pictures late.

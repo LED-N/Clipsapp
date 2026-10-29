@@ -28,7 +28,7 @@ struct VideoSettings {
     int width = 1920;
     int height = 1080;
     int fps = 60;
-    int bitrateMbps = 25;
+    int bitrateMbps = 20;
     // "bitrate" aims at bitrateMbps. "quality" holds one level of quality and spends what each
     // scene needs, with bitrateMbps as its ceiling.
     QString rateControl = "bitrate";
@@ -38,6 +38,9 @@ struct VideoSettings {
     QString effort = "fast";
     QString codec = "h264";
     QString encoder = "auto";
+    // "light", "balanced" or "high": the bitrate then follows the resolution, the frequency and the
+    // codec (applyQualityPreset). Empty: set by hand, in the advanced settings.
+    QString preset = "balanced";
     bool captureCursor = false;
 };
 struct ReplaySettings {
@@ -80,6 +83,9 @@ struct AppConfig {
     qint64 discordLimitBytes = 20000000;
     QString discordCodec = "h264";
     bool discordAutoResize = true;
+    // The compression that saves room, as last chosen: its level (0 to 2) and the processor's AV1 rather than the card's HEVC.
+    int compressLevel = 0;
+    bool compressProcessor = false;
     // Listening level of the full-screen player, in percent. It changes nothing in the clips.
     int playbackVolume = 100;
     // Ask GitHub at launch whether a newer version was published.
@@ -89,8 +95,9 @@ struct AppConfig {
     bool closeToTray = true, trayNoticeShown = false;
     // A shortcut to the application is kept in the Start menu.
     bool startMenuShortcut = false;
-    // Started with the Windows session, the application waits behind its icon.
-    bool launchAtLogin = false;
+    // Started with the Windows session, the application waits behind its icon, or shows its window
+    // in front when "launchVisible" says so.
+    bool launchAtLogin = false, launchVisible = false;
     // When the replay starts by itself: never ("off"), as soon as the application runs ("launch"),
     // or while one of the games listed runs ("games"), until a little after the last one closes.
     QString autoReplay = "off";
@@ -114,7 +121,11 @@ struct AppConfig {
     QString screenshotSoundId = "shutter";
     int screenshotSoundVolume = 50;
     // The shortcut that starts a recording, and stops it: one key for both, whatever the replay does.
+    // Then the sound it makes: once as it starts, twice as it ends.
     QString recordHotkey = "Ctrl+Alt+F9";
+    bool recordSound = true;
+    QString recordSoundId = "beep";
+    int recordSoundVolume = 50;
     ThemeSettings theme;
     static AppConfig defaults();
     RecordingProfile* activeProfile();
@@ -126,14 +137,21 @@ struct AppConfig {
 QString newId();
 QStringList applicationExclusions(const AudioSource& source, const RecordingProfile& profile);
 // What the replay holds at the bitrate of the profile: its weight on a target, its most in constant quality.
+// The target bitrate of a preset, in Mbit/s: set for 1080p at 60 FPS in H.264, and following the
+// three-quarter power of the pixels and a little less than the frequency, HEVC needing less.
+int presetBitrate(const QString& preset, int width, int height, int fps, const QString& codec);
+// Fills in what the preset of these settings decides; nothing when it is empty.
+void applyQualityPreset(VideoSettings& video);
 double estimatedBufferMiB(const RecordingProfile& profile);
 // What it usually holds, from a calm game to a busy one. Both ends are the same on a target bitrate.
 struct BufferRange { double low = 0, high = 0; };
 BufferRange usualBufferMiB(const RecordingProfile& profile);
 // The folder of a buffer kept on disk: the one chosen, or "Buffer du replay" beside Clipsapp.
 QString replayDiskFolder(const ReplaySettings& replay);
-// Past this share of the memory of the PC, a buffer in memory weighs on the game: the disk is proposed.
-constexpr double diskBufferMemoryShare = 0.15;
+// Past a tenth of the memory of the PC, or 2 Gio on a large one, a buffer in memory weighs on the game
+// and on the whole system when it runs short: the disk is proposed. 8 Go give 800 Mio, 16 Go 1,6 Gio.
+constexpr double diskBufferMemoryShare = 0.10;
+constexpr double diskBufferMemoryCeilingMiB = 2048;
 bool suggestsDiskBuffer(const RecordingProfile& profile, qint64 physicalMemoryBytes);
 }
 

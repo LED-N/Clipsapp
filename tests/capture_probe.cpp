@@ -28,6 +28,7 @@ int main(int argc, char** argv) {
     parser.addOption({"bitrate", "Target bitrate, or ceiling of the constant quality", "Mbit/s", "25"});
     parser.addOption({"quality", "Hold this constant quality instead of a bitrate", "level"});
     parser.addOption({"thorough", "Ask the encoder for its thorough effort"});
+    parser.addOption({"encoder", "auto, nvenc, amf or mf (the encoder of the card through Windows)", "name", "auto"});
     parser.addOption({"seconds", "Observation duration", "seconds", "5"});
     parser.addOption({"buffer", "Replay duration", "seconds", "3"});
     parser.addOption({"automatic-audio", "Capture applications automatically"});
@@ -52,6 +53,7 @@ int main(int argc, char** argv) {
     profile.video.bitrateMbps = parser.value("bitrate").toInt();
     if (parser.isSet("quality")) { profile.video.rateControl = "quality"; profile.video.quality = parser.value("quality").toInt(); }
     if (parser.isSet("thorough")) profile.video.effort = "thorough";
+    profile.video.encoder = parser.value("encoder");
     profile.sources.clear();
     profile.sources.append({"output", "Son système", parser.isSet("automatic-audio") ? SourceKind::ApplicationMix : SourceKind::Output, "@default", "Par défaut", profile.tracks[1].id, true});
     if (parser.isSet("microphone")) profile.sources.append({"microphone", "Micro", SourceKind::Microphone, "@default", "Par défaut", profile.tracks[0].id, true});

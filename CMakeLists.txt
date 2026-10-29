@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(Clipsapp VERSION 0.8.4 LANGUAGES CXX)
+project(Clipsapp VERSION 0.8.5 LANGUAGES CXX)
 
 # The GitHub repository whose releases the published application follows for its updates,
 # written "owner/name". Left empty, the application never looks for updates.
@@ -34,6 +34,7 @@ target_include_directories(clipsapp_core PUBLIC src)
 target_link_libraries(clipsapp_core PUBLIC Qt6::Core)
 if(WIN32)
     target_compile_definitions(clipsapp_core PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_sources(clipsapp_core PRIVATE src/platform/windows_monitors.cpp src/platform/windows_monitors.h)
     target_link_libraries(clipsapp_core PRIVATE user32 version dbghelp ole32 shell32 uuid)
 endif()
 
@@ -62,6 +63,7 @@ add_library(clipsapp_editor STATIC
     src/media/clip_reader.cpp src/media/clip_reader.h
     src/media/clip_player.cpp src/media/clip_player.h
     src/media/clip_exporter.cpp src/media/clip_exporter.h
+    src/media/clip_compressor.cpp src/media/clip_compressor.h
     src/media/clip_analysis.cpp src/media/clip_analysis.h
     src/media/gpu_video.cpp src/media/gpu_video.h
     src/media/audio_output.h ${CLIPSAPP_AUDIO_OUTPUT}
@@ -71,7 +73,7 @@ add_library(clipsapp_editor STATIC
 target_link_libraries(clipsapp_editor PUBLIC clipsapp_core Qt6::Gui PRIVATE clipsapp_media)
 if(WIN32)
     target_compile_definitions(clipsapp_editor PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-    target_link_libraries(clipsapp_editor PRIVATE ole32 uuid mmdevapi winmm d3d11 dxgi dxguid)
+    target_link_libraries(clipsapp_editor PRIVATE ole32 oleaut32 shell32 dwmapi uuid mmdevapi winmm d3d11 dxgi dxguid)
 endif()
 
 set(CLIPSAPP_APP_SOURCES
@@ -83,12 +85,16 @@ set(CLIPSAPP_APP_SOURCES
     src/ui/thumbnail_cache.cpp src/ui/thumbnail_cache.h
     src/ui/clip_list.cpp src/ui/clip_list.h
     src/ui/library_page.cpp src/ui/library_page.h
-    src/ui/sharing_page.cpp src/ui/sharing_page.h
+    src/ui/compressor_page.cpp src/ui/compressor_page.h
     src/ui/settings_page.cpp src/ui/settings_page.h
     src/ui/source_dialog.cpp src/ui/source_dialog.h
     src/ui/onboarding_page.cpp src/ui/onboarding_page.h
     src/ui/discord_batch.cpp src/ui/discord_batch.h
-    src/ui/discord_dialog.cpp src/ui/discord_dialog.h
+    src/ui/compressor_dialog.cpp src/ui/compressor_dialog.h
+    src/ui/delete_prompt.cpp src/ui/delete_prompt.h
+    src/ui/quality_tiles.cpp src/ui/quality_tiles.h
+    src/ui/compress_batch.cpp src/ui/compress_batch.h
+    src/ui/compare_view.cpp src/ui/compare_view.h
     src/ui/clip_editor.cpp src/ui/clip_editor.h
     src/ui/screenshot_editor.cpp src/ui/screenshot_editor.h
     src/ui/image_viewer.cpp src/ui/image_viewer.h

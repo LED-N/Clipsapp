@@ -14,7 +14,7 @@ namespace clipsapp {
 ImageViewer::ImageViewer(QWidget* owner) : QWidget(owner, Qt::Window | Qt::FramelessWindowHint), m_owner(owner) {
     setObjectName("image-viewer"); setWindowTitle(QStringLiteral("Clipsapp")); setWindowModality(Qt::ApplicationModal); setAttribute(Qt::WA_OpaquePaintEvent);
     setFocusPolicy(Qt::StrongFocus); setMouseTracking(true); followVisibility(this, owner);
-    setStyleSheet(QStringLiteral("QFrame#viewerBar { background: rgba(12, 14, 18, 224); border: none; }"));
+    setThemedStyleSheet(this, QStringLiteral("QFrame#viewerBar { background: {veil}; border: none; }"));
     // The bar of the clip viewer, with what a picture offers: the editor and a copy for Discord.
     auto* top = new QFrame(this); top->setObjectName("viewerBar"); m_top = top; auto* layout = new QHBoxLayout(top); layout->setContentsMargins(20, 0, 12, 0); layout->setSpacing(12);
     m_title = new ElideLabel({}, "clip", Qt::ElideMiddle); m_title->setObjectName("image-viewer-title"); m_title->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed); layout->addWidget(m_title);

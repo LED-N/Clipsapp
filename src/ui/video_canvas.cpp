@@ -7,6 +7,7 @@
 #include <QPainterPath>
 #include <algorithm>
 #include <cmath>
+#include <utility>
 namespace clipsapp {
 namespace {
 const QColor ground(0x07, 0x08, 0x0A);
@@ -39,11 +40,14 @@ QRectF VideoCanvas::frameRect(const QRect& crop) const {
 VideoSurface* VideoCanvas::prepareSurface() {
     if (!VideoSurface::usable(this)) return nullptr;
     if (m_surface) return m_surface;
-    m_surface = new VideoSurface(this); m_surface->setGeometry(rect()); m_surface->setCursor(cursor()); m_surface->hide();
+    m_surface = new VideoSurface(this); if (!m_surface->ready()) { delete std::exchange(m_surface, nullptr); return nullptr; }
+    m_surface->setGeometry(rect()); m_surface->setCursor(cursor()); m_surface->hide();
     // The buttons that sit on the image keep their place above it.
     VideoSurface::raiseAbove(m_overlay);
     return m_surface;
 }
+// The surface and the device behind it hold a good deal of memory: once the clip is closed they go, and come back with the next one.
+void VideoCanvas::releaseSurface() { m_direct = false; delete std::exchange(m_surface, nullptr); }
 void VideoCanvas::setDirect(bool direct) {
     direct = direct && m_surface; if (direct == m_direct) return;
     m_direct = direct;
@@ -112,8 +116,9 @@ void VideoCanvas::paintOver(QPainter& painter, const QRectF& display, bool resul
         const QRect selected = m_drag != Drag::None ? dragged() : m_crop; const bool whole = selected == QRect(QPoint(), m_original) && m_drag == Drag::None;
         const QRectF frame = frameRect(selected);
         if (!whole) {
-            QPainterPath shade; shade.addRect(display); shade.addRect(frame); painter.fillPath(shade, QColor(4, 5, 7, 173));
-            painter.setPen(QPen(QColor(233, 237, 243, 56), 1));
+            auto veil = tk::mix(tk::window, QColor(Qt::black), 0.6), thirds = tk::text; veil.setAlpha(173); thirds.setAlpha(56);
+            QPainterPath shade; shade.addRect(display); shade.addRect(frame); painter.fillPath(shade, veil);
+            painter.setPen(QPen(thirds, 1));
             for (int third = 1; third < 3; ++third) { const double x = std::round(frame.x() + frame.width() * third / 3) + 0.5, y = std::round(frame.y() + frame.height() * third / 3) + 0.5; painter.drawLine(QPointF(x, frame.top()), QPointF(x, frame.bottom())); painter.drawLine(QPointF(frame.left(), y), QPointF(frame.right(), y)); }
         }
         const bool framed = !whole || (m_tool && m_freeFrame);

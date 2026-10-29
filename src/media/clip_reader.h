@@ -4,6 +4,7 @@
 #include <QImage>
 #include <atomic>
 #include <memory>
+#include <stdexcept>
 namespace clipsapp {
 // What the reader hands out as images. By default the whole frame, never larger than
 // 1280 x 720: enough for an editing preview, and light. A presentation asks instead for
@@ -15,6 +16,8 @@ struct FrameOutput {
     bool fit = false;
     bool operator==(const FrameOutput& other) const { return box == other.box && crop == other.crop && fit == other.fit; }
 };
+// A reading stopped on purpose, met where it could not simply return: nothing is wrong with the clip.
+struct ReadInterrupted : std::runtime_error { using std::runtime_error::runtime_error; };
 class ClipReader {
 public:
     // presentable: the images stay on the graphics card, for a window that shows them from there.
@@ -32,6 +35,8 @@ public:
     // with the sound being read too the clip is playing, and presentMs moves on with the clock meanwhile.
     void readUntil(qint64 endMs, const std::atomic_bool& stop, bool videoOnly = false, qint64 videoEndMs = -1, qint64 presentMs = -1);
     QImage frameAt(qint64 positionMs);
+    // When the image frameAt() gave last starts in the clip; -1 before the first.
+    qint64 frameTime() const;
     // The same for a presentable reader: the image due at that time, still on the card. Nothing
     // when this clip is decoded in memory, which direct() tells before the first image.
     GpuFrame gpuFrameAt(qint64 positionMs);
@@ -41,4 +46,9 @@ private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 };
+// Whether Clipsapp already compressed this file, read from its container alone: far quicker than
+// opening it, for a whole library. A file that cannot be read was not.
+bool compressedByClipsapp(const QString& path);
+// The codec of its picture (« h264 », « hevc », « av1 »…), read from the container alone; empty for a file that is not a video.
+QString videoCodecOf(const QString& path);
 }

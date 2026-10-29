@@ -12,6 +12,8 @@ public:
     // Polls the frame pool without waiting. Duplicates the last image when idle.
     bool read(AVFrame* frame);
     QString warning() const;
+    // The screen captured is gone for now: the images are black until it is back.
+    bool lost() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;

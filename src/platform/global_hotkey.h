@@ -18,4 +18,7 @@ signals:
 private:
     bool m_bound = false; int m_id;
 };
+// The key Windows knows for the one Qt recorded: the keys of the numeric keypad, and the
+// punctuation of the keyboard in use (« é » of AZERTY, « + » of QWERTY). Zero when there is none.
+unsigned windowsVirtualKey(QKeyCombination combination);
 }

@@ -50,7 +50,7 @@ void ClipTimeline::rebuildRows() {
         auto* percent = monoLabel(QString("%1 %").arg(volume->value()), 11, tk::text2); percent->setFixedWidth(40); percent->setAlignment(Qt::AlignRight | Qt::AlignVCenter); level->addWidget(percent); layout->addLayout(level); layout->addStretch();
         const auto reflect = [mute, title, name](bool muted) {
             mute->setIconName(muted ? QStringLiteral("muted") : QStringLiteral("speaker")); mute->setToolTip((muted ? QStringLiteral("Rétablir le son de ") : QStringLiteral("Couper le son de ")) + name); mute->setAccessibleName(mute->toolTip());
-            title->setStyleSheet(muted ? QStringLiteral("color: #7C8696;") : QString());
+            setThemedStyleSheet(title, muted ? QStringLiteral("color: {muted};") : QString());
         };
         reflect(mute->isChecked());
         connect(remove, &QPushButton::clicked, this, [this, stream = edit.tracks[track].stream] { emit removeTrackRequested(stream); });
@@ -150,7 +150,8 @@ void ClipTimeline::paintContent(QPainter& painter) {
     // Outside the selection: a dark veil and diagonal hatching, over the frames and every track.
     for (const QRectF& out : {QRectF(m.header, m.ruler, start - m.header, height() - m.ruler), QRectF(end, m.ruler, width() - end, height() - m.ruler)}) {
         if (out.width() <= 0) continue;
-        painter.fillRect(out, QColor(7, 8, 11, 168)); painter.fillRect(out, QBrush(QColor(233, 237, 243, 20), Qt::BDiagPattern));
+        auto veil = tk::mix(tk::window, QColor(Qt::black), 0.4), hatch = tk::text; veil.setAlpha(168); hatch.setAlpha(20);
+        painter.fillRect(out, veil); painter.fillRect(out, QBrush(hatch, Qt::BDiagPattern));
     }
     painter.setRenderHint(QPainter::Antialiasing); painter.fillRect(QRectF(start, m.ruler, end - start, 2), tk::accent); painter.fillRect(QRectF(start, m.ruler + m.video - 2, end - start, 2), tk::accent);
     for (const bool leading : {true, false}) {

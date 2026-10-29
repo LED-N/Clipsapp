@@ -230,7 +230,7 @@ public:
     CaptureStats stats() const override {
         QMutexLocker lock(&m_mutex);
         const bool recording = m_recording && !m_recording->done();
-        return {m_buffer.seconds(), m_buffer.bytes(), m_frames, m_encoder, m_warning, m_lost, m_silent, recording, recording ? m_recording->seconds() : 0, recording ? m_recording->bytes() : 0, m_bufferError};
+        return {m_buffer.seconds(), m_buffer.bytes(), m_frames, m_encoder, m_warning, m_lost, m_silent, recording, recording ? m_recording->seconds() : 0, recording ? m_recording->bytes() : 0, m_bufferError, m_screenLost};
     }
     QString startRecording(const QString& path) override {
         QMutexLocker lock(&m_mutex);
@@ -265,7 +265,7 @@ public:
         const auto cleanup = qScopeGuard([this] {
             QMutexLocker lock(&m_mutex);
             m_buffer.clear(); m_streams.clear(); m_frames = 0;
-            m_encoder.clear(); m_warning.clear(); m_lost = 0; m_silent.clear();
+            m_encoder.clear(); m_warning.clear(); m_lost = 0; m_silent.clear(); m_screenLost = false;
             // Its files go with the last packet that uses them, once a clip being saved is written.
             m_disk.reset();
         });
@@ -366,7 +366,7 @@ public:
                 if (const qint64 now = (windowsClock100ns() - epoch) / 10000000; now != second) {
                     second = now; int encoded = 0, lost = 0; for (const auto& [kept, given] : seconds) { encoded += kept; lost += given; }
                     QStringList silent; for (const auto& item : audio) for (const auto& input : item->sources) if (!input->unavailable().isEmpty()) silent.append(input->source().name);
-                    { QMutexLocker lock(&m_mutex); m_lost = encoded + lost ? double(lost) / (encoded + lost) : 0; m_silent = silent; }
+                    { QMutexLocker lock(&m_mutex); m_lost = encoded + lost ? double(lost) / (encoded + lost) : 0; m_silent = silent; if (nativeVideo) { m_screenLost = nativeVideo->lost(); m_warning = nativeVideo->warning(); } }
                     seconds.emplace_back(0, 0); while (seconds.size() > 5) seconds.pop_front();
                 }
                 if (nativeVideo) {
@@ -386,16 +386,18 @@ private:
         const auto& video = m_profile.video;
         QStringList candidates;
         if (m_synthetic) candidates = {"libopenh264"};
-        else if (video.encoder == "auto") candidates = {video.codec + "_nvenc", video.codec + "_amf"};
-        else if (video.encoder == "nvenc" || video.encoder == "amf") candidates = {video.codec + '_' + video.encoder};
-        else throw std::runtime_error("Encodeur inconnu : choisissez Automatique, NVIDIA NVENC ou AMD AMF dans les réglages.");
+        // Last, the encoder of the card as Windows offers it (Media Foundation): it does not depend on the
+        // version of NVENC that FFmpeg asks for, which the GTX 900 and 1000 no longer get from NVIDIA.
+        else if (video.encoder == "auto") candidates = {video.codec + "_nvenc", video.codec + "_amf", video.codec + "_mf"};
+        else if (video.encoder == "nvenc" || video.encoder == "amf" || video.encoder == "mf") candidates = {video.codec + '_' + video.encoder};
+        else throw std::runtime_error("Encodeur inconnu : choisissez Automatique, NVIDIA NVENC, AMD AMF ou Windows dans les réglages.");
         const bool constantQuality = video.rateControl == "quality", thorough = video.effort == "thorough";
         const qint64 bitrate = qint64(video.bitrateMbps) * 1000000;
         const QByteArray quality = QByteArray::number(video.quality);
         QStringList errors;
         for (const auto& name : candidates) {
             const auto* codec = avcodec_find_encoder_by_name(name.toUtf8().constData()); if (!codec) { errors.append(name + ": absent"); continue; }
-            const bool nvenc = name.endsWith("nvenc"), amf = name.endsWith("amf");
+            const bool nvenc = name.endsWith("nvenc"), amf = name.endsWith("amf"), windows = name.endsWith("_mf");
             // Each step asks a little less of the GPU, down to what every card of the family accepts:
             // B-frames used as references, then plain B-frames, then none. The buffer lives in memory,
             // so nothing here is tuned for latency.
@@ -408,7 +410,7 @@ private:
                 context->sample_aspect_ratio = {1, 1}; context->color_primaries = AVCOL_PRI_BT709; context->color_trc = AVCOL_TRC_BT709; context->colorspace = AVCOL_SPC_BT709;
                 if (first->hw_frames_ctx) context->hw_frames_ctx = av_buffer_ref(first->hw_frames_ctx);
                 // The last resort on AMD is a plain constant bitrate, which every driver accepts.
-                const bool legacy = amf && step == 0, tuned = (nvenc || amf) && !legacy;
+                const bool legacy = amf && step == 0, tuned = (nvenc || amf || windows) && !legacy;
                 // A target lets hard scenes borrow from calm ones; a constant quality only knows its ceiling.
                 context->bit_rate = tuned && constantQuality ? 0 : bitrate;
                 context->rc_max_rate = tuned && !constantQuality ? bitrate * 3 / 2 : bitrate;
@@ -420,6 +422,13 @@ private:
                     if (constantQuality) set("cq", quality.constData());
                     if (step >= 1) context->max_b_frames = 2;
                     if (step == 2) set("b_ref_mode", "middle");
+                } else if (windows) {
+                    // Only the chip of the card, never a software encoder of Windows. A constant quality goes from 0 to 100 there.
+                    set("hw_encoding", "1");
+                    // Windows starts from the plainest profile of H.264, which compresses worst.
+                    if (video.codec == QLatin1String("h264")) context->profile = AV_PROFILE_H264_HIGH;
+                    if (constantQuality) { set("rate_control", "quality"); set("quality", QByteArray::number(std::clamp(100 - (video.quality - 10) * 4, 1, 100)).constData()); }
+                    else set("rate_control", "pc_vbr");
                 } else if (legacy) {
                     set("usage", "lowlatency"); set("rc", "cbr");
                 } else if (amf) {
@@ -429,7 +438,10 @@ private:
                 }
                 const int status = avcodec_open2(context, codec, &options); av_dict_free(&options);
                 if (status >= 0) { QMutexLocker lock(&m_mutex); m_encoder = name; return; }
-                char message[AV_ERROR_MAX_STRING_SIZE]; av_strerror(status, message, sizeof(message)); errors.append(name + ": " + QString::fromUtf8(message));
+                char message[AV_ERROR_MAX_STRING_SIZE]; av_strerror(status, message, sizeof(message));
+                // FFmpeg says « Function not implemented » when the driver offers an older NVENC than it needs.
+                errors.append(name + ": " + (nvenc && status == AVERROR(ENOSYS) ? QStringLiteral("pilote NVIDIA trop ancien pour NVENC (version 610 ou plus récente requise)") : QString::fromUtf8(message)));
+                if (nvenc && status == AVERROR(ENOSYS)) break;
             }
         }
         throw std::runtime_error((QStringLiteral("Aucun encodeur matériel disponible. Vérifiez le pilote GPU et le codec choisi.\n") + errors.join('\n')).toStdString());
@@ -501,6 +513,7 @@ private:
     quint64 m_frames = 0;
     double m_lost = 0;
     QStringList m_silent;
+    bool m_screenLost = false;
 };
 }
 std::shared_ptr<CaptureBackend> createCaptureBackend(const RecordingProfile& profile) { return std::make_shared<WindowsCapture>(profile); }

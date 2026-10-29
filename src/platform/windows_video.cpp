@@ -1,11 +1,13 @@
 #include "windows_video.h"
 #include "windows_audio.h"
 #include "windows_capture_abi.h"
+#include "windows_monitors.h"
 #include <d3d11.h>
 #include <roapi.h>
 #include <winstring.h>
 #include <QImage>
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 #include <thread>
@@ -77,15 +79,20 @@ struct WindowsVideo::Impl {
     AVBufferRef* hardware = nullptr;
     AVBufferRef* frames = nullptr;
     AVFrame* last = av_frame_alloc();
+    // Shown while the screen captured is gone, until it comes back.
+    AVFrame* black = av_frame_alloc();
     int inputWidth = 0, inputHeight = 0;
     wgc::Size poolSize{};
+    const std::atomic_bool* stopping = nullptr;
+    bool lost = false; QString topology; std::chrono::steady_clock::time_point nextCheck;
     ~Impl() {
-        close(session.p); close(pool.p); session.reset(); pool.reset(); item.reset(); winrtDevice.reset();
-        av_frame_free(&last); av_buffer_unref(&frames); av_buffer_unref(&hardware);
+        closeSession(); winrtDevice.reset();
+        av_frame_free(&last); av_frame_free(&black); av_buffer_unref(&frames); av_buffer_unref(&hardware);
         processor.reset(); enumerator.reset(); videoContext.reset(); videoDevice.reset(); context.reset(); device.reset();
         if (apartment) RoUninitialize();
     }
     void setup(const std::atomic_bool& stop) {
+        stopping = &stop;
         check(RoInitialize(RO_INIT_MULTITHREADED), "Initialisation de la capture"); apartment = true;
         const QString resolved = windowsVideoOptions(settings.targetId);
         if (resolved.startsWith("hwnd=")) window = reinterpret_cast<HWND>(quintptr(resolved.mid(5).toULongLong()));
@@ -96,17 +103,8 @@ struct WindowsVideo::Impl {
         check(context->QueryInterface(__uuidof(ID3D11VideoContext), reinterpret_cast<void**>(videoContext.out())), "Traitement vidéo GPU");
         Com<IDXGIDevice> dxgi; check(device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(dxgi.out())), "Périphérique DXGI");
         check(CreateDirect3D11DeviceFromDXGIDevice(dxgi.p, winrtDevice.out()), "Périphérique de capture");
-        Com<wgc::ItemFactory> itemFactory; factory(L"Windows.Graphics.Capture.GraphicsCaptureItem", wgc::itemFactoryId, reinterpret_cast<void**>(itemFactory.out()));
-        if (window) check(itemFactory->ForWindow(window, wgc::itemId, reinterpret_cast<void**>(item.out())), "Capture de la fenêtre");
-        else check(itemFactory->ForMonitor(monitor, wgc::itemId, reinterpret_cast<void**>(item.out())), "Capture du moniteur");
-        check(item->GetSize(&poolSize), "Dimensions de la source");
-        Com<wgc::PoolFactory> poolFactory; factory(L"Windows.Graphics.Capture.Direct3D11CaptureFramePool", wgc::poolFactoryId, reinterpret_cast<void**>(poolFactory.out()));
-        check(poolFactory->Create(winrtDevice.p, 87 /* B8G8R8A8_UNORM */, 2, poolSize, pool.out()), "Buffer de capture GPU");
-        check(pool->CreateSession(item.p, session.out()), "Session de capture");
-        Com<wgc::Cursor> cursor;
-        check(session->QueryInterface(wgc::cursorId, reinterpret_cast<void**>(cursor.out())), "Réglage du curseur");
-        check(cursor->Set(settings.captureCursor), "Capture du curseur");
-        if (!disableBorder(session.p, stop)) warning = QStringLiteral("Windows n'a pas autorisé la capture sans bordure. La bordure jaune peut rester visible.");
+        openSession(stop);
+        if (monitor) { topology = screens(windowsMonitors()); nextCheck = std::chrono::steady_clock::now() + std::chrono::seconds(1); }
         hardware = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA); if (!hardware) throw std::bad_alloc();
         auto* hardwareContext = reinterpret_cast<AVD3D11VADeviceContext*>(reinterpret_cast<AVHWDeviceContext*>(hardware->data)->hwctx);
         device->AddRef(); hardwareContext->device = device.p;
@@ -120,6 +118,58 @@ struct WindowsVideo::Impl {
         reinterpret_cast<AVD3D11VAFramesContext*>(frameContext->hwctx)->BindFlags = D3D11_BIND_RENDER_TARGET;
         if (av_hwframe_ctx_init(frames) < 0) throw std::runtime_error("Buffer d'encodage GPU indisponible.");
         check(session->Start(), "Démarrage de Windows Graphics Capture");
+    }
+    // The source in Windows Graphics Capture: its item, its pool and its session. A screen that comes back
+    // is given new ones on the same device: its images keep going to the same encoder.
+    void openSession(const std::atomic_bool& stop) {
+        Com<wgc::ItemFactory> itemFactory; factory(L"Windows.Graphics.Capture.GraphicsCaptureItem", wgc::itemFactoryId, reinterpret_cast<void**>(itemFactory.out()));
+        if (window) check(itemFactory->ForWindow(window, wgc::itemId, reinterpret_cast<void**>(item.out())), "Capture de la fenêtre");
+        else check(itemFactory->ForMonitor(monitor, wgc::itemId, reinterpret_cast<void**>(item.out())), "Capture du moniteur");
+        check(item->GetSize(&poolSize), "Dimensions de la source");
+        Com<wgc::PoolFactory> poolFactory; factory(L"Windows.Graphics.Capture.Direct3D11CaptureFramePool", wgc::poolFactoryId, reinterpret_cast<void**>(poolFactory.out()));
+        check(poolFactory->Create(winrtDevice.p, 87 /* B8G8R8A8_UNORM */, 2, poolSize, pool.out()), "Buffer de capture GPU");
+        check(pool->CreateSession(item.p, session.out()), "Session de capture");
+        Com<wgc::Cursor> cursor;
+        check(session->QueryInterface(wgc::cursorId, reinterpret_cast<void**>(cursor.out())), "Réglage du curseur");
+        check(cursor->Set(settings.captureCursor), "Capture du curseur");
+        warning.clear(); if (!disableBorder(session.p, stop)) warning = QStringLiteral("Windows n'a pas autorisé la capture sans bordure. La bordure jaune peut rester visible.");
+    }
+    void closeSession() { close(session.p); close(pool.p); session.reset(); pool.reset(); item.reset(); }
+    // How the screens are laid out now: a screen put back may keep its handle, but not its session.
+    static QString screens(const QList<WindowsMonitor>& monitors) {
+        QStringList parts; for (const auto& screen : monitors) parts << QStringLiteral("%1|%2|%3,%4,%5,%6").arg(screen.device, screen.path).arg(screen.area.x()).arg(screen.area.y()).arg(screen.area.width()).arg(screen.area.height());
+        return parts.join(QLatin1Char(';'));
+    }
+    // Once a second, the screen captured is looked for again. Gone, the capture goes on with a black image;
+    // back, under its handle or another, it starts again from where it is now.
+    void follow() {
+        const auto now = std::chrono::steady_clock::now(); if (now < nextCheck) return; nextCheck = now + std::chrono::seconds(1);
+        const auto monitors = windowsMonitors(); const auto arrangement = screens(monitors); const auto found = findMonitor(settings.targetId, monitors);
+        if (!found) { if (!lost) { lost = true; closeSession(); } topology = arrangement; return; }
+        const auto handle = static_cast<HMONITOR>(found->handle);
+        if (!lost && handle == monitor && arrangement == topology) return;
+        topology = arrangement; closeSession(); monitor = handle;
+        try { const std::atomic_bool never{false}; openSession(stopping ? *stopping : never); check(session->Start(), "Démarrage de Windows Graphics Capture"); lost = false; }
+        catch (const std::exception&) { closeSession(); lost = true; }
+    }
+    // Black, at the size the clip is encoded: the two planes of one image cleared once, then shared.
+    bool blank(AVFrame* output) {
+        if (!black->buf[0]) {
+            if (av_hwframe_get_buffer(frames, black, 0) < 0) return false;
+            auto* texture = reinterpret_cast<ID3D11Texture2D*>(black->data[0]); const UINT slice = UINT(quintptr(black->data[1])); D3D11_TEXTURE2D_DESC description; texture->GetDesc(&description);
+            const auto clear = [&](DXGI_FORMAT format, const float* value) {
+                D3D11_RENDER_TARGET_VIEW_DESC view{}; view.Format = format;
+                if (description.ArraySize > 1) { view.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY; view.Texture2DArray.FirstArraySlice = slice; view.Texture2DArray.ArraySize = 1; }
+                else view.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+                Com<ID3D11RenderTargetView> target; if (FAILED(device->CreateRenderTargetView(texture, &view, target.out()))) return false;
+                context->ClearRenderTargetView(target.p, value); return true;
+            };
+            const float luma[4]{16 / 255.f, 0, 0, 1}, chroma[4]{128 / 255.f, 128 / 255.f, 0, 1};
+            if (!clear(DXGI_FORMAT_R8_UNORM, luma) || !clear(DXGI_FORMAT_R8G8_UNORM, chroma)) { av_frame_unref(black); return false; }
+            context->Flush();
+            black->sample_aspect_ratio = {1, 1}; black->color_primaries = AVCOL_PRI_BT709; black->color_trc = AVCOL_TRC_BT709; black->colorspace = AVCOL_SPC_BT709; black->color_range = AVCOL_RANGE_MPEG;
+        }
+        return av_frame_ref(output, black) >= 0;
     }
     void scale(ID3D11Texture2D* input, wgc::Size content, AVFrame* output) {
         D3D11_TEXTURE2D_DESC inputDesc; input->GetDesc(&inputDesc);
@@ -166,12 +216,19 @@ struct WindowsVideo::Impl {
 WindowsVideo::WindowsVideo(const VideoSettings& settings, const std::atomic_bool& stop) : m_impl(std::make_unique<Impl>()) { m_impl->settings = settings; m_impl->setup(stop); }
 WindowsVideo::~WindowsVideo() = default;
 QString WindowsVideo::warning() const { return m_impl->warning; }
+bool WindowsVideo::lost() const { return m_impl->lost; }
 bool WindowsVideo::read(AVFrame* output) {
     auto& capture = *m_impl;
     if (capture.window && !IsWindow(capture.window)) throw std::runtime_error("La fenêtre capturée a été fermée. La capture est arrêtée et le buffer vidé.");
-    if (capture.monitor) { MONITORINFO info{}; info.cbSize = sizeof(info); if (!GetMonitorInfoW(capture.monitor, &info)) throw std::runtime_error("Le moniteur capturé a été déconnecté."); }
-    Com<wgc::Frame> frame; check(capture.pool->Next(frame.out()), "Lecture de la capture");
-    if (frame.p) {
+    // A screen comes and goes: while it is gone the capture shows black, and it starts again when it is back.
+    if (capture.monitor) capture.follow();
+    Com<wgc::Frame> frame;
+    if (const HRESULT next = capture.lost ? S_OK : capture.pool->Next(frame.out()); FAILED(next)) {
+        if (!capture.monitor) check(next, "Lecture de la capture");
+        capture.lost = true; capture.closeSession(); capture.nextCheck = {};
+    }
+    if (capture.lost) { av_frame_unref(output); if (capture.blank(output)) return true; }
+    else if (frame.p) {
         Com<IInspectable> surface; Com<wgc::DxgiAccess> access; Com<ID3D11Texture2D> texture;
         wgc::Size size{}; check(frame->ContentSize(&size), "Dimensions de l'image");
         check(frame->Surface(surface.out()), "Surface capturée");

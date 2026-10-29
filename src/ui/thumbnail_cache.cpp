@@ -9,8 +9,10 @@
 #include <QJsonObject>
 #include <QSaveFile>
 #include <QtConcurrent/QtConcurrentRun>
+#include <utility>
 namespace clipsapp {
 namespace {
+constexpr int retryDelay = 15000;
 QString indexPath(const QString& storage) { return QDir(storage).filePath(QStringLiteral("index.json")); }
 QString imageName(const QString& key) { return QString::fromLatin1(QCryptographicHash::hash(key.toUtf8(), QCryptographicHash::Sha1).toHex()) + QStringLiteral(".jpg"); }
 // The clip a key stands for, with the size and the date it had when it was read.
@@ -27,7 +29,11 @@ ThumbnailCache::ThumbnailCache(QObject* parent) : QObject(parent) {
         const auto result = m_worker.result(); m_pending.remove(result.key);
         if (m_stop && !m_stop->load()) {
             if (m_meta.size() >= 20000) { m_meta.clear(); m_stored.clear(); }
-            m_meta.insert(result.key, {result.info.durationMs, result.info.size, result.info.fps, int(result.info.audio.size()), result.image.isNull()});
+            const int attempts = result.image.isNull() ? (m_meta.contains(result.key) ? m_meta[result.key].attempts : 0) + 1 : 0;
+            m_meta.insert(result.key, {result.info.durationMs, result.info.size, result.info.fps, int(result.info.audio.size()), result.image.isNull(), attempts, QDateTime::currentMSecsSinceEpoch()});
+            // The views ask again once the wait is over: a clip still being written, or replaced, is read by then.
+            if (result.image.isNull() && attempts < 3) QTimer::singleShot(retryDelay, this, [this, key = result.key] { emit ready(key); });
+            if (result.error.isEmpty() && !isImageFile(result.info.path)) m_marks.insert(result.key, result.info.compressed);
             const auto cost = std::max(1, int(result.image.sizeInBytes() / 1024)); m_cache.insert(result.key, new ClipPreview(result), cost);
             if (result.stored) m_stored.insert(result.key);
             // A clip that could not be read is tried again at the next launch: it may have been still on its way.
@@ -38,11 +44,17 @@ ThumbnailCache::ThumbnailCache(QObject* parent) : QObject(parent) {
     });
     connect(&m_prune, &QFutureWatcher<QStringList>::finished, this, [this] {
         const auto gone = m_prune.result();
-        for (const auto& key : gone) { m_meta.remove(key); m_stored.remove(key); m_cache.remove(key); }
+        for (const auto& key : gone) { m_meta.remove(key); m_stored.remove(key); m_cache.remove(key); m_marks.remove(key); }
         if (!gone.isEmpty()) { m_unsaved = true; m_saveLater.start(); }
     });
+    connect(&m_marking, &QFutureWatcher<QHash<QString, bool>>::finished, this, [this] {
+        m_markFlight.clear(); const auto found = m_marking.result(); if (m_marks.size() >= 20000) m_marks.clear();
+        for (auto it = found.cbegin(); it != found.cend(); ++it) m_marks.insert(it.key(), it.value());
+        if (!found.isEmpty() && !m_storage.isEmpty()) { m_unsaved = true; m_saveLater.start(); }
+        emit marksReady(); startMarks();
+    });
 }
-ThumbnailCache::~ThumbnailCache() { save(); if (m_stop) *m_stop = true; disconnect(&m_worker, nullptr, this, nullptr); }
+ThumbnailCache::~ThumbnailCache() { save(); if (m_stop) *m_stop = true; *m_markStop = true; disconnect(&m_worker, nullptr, this, nullptr); disconnect(&m_marking, nullptr, this, nullptr); m_marking.waitForFinished(); }
 QString ThumbnailCache::keyFor(const QString& path, qint64 size, const QDateTime& modified) { return path + QString("|%1|%2").arg(size).arg(modified.toMSecsSinceEpoch()); }
 QString ThumbnailCache::keyFor(const QString& path) { const QFileInfo file(path); return keyFor(path, file.size(), file.lastModified()); }
 QString ThumbnailCache::imagePath(const QString& key) const { return QDir(m_storage).filePath(imageName(key)); }
@@ -58,10 +70,13 @@ void ThumbnailCache::setStorage(const QString& directory) {
             m_meta.insert(it.key(), {entry.value("duration").toInteger(), {entry.value("width").toInt(), entry.value("height").toInt()}, entry.value("fps").toDouble(), entry.value("tracks").toInt(), false});
             if (entry.value("image").toBool()) m_stored.insert(it.key());
         }
+        const auto marks = document.object().value("version").toInt() == 1 ? document.object().value("marks").toObject() : QJsonObject();
+        for (auto it = marks.begin(); it != marks.end() && m_marks.size() < 20000; ++it) m_marks.insert(it.key(), it.value().toBool());
     }
     // What belongs to a clip deleted, renamed or changed since is forgotten, away from the interface.
     // A preview written after this point is never taken for a leftover.
-    const auto keys = m_meta.keys(); const auto storage = m_storage; const auto since = QDateTime::currentDateTime();
+    auto keys = m_meta.keys(); for (auto it = m_marks.cbegin(); it != m_marks.cend(); ++it) if (!m_meta.contains(it.key())) keys.append(it.key());
+    const auto storage = m_storage; const auto since = QDateTime::currentDateTime();
     m_prune.setFuture(QtConcurrent::run([keys, storage, since] {
         QStringList gone; QSet<QString> kept;
         for (const auto& key : keys) { if (stillTheSame(key)) kept.insert(imageName(key)); else { gone.append(key); QFile::remove(QDir(storage).filePath(imageName(key))); } }
@@ -87,7 +102,8 @@ void ThumbnailCache::save() {
         const auto& meta = it.value();
         clips.insert(it.key(), QJsonObject{{"duration", meta.durationMs}, {"width", meta.size.width()}, {"height", meta.size.height()}, {"fps", meta.fps}, {"tracks", meta.tracks}, {"image", m_stored.contains(it.key())}});
     }
-    QSaveFile file(indexPath(m_storage)); const auto bytes = QJsonDocument(QJsonObject{{"version", 1}, {"clips", clips}}).toJson(QJsonDocument::Compact);
+    QJsonObject marks; for (auto it = m_marks.cbegin(); it != m_marks.cend(); ++it) marks.insert(it.key(), it.value());
+    QSaveFile file(indexPath(m_storage)); const auto bytes = QJsonDocument(QJsonObject{{"version", 1}, {"clips", clips}, {"marks", marks}}).toJson(QJsonDocument::Compact);
     if (file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size() && file.commit()) m_unsaved = false;
     else qWarning("Miniatures : index non enregistré (%s).", qUtf8Printable(file.errorString()));
 }
@@ -98,7 +114,7 @@ void ThumbnailCache::setActive(bool active) {
 }
 void ThumbnailCache::request(const QString& key, const QString& path) {
     if (!m_active || m_cache.contains(key) || m_stored.contains(key) || m_pending.contains(key) || m_pending.size() >= 32) return;
-    if (const auto* known = meta(key); known && known->failed) return;
+    if (const auto* known = meta(key); known && known->failed && (known->attempts >= 3 || QDateTime::currentMSecsSinceEpoch() - known->failedAt < retryDelay)) return;
     m_pending.insert(key); m_queue.enqueue({key, path}); startNext();
 }
 void ThumbnailCache::startNext() {
@@ -123,6 +139,21 @@ void ThumbnailCache::startNext() {
         // Written here, away from the interface; the index follows once the result is back.
         if (!file.isEmpty() && !result.image.isNull()) result.stored = result.image.save(file, "JPG", 90);
         return result;
+    }));
+}
+void ThumbnailCache::requestMarks(const QList<QPair<QString, QString>>& clips) {
+    QSet<QString> asked = m_markFlight; for (const auto& clip : std::as_const(m_markQueue)) asked.insert(clip.first);
+    for (const auto& clip : clips) if (!m_marks.contains(clip.first) && !asked.contains(clip.first)) { m_markQueue.append(clip); asked.insert(clip.first); }
+    startMarks();
+}
+// Only the containers are read, one clip after the other: a few milliseconds each.
+void ThumbnailCache::startMarks() {
+    if (m_marking.isRunning() || m_markQueue.isEmpty()) return;
+    const auto clips = std::exchange(m_markQueue, {}); const auto stop = m_markStop; for (const auto& clip : clips) m_markFlight.insert(clip.first);
+    m_marking.setFuture(QtConcurrent::run([clips, stop] {
+        QHash<QString, bool> found;
+        for (const auto& clip : clips) { if (*stop) break; if (QFileInfo(clip.second).isFile()) found.insert(clip.first, compressedByClipsapp(clip.second)); }
+        return found;
     }));
 }
 }

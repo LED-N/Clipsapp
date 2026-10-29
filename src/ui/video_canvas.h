@@ -27,6 +27,7 @@ public:
     // Where the graphics card can show the clip itself, the place it does so in this view; nothing
     // elsewhere. The view then draws what belongs over the image, and no longer the image.
     VideoSurface* prepareSurface();
+    void releaseSurface();
     VideoSurface* surface() const { return m_surface; }
     void setDirect(bool direct);
     // The image being shown, for what measures how often it changes.

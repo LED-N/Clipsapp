@@ -1,4 +1,5 @@
 #include "source_catalog.h"
+#include "windows_monitors.h"
 #include <QCoreApplication>
 #include <QFileInfo>
 #include <QGuiApplication>
@@ -61,14 +62,8 @@ BOOL CALLBACK collectWindow(HWND hwnd, LPARAM argument) {
 }
 SourceCatalog SourceCatalog::discover() {
     SourceCatalog catalog;
-    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR monitor, HDC, LPRECT, LPARAM data) -> BOOL {
-        auto& targets = *reinterpret_cast<QList<SourceTarget>*>(data); MONITORINFOEXW info{}; info.cbSize = sizeof(info);
-        if (GetMonitorInfoW(monitor, &info)) {
-            const auto name = QString::fromWCharArray(info.szDevice);
-            targets.append({"screen:" + name, QStringLiteral("Écran %1 · %2 × %3%4").arg(name).arg(info.rcMonitor.right - info.rcMonitor.left).arg(info.rcMonitor.bottom - info.rcMonitor.top).arg(info.dwFlags & MONITORINFOF_PRIMARY ? QStringLiteral(" · principal") : QString())});
-        }
-        return TRUE;
-    }, reinterpret_cast<LPARAM>(&catalog.videoTargets));
+    // Each screen by its path: the name of its device may go to another screen after a sleep.
+    for (const auto& monitor : windowsMonitors()) catalog.videoTargets.append({monitorTargetId(monitor), monitorLabel(monitor)});
     EnumWindows(collectWindow, reinterpret_cast<LPARAM>(&catalog.videoTargets));
     const HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     const bool uninitialize = SUCCEEDED(init);

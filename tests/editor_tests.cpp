@@ -41,7 +41,11 @@
 #include "platform/system_info.h"
 #include "ui/library_page.h"
 #include "ui/discord_batch.h"
-#include "ui/discord_dialog.h"
+#include "ui/compressor_dialog.h"
+#include "ui/compressor_page.h"
+#include "ui/compress_batch.h"
+#include "ui/compare_view.h"
+#include "media/clip_compressor.h"
 #include "ui/widgets.h"
 #include "ui/replay_strip.h"
 #include "ui/clip_viewer.h"
@@ -207,13 +211,13 @@ private slots:
         auto* micro = editor.findChild<QSlider*>("track-volume-0"); QTRY_VERIFY_WITH_TIMEOUT((micro = editor.findChild<QSlider*>("track-volume-0")) && micro->isEnabled(), 5000);
         // Micro, Jeu, Discord: each track opens at its usual level, a track without one as it was recorded.
         QCOMPARE(micro->value(), 70); QCOMPARE(editor.findChild<QSlider*>("track-volume-1")->value(), 100); QCOMPARE(editor.findChild<QSlider*>("track-volume-2")->value(), 130);
-        // The usual levels can be exported, but they are not a change the user made to this clip.
+        // The usual levels are not a change the user made to this clip: nothing to export yet.
         auto* exportButton = editor.findChild<QPushButton*>("export-clip"); auto* keep = editor.findChild<QPushButton*>("keep-mix"); auto* state = editor.findChild<QWidget*>("editor-state");
-        QVERIFY(exportButton->isEnabled()); QVERIFY(state->isHidden()); QVERIFY(keep->isHidden());
+        QVERIFY(!exportButton->isEnabled()); QVERIFY(state->isHidden()); QVERIFY(keep->isHidden());
         QSignalSpy chosen(&editor, &ClipEditor::mixChosen);
-        editor.findChild<QSlider*>("track-volume-1")->setValue(85); QVERIFY(!state->isHidden()); QVERIFY(!keep->isHidden()); keep->click(); QCOMPARE(chosen.size(), 1);
+        editor.findChild<QSlider*>("track-volume-1")->setValue(85); QVERIFY(!state->isHidden()); QVERIFY(!keep->isHidden()); QVERIFY(exportButton->isEnabled()); keep->click(); QCOMPARE(chosen.size(), 1);
         const auto kept = chosen.first().first().value<TrackMix>(); QCOMPARE(kept.value(mixKey("Jeu")), 0.85); QCOMPARE(kept.value(mixKey("Micro")), 0.7); QCOMPARE(kept.value(mixKey("Discord")), 1.3);
-        editor.setDefaultMix(kept); QVERIFY(keep->isHidden()); QVERIFY(state->isHidden()); QVERIFY(exportButton->isEnabled());
+        editor.setDefaultMix(kept); QVERIFY(keep->isHidden()); QVERIFY(state->isHidden()); QVERIFY(!exportButton->isEnabled());
         editor.suspend();
         // What an export writes says its sound was mixed: read again, it keeps the levels it has.
         QVERIFY(!m_info.mixed); auto edit = defaultEdit(m_info, mix); QCOMPARE(edit.tracks[0].volume, 0.7); edit.separateTracks = true;
@@ -247,8 +251,14 @@ private slots:
         auto* exporter = editor.findChild<ClipExporter*>(); QSignalSpy done(exporter, &ClipExporter::completed), deleteRequested(&editor, &ClipEditor::deleteRequested), opened(&editor, &ClipEditor::openRequested);
         const auto path = m_directory.filePath("ui-edited.mp4");
         width->setValue(160); QVERIFY(static_cast<Tag*>(editor.findChild<QWidget*>("editor-state"))->text() == QStringLiteral("Modifié")); QVERIFY2(editor.exportTo(path, error), qPrintable(error));
-        QVERIFY(!exportButton->isVisible()); QVERIFY(editor.findChild<QPushButton*>("cancel-export")->isVisible());
+        // The export is shown in the middle of the window, large, and Échap does not close it while it runs.
+        auto* progress = editor.findChild<QDialog*>("export-dialog"); QVERIFY(progress); QVERIFY(progress->isVisible()); QVERIFY(!exportButton->isEnabled());
+        QVERIFY(progress->findChild<QPushButton*>("cancel-export")->isVisible()); QVERIFY(progress->grab().save(previewPath("export-progress.png")));
+        progress->reject(); QVERIFY(progress->isVisible());
         QTRY_COMPARE_WITH_TIMEOUT(done.size(), 1, 10000); QVERIFY(QFile::exists(path)); QVERIFY(!banner->isHidden());
+        // Then what was written, with what may follow; closing it leaves the same offer in the banner.
+        QTRY_VERIFY_WITH_TIMEOUT(progress->findChild<QPushButton*>("export-open"), 3000); QVERIFY(progress->findChild<QPushButton*>("export-trash-original"));
+        QTest::qWait(30); QVERIFY(progress->grab().save(previewPath("export-done.png"))); progress->findChild<QPushButton*>("export-close")->click(); QTRY_VERIFY_WITH_TIMEOUT(!editor.findChild<QDialog*>("export-dialog"), 3000);
         // Nothing is removed without an explicit click, and the click itself only asks.
         QVERIFY(deleteRequested.isEmpty()); QCOMPARE(digest(m_source), m_digest);
         QVERIFY(!exportButton->isEnabled()); QVERIFY(!editor.exportTo(m_directory.filePath("ui-duplicate.mp4"), error)); QCOMPARE(digest(m_source), m_digest);
@@ -256,7 +266,10 @@ private slots:
         width->setValue(158); QVERIFY(exportButton->isEnabled());
         QVERIFY2(editor.exportTo(m_directory.filePath("ui-edited-again.mp4"), error), qPrintable(error)); QVERIFY(banner->isHidden());
         QTRY_COMPARE_WITH_TIMEOUT(done.size(), 2, 10000); QVERIFY(!banner->isHidden());
-        editor.findChild<QPushButton*>("open-exported")->click(); QCOMPARE(opened.size(), 1); QCOMPARE(opened.first().first().toString(), m_directory.filePath("ui-edited-again.mp4"));
+        QDialog* again = nullptr; QTRY_VERIFY_WITH_TIMEOUT((again = editor.findChild<QDialog*>("export-dialog")) && again->findChild<QPushButton*>("export-open"), 3000);
+        again->findChild<QPushButton*>("export-open")->click(); QCOMPARE(opened.size(), 1); QCOMPARE(opened.first().first().toString(), m_directory.filePath("ui-edited-again.mp4"));
+        QTRY_VERIFY_WITH_TIMEOUT(!editor.findChild<QDialog*>("export-dialog"), 3000);
+        editor.findChild<QPushButton*>("open-exported")->click(); QCOMPARE(opened.size(), 2);
         editor.findChild<QPushButton*>("trash-original")->click();
         QCOMPARE(deleteRequested.size(), 1); QCOMPARE(deleteRequested.first().first().toString(), m_source); QVERIFY(!deleteRequested.first()[1].toBool()); QCOMPARE(digest(m_source), m_digest); editor.suspend();
     }
@@ -347,30 +360,129 @@ private slots:
         for (const auto& path : {first, hidden, last}) QCOMPARE(digest(path), m_digest);
         QCOMPARE(list.clips()->rowCount(), int(paths.size()) + 1);
     }
-    void editorSharingSavesHighQualityAndPlacesOnlySharingCopiesInTheirDedicatedPage() {
+    void compressorDiscordCopyOfAnEditIsTemporaryAndTheEditIsKeptInHighQuality() {
         QTemporaryDir directory; const auto original = directory.filePath("source.mp4"); QVERIFY(QFile::copy(m_source, original));
         ConfigStore store(directory.filePath("config")); auto config = AppConfig::defaults(); config.libraryPath = directory.path(); config.clipSavedSound = false; config.clipSavedNotification = false; QString error; QVERIFY(store.save(config, error));
         MainWindow window(directory.filePath("config")); window.setAttribute(Qt::WA_DontShowOnScreen); window.show(); auto* library = window.findChild<ClipListView*>("clip-library"); QTRY_COMPARE_WITH_TIMEOUT(clipPaths(library), QStringList{original}, 3000); emit library->openRequested(original);
         auto* editor = window.findChild<ClipEditor*>(); auto* width = editor->findChild<QSpinBox*>("crop-width"); QTRY_VERIFY_WITH_TIMEOUT(width->isEnabled(), 5000); width->setValue(160); editor->findChild<QDoubleSpinBox*>("trim-start")->setValue(0.4); editor->findChild<QDoubleSpinBox*>("trim-end")->setValue(2.4); editor->findChild<QSlider*>("track-volume-0")->setValue(50); editor->findChild<QAbstractButton*>("track-mute-2")->setChecked(true);
-        editor->findChild<QPushButton*>("compress-discord-editor")->click(); auto* dialog = window.findChild<DiscordDialog*>(); auto* batch = window.findChild<DiscordBatch*>(); QVERIFY(dialog); QVERIFY(batch);
+        // The compressor first asks what for; Discord is one of its two answers.
+        editor->findChild<QPushButton*>("compress-editor")->click(); auto* dialog = window.findChild<CompressorDialog*>(); auto* batch = window.findChild<DiscordBatch*>(); QVERIFY(dialog); QVERIFY(batch);
+        auto* start = dialog->findChild<QPushButton*>("compressor-start"); QVERIFY(!start->isEnabled()); QVERIFY(dialog->grab().save(previewPath("compressor-goal.png")));
+        dialog->findChild<QPushButton*>("compressor-goal-discord")->click(); QVERIFY(start->isEnabled());
         QSignalSpy ready(batch, &DiscordBatch::shareReady), hq(batch, &DiscordBatch::highQualityReady); dialog->findChild<QDoubleSpinBox*>("discord-limit-mb")->setValue(1);
-        QVERIFY(dialog->grab().save(previewPath("discord-options.png"))); dialog->findChild<QPushButton*>("discord-start")->click();
+        QVERIFY(dialog->grab().save(previewPath("compressor-discord-options.png"))); start->click();
         QTRY_COMPARE_WITH_TIMEOUT(ready.size(), 1, 15000); QCOMPARE(hq.size(), 1); QTRY_VERIFY_WITH_TIMEOUT(!batch->running(), 3000); const auto share = ready.first().first().toString(); const auto quality = hq.first().first().toString();
         QVERIFY(QFileInfo(share).size() <= 1000000); QCOMPARE(digest(original), m_digest);
         for (const auto& path : {share, quality}) { ClipReader reader(path, false); QCOMPARE(reader.info().size.width(), 160); QVERIFY(qAbs(reader.info().durationMs - 2000) <= 60); QCOMPARE(reader.info().audio.size(), 1); const auto audio = samples(reader, defaultEdit(reader.info()).tracks); QVERIFY(qAbs(amplitude(audio, 330) - 0.06) < 0.018); QVERIFY(amplitude(audio, 550) < 0.005); }
-        auto* sharing = window.findChild<ClipListView*>("discord-library"); QTRY_COMPARE_WITH_TIMEOUT(clipPaths(library).size(), 2, 3000); QTRY_COMPARE_WITH_TIMEOUT(clipPaths(sharing), QStringList{share}, 3000);
-        // The copy remembers the clip it comes from and the limit it was made for; the clip says a copy is ready.
-        LibraryLabels labels(directory.filePath("config/library-tags.json")); QVERIFY(labels.load(error)); QCOMPARE(labels.shareLink(share).source, QFileInfo(original).absoluteFilePath()); QCOMPARE(labels.shareLink(share).limitBytes, qint64(1000000));
-        const auto shareIndex = sharing->clips()->index(sharing->rowOf(share), 0); QCOMPARE(shareIndex.data(ClipRole::ThumbPath).toString(), QFileInfo(original).absoluteFilePath()); QCOMPARE(shareIndex.data(ClipRole::Limit).toLongLong(), qint64(1000000));
-        // A clip over the limit points to its ready copy; one that already fits needs none.
-        QTRY_COMPARE_WITH_TIMEOUT(library->clips()->index(library->rowOf(original), 0).data(ClipRole::FitText).toString(), QFileInfo(original).size() > 1000000 ? QStringLiteral("Copie Discord prête") : QStringLiteral("Prêt pour Discord"), 3000);
-        QTRY_COMPARE_WITH_TIMEOUT(library->clips()->index(library->rowOf(quality), 0).data(ClipRole::FitText).toString(), QFileInfo(quality).size() > 1000000 ? QStringLiteral("Plus de 1 Mo") : QStringLiteral("Prêt pour Discord"), 3000);
+        // The copy lives outside the library, where nothing piles up; the edit in high quality joins the library.
+        QVERIFY(!QDir::cleanPath(share).startsWith(QDir::cleanPath(directory.path()), Qt::CaseInsensitive)); QVERIFY(QDir::cleanPath(share).startsWith(QDir::cleanPath(QDir::tempPath()), Qt::CaseInsensitive));
+        QTRY_COMPARE_WITH_TIMEOUT(clipPaths(library).size(), 2, 3000); QVERIFY(!QDir(directory.filePath("Partage Discord")).exists());
+        // The library keeps saying whether each clip fits the limit chosen.
+        QTRY_COMPARE_WITH_TIMEOUT(library->clips()->index(library->rowOf(original), 0).data(ClipRole::FitText).toString(), QFileInfo(original).size() > 1000000 ? QStringLiteral("Plus de 1 Mo") : QStringLiteral("Prêt pour Discord"), 3000);
         library->selectAll(); std::unique_ptr<QMimeData> originals(library->dragPayload()); QVERIFY(originals);
         QCOMPARE(originals->urls().size(), 2); QVERIFY(originals->urls().contains(QUrl::fromLocalFile(original))); QVERIFY(originals->urls().contains(QUrl::fromLocalFile(quality)));
-        sharing->selectAll(); std::unique_ptr<QMimeData> compressed(sharing->dragPayload()); QVERIFY(compressed);
-        QCOMPARE(compressed->urls(), QList<QUrl>{QUrl::fromLocalFile(share)});
-        QCOMPARE(digest(original), m_digest);
-        QVERIFY(dialog->grab().save(previewPath("discord-progress.png"))); dialog->close(); window.setPage(MainWindow::Sharing); QVERIFY(window.grab().save(previewPath("sharing-copies.png"))); window.close();
+        QVERIFY(dialog->findChild<QPushButton*>("compressor-close")->isVisible()); QTest::qWait(30); QVERIFY(dialog->grab().save(previewPath("compressor-discord-ready.png")));
+        // Closed, the dialog takes its copy with it.
+        dialog->findChild<QPushButton*>("compressor-close")->click(); QTRY_VERIFY_WITH_TIMEOUT(!QFileInfo::exists(share), 5000); QCOMPARE(digest(original), m_digest);
+        window.setPage(MainWindow::Compressor); QTest::qWait(50); QVERIFY(window.grab().save(previewPath("compressor-page.png"))); window.close();
+    }
+    void compressorSavesRoomComparesThenReplacesTheOriginalAsItWas() {
+        QTemporaryDir directory; const auto library = directory.filePath("clips"); QVERIFY(QDir().mkpath(library + "/Jeu"));
+        // Heavy, as a recording is: the same picture and the same three tracks, at a quality that weighs.
+        const auto clip = QDir(library).filePath("Jeu/Partie.mp4"), other = QDir(library).filePath("Jeu/Autre partie.mp4"); QProcess heavy;
+        heavy.start(QDir(QCoreApplication::applicationDirPath()).filePath("ffmpeg.exe"), {"-nostdin", "-v", "error", "-i", m_source, "-map", "0", "-vf", "scale=960:576", "-c:v", "mpeg4", "-q:v", "1", "-c:a", "copy", clip});
+        QVERIFY(heavy.waitForFinished(30000)); QVERIFY2(heavy.exitCode() == 0, heavy.readAllStandardError().constData()); QVERIFY(QFile::copy(clip, other)); const auto original = digest(clip);
+        // An old date, as the clips of a library have: the compressed file keeps it, and its place in the list with it.
+        const QDateTime long_ago(QDate(2026, 3, 14), QTime(21, 5)); for (const auto& path : {clip, other}) { QFile file(path); QVERIFY(file.open(QIODevice::ReadWrite)); QVERIFY(file.setFileTime(long_ago, QFileDevice::FileModificationTime)); }
+        const auto trash = directory.filePath("trash"); QVERIFY(QDir().mkpath(trash));
+        const ClipTrashOperation toTrash = [&](const QString& path, QString&) { return QFile::rename(path, QDir(trash).filePath(QFileInfo(path).fileName())); };
+        CompressBatch batch(nullptr, toTrash); QSignalSpy replaced(&batch, &CompressBatch::replaced), finished(&batch, &CompressBatch::finished);
+        // The processor's AV1: the same result on any machine, with or without a graphics card.
+        CompressOptions options; options.settings.processor = true; options.review = true;
+        batch.start({clip}, options); QTRY_VERIFY_WITH_TIMEOUT(!batch.running(), 60000); QCOMPARE(batch.jobs().size(), 1);
+        const auto job = batch.jobs().first(); QVERIFY2(job.state == CompressJob::Review, qPrintable(job.error + job.note)); QVERIFY(QFileInfo::exists(job.output)); QVERIFY(job.after < job.before);
+        QCOMPARE(digest(clip), original);
+        { ClipReader reader(job.output, false); const auto info = reader.info(); QCOMPARE(info.audio.size(), 3); QCOMPARE(info.audio[0].name, QString("Micro")); QCOMPARE(info.size, QSize(960, 576)); QVERIFY(qAbs(info.durationMs - m_info.durationMs) <= 100); QVERIFY(info.compressed); QCOMPARE(info.videoCodec, QString("av1")); QCOMPARE(videoCodecOf(job.output), QString("av1")); QCOMPARE(videoCodecOf(m_source), QString("h264"));
+          const auto audio = samples(reader, defaultEdit(info).tracks); QVERIFY(qAbs(amplitude(audio, 330) - 0.12) < 0.015); QVERIFY(qAbs(amplitude(audio, 550) - 0.12) < 0.015); }
+        // The two versions on one picture, the separation where the mouse puts it.
+        CompareView compare; compare.setAttribute(Qt::WA_DontShowOnScreen); compare.resize(880, 560); compare.show(); compare.open(job.source, job.output, job.before, job.after);
+        // The two sides show the same moment at the same scale, or nothing changes on screen.
+        const auto alike = [&] { const auto left = compare.shownBefore(), right = compare.shownAfter(); if (left.isNull() || left.size() != right.size()) return false;
+            const auto a = left.scaled(48, 30).convertToFormat(QImage::Format_Grayscale8), b = right.scaled(48, 30).convertToFormat(QImage::Format_Grayscale8); double difference = 0;
+            for (int y = 0; y < a.height(); ++y) for (int x = 0; x < a.width(); ++x) difference += std::abs(int(a.pixelColor(x, y).value()) - int(b.pixelColor(x, y).value()));
+            return difference / (a.width() * a.height()) < 12; };
+        QTRY_VERIFY_WITH_TIMEOUT(alike(), 8000); const auto fitted = compare.shownBefore().size();
+        auto* picture = compare.findChild<QWidget*>("compare-picture"); QTest::mousePress(picture, Qt::LeftButton, Qt::NoModifier, QPoint(picture->width() / 4, picture->height() / 2)); QTest::mouseRelease(picture, Qt::LeftButton, Qt::NoModifier, QPoint(picture->width() / 4, picture->height() / 2));
+        QVERIFY(qAbs(compare.split() - 0.25) < 0.02); compare.setPlaying(true); QTRY_VERIFY_WITH_TIMEOUT(compare.before()->snapshot().positionMs > 1200, 4000); compare.setPlaying(false); QTRY_VERIFY_WITH_TIMEOUT(!compare.before()->snapshot().loading && alike() && compare.shownBefore().cacheKey() == compare.before()->snapshot().image.cacheKey(), 4000);
+        compare.setVolume(40); QVERIFY(qAbs(compare.before()->volume() - 0.16) < 1e-6);
+        QVERIFY(compare.grab().save(previewPath("compressor-compare.png")));
+        // At 100 %, both sides change scale together, at once, without playing.
+        compare.findChild<Segmented*>("compare-zoom")->setCurrentIndex(1); QTRY_VERIFY_WITH_TIMEOUT(compare.shownBefore().size() != fitted && alike(), 5000); QVERIFY(compare.grab().save(previewPath("compressor-compare-zoom.png")));
+        compare.findChild<Segmented*>("compare-zoom")->setCurrentIndex(0); QTRY_VERIFY_WITH_TIMEOUT(compare.shownBefore().size() == fitted && alike(), 5000);
+        // On the whole screen, and back with Échap.
+        compare.findChild<QPushButton*>("compare-full-screen")->click(); QVERIFY(compare.fullScreen()); QVERIFY(compare.window() != &compare);
+        QTest::keyClick(&compare, Qt::Key_Escape); QVERIFY(!compare.fullScreen()); QCOMPARE(compare.window(), &compare); compare.close();
+        // Replaced: same place, same name, same date; the original waits in the trash.
+        batch.replace(0, false); QTRY_COMPARE_WITH_TIMEOUT(replaced.size(), 1, 10000); QCOMPARE(batch.jobs().first().state, CompressJob::Replaced);
+        QCOMPARE(replaced.first()[0].toString(), clip); QCOMPARE(replaced.first()[1].toString(), clip); QVERIFY(!QFileInfo::exists(job.output));
+        QCOMPARE(QFileInfo(clip).lastModified(), long_ago); QVERIFY(QFileInfo(clip).size() < QFileInfo(other).size()); QCOMPARE(digest(QDir(trash).filePath("Partie.mp4")), original);
+        // Compressed once, it is not compressed again.
+        batch.start({clip}, options); QTRY_VERIFY_WITH_TIMEOUT(!batch.running(), 10000); QCOMPARE(batch.jobs().first().state, CompressJob::Skipped);
+        // Chosen one by one, after a warning, it is compressed all the same.
+        options.again = true; batch.start({clip}, options); QTRY_VERIFY_WITH_TIMEOUT(!batch.running(), 60000);
+        QVERIFY(batch.jobs().first().state == CompressJob::Review || batch.jobs().first().state == CompressJob::Kept); batch.discard(0); options.again = false;
+        { DiscordBatch discord; ThumbnailCache cache; CompressorDialog::Setup setup; setup.paths = {clip, other}; setup.goal = CompressorDialog::Space;
+          CompressorDialog dialog(&discord, &batch, &cache, setup, ShareOptions{}, CompressSettings{}, nullptr); dialog.setAttribute(Qt::WA_DontShowOnScreen); dialog.show();
+          auto* warning = dialog.findChild<QWidget*>("compress-again-warning"); QVERIFY(warning); QTRY_VERIFY_WITH_TIMEOUT(warning->isVisible(), 5000);
+          QVERIFY(dialog.findChild<QWidget*>("compress-again-0")->isVisible()); QVERIFY(!dialog.findChild<QWidget*>("compress-again-1")->isVisible()); QVERIFY(dialog.findChild<QPushButton*>("compressor-start")->isEnabled());
+          // In a batch they are left out unless asked for: the counts say what will really be compressed.
+          auto* again = dialog.findChild<QCheckBox*>("compress-again-toggle"); QVERIFY(again); QVERIFY(again->isVisible()); QVERIFY(!again->isChecked());
+          QCOMPARE(dialog.findChild<QPushButton*>("compressor-start")->text(), QStringLiteral("Compresser le clip"));
+          again->click(); QCOMPARE(dialog.findChild<QPushButton*>("compressor-start")->text(), QStringLiteral("Compresser 2 clips")); again->click();
+          QVERIFY(dialog.grab().save(previewPath("compressor-again-warning.png"))); dialog.reject();
+          // The page of the compressor no longer offers it among the heaviest.
+          const auto entry = [](const QString& path) { const QFileInfo file(path); return ClipEntry{path, file.completeBaseName(), QStringLiteral("Jeu"), QStringLiteral("mp4"), file.size(), file.lastModified()}; };
+          CompressorPage page(&cache, &batch); page.setAttribute(Qt::WA_DontShowOnScreen); page.resize(900, 700); page.show(); page.setClips({entry(clip), entry(other)}, 20000000);
+          auto* note = page.findChild<QWidget*>("heaviest-compressed-note"); QTRY_VERIFY_WITH_TIMEOUT(note->isVisible(), 5000);
+          QVERIFY(page.findChild<QCheckBox*>("heaviest-check-0")); QTRY_VERIFY_WITH_TIMEOUT(!page.findChild<QCheckBox*>("heaviest-check-1"), 3000); }
+        // Several at once replace their originals as they go; deleted for good, they never reach the trash.
+        options.review = false; options.permanent = true; const auto trashed = QDir(trash).entryList(QDir::Files).size(); finished.clear();
+        batch.start({clip, other, QDir(library).filePath("absent.mp4")}, options); QTRY_COMPARE_WITH_TIMEOUT(finished.size(), 1, 60000);
+        QCOMPARE(batch.jobs()[0].state, CompressJob::Skipped); QCOMPARE(batch.jobs()[1].state, CompressJob::Replaced); QCOMPARE(batch.jobs()[2].state, CompressJob::Failed);
+        QCOMPARE(QDir(trash).entryList(QDir::Files).size(), trashed); QCOMPARE(QFileInfo(other).lastModified(), long_ago); QVERIFY(batch.savedBytes() > 0);
+        { ClipReader reader(other, false); QVERIFY(reader.info().compressed); QCOMPARE(reader.info().audio.size(), 3); }
+        QVERIFY(QDir(QDir(library).filePath("Jeu")).entryList({"*.part"}, QDir::Files | QDir::Hidden).isEmpty());
+    }
+    void compressorDialogOffersRoomForOneClipAndTheWholeLibrary() {
+        QTemporaryDir directory; const auto library = directory.filePath("clips"); QVERIFY(QDir().mkpath(library));
+        QStringList paths; for (const auto& name : {"Un", "Deux"}) { const auto path = QDir(library).filePath(QString::fromLatin1(name) + ".mp4"); QVERIFY(QFile::copy(m_source, path)); paths.append(path); }
+        ConfigStore store(directory.filePath("config")); auto config = AppConfig::defaults(); config.libraryPath = library; QString error; QVERIFY(store.save(config, error));
+        MainWindow window(directory.filePath("config")); window.setAttribute(Qt::WA_DontShowOnScreen); window.show(); auto* list = window.findChild<ClipListView*>("clip-library"); QTRY_COMPARE_WITH_TIMEOUT(clipPaths(list).size(), 2, 3000);
+        // From the selection: the goal is asked, saving room shows its own settings.
+        list->selectPaths({paths[0]}); auto* compress = window.findChild<QPushButton*>("compress-library-selection"); QVERIFY(compress); QVERIFY(compress->isEnabled()); compress->click();
+        auto* dialog = window.findChild<CompressorDialog*>(); QVERIFY(dialog); dialog->findChild<QPushButton*>("compressor-goal-space")->click();
+        QVERIFY(dialog->findChild<Segmented*>("compress-level")->isVisible()); QVERIFY(!dialog->findChild<QCheckBox*>("compress-permanent"));
+        QCOMPARE(dialog->findChild<QPushButton*>("compressor-start")->text(), QStringLiteral("Compresser le clip")); QVERIFY(dialog->grab().save(previewPath("compressor-space-options.png")));
+        dialog->reject(); QTRY_VERIFY_WITH_TIMEOUT(!window.findChild<CompressorDialog*>(), 3000);
+        // The whole library, from the page of the compressor: room only, the trash or not.
+        window.setPage(MainWindow::Compressor); window.findChild<QPushButton*>("compress-library")->click(); dialog = window.findChild<CompressorDialog*>(); QVERIFY(dialog);
+        QVERIFY(!dialog->findChild<QPushButton*>("compressor-goal-discord")->isEnabled()); QVERIFY(dialog->findChild<QCheckBox*>("compress-permanent"));
+        QCOMPARE(dialog->findChild<QPushButton*>("compressor-start")->text(), QStringLiteral("Compresser la bibliothèque")); QVERIFY(dialog->grab().save(previewPath("compressor-library-options.png")));
+        dialog->reject(); QTRY_VERIFY_WITH_TIMEOUT(!window.findChild<CompressorDialog*>(), 3000);
+        // The heaviest clips are ticked like those of the library, and compressed together.
+        auto* selection = window.findChild<QWidget*>("heaviest-selection"); QVERIFY(selection); QVERIFY(selection->isHidden());
+        window.findChild<QCheckBox*>("heaviest-check-0")->click(); window.findChild<QCheckBox*>("heaviest-check-1")->click(); QVERIFY(!selection->isHidden());
+        QCOMPARE(window.findChild<QLabel*>("heaviest-selection-count")->text(), QStringLiteral("2 clips cochés")); QVERIFY(window.findChild<QCheckBox*>("heaviest-check-all")->isChecked());
+        QTest::qWait(30); QVERIFY(window.grab().save(previewPath("compressor-page-checked.png")));
+        window.findChild<QPushButton*>("heaviest-compress")->click(); dialog = window.findChild<CompressorDialog*>(); QVERIFY(dialog);
+        QCOMPARE(dialog->findChild<QPushButton*>("compressor-start")->text(), QStringLiteral("Compresser 2 clips")); dialog->reject(); QTRY_VERIFY_WITH_TIMEOUT(!window.findChild<CompressorDialog*>(), 3000);
+        // What a compression gave, clip by clip.
+        CompressJob done; done.name = QStringLiteral("Un"); done.state = CompressJob::Replaced; done.before = 415000000; done.after = 91500000;
+        CompressJob kept; kept.name = QStringLiteral("Deux"); kept.state = CompressJob::Kept; kept.before = 20000000; kept.note = QStringLiteral("Déjà compact : rien à gagner");
+        QString heading; QTimer::singleShot(0, &window, [&] { auto* report = window.findChild<QDialog*>("compression-report"); if (!report) return; heading = report->findChild<QLabel*>()->text(); for (auto* text : report->findChildren<QLabel*>()) if (text->text().endsWith(QStringLiteral("gagnés"))) heading = text->text();
+            report->grab().save(previewPath("compression-report.png")); report->findChild<QPushButton*>("report-close")->click(); });
+        showCompressionReport(&window, {done, kept}, false); QCOMPARE(heading, QStringLiteral("324 Mo gagnés"));
+        window.close();
     }
     void sharingBatchProcessesCompleteClipsContinuesAfterAnInvalidSourceAndCanBeRetried() {
         QTemporaryDir directory; const auto first = directory.filePath("first.mp4"), second = directory.filePath("second.mp4"), late = directory.filePath("late.mp4"); QVERIFY(QFile::copy(m_source, first)); QVERIFY(QFile::copy(m_source, second));
@@ -489,9 +601,12 @@ private slots:
         const auto gameOf = [&](const QString& path) { return list->clips()->index(list->rowOf(path), 0).data(ClipRole::Game).toString(); };
         // The safe answer of the trash dialog is the default; the test answers it from inside its event loop.
         bool safeDefault = false; QStringList asked;
-        const auto answerTrash = [&](bool confirm) { QTimer::singleShot(0, &window, [&, confirm] {
+        const auto answerTrash = [&](bool confirm, bool permanent = false) { QTimer::singleShot(0, &window, [&, confirm, permanent] {
             auto* dialog = window.findChild<QDialog*>("delete-clips-prompt"); if (!dialog) return;
             asked = dialog->property("names").toStringList(); safeDefault = dialog->findChild<QPushButton*>("trash-keep")->isDefault() && !dialog->findChild<QPushButton*>("trash-confirm")->isDefault();
+            // The trash is the way unless the box asks otherwise; it is never ticked by itself.
+            auto* forGood = dialog->findChild<QCheckBox*>("trash-permanent"); safeDefault = safeDefault && forGood && !forGood->isChecked();
+            if (permanent) { forGood->setChecked(true); dialog->layout()->activate(); safeDefault = safeDefault && dialog->findChild<QPushButton*>("trash-confirm")->text() == QStringLiteral("Supprimer définitivement"); dialog->grab().save(previewPath("trash-dialog-permanent.png")); }
             if (asked.size() == 2) dialog->grab().save(previewPath("trash-dialog.png"));
             dialog->findChild<QPushButton*>(confirm ? "trash-confirm" : "trash-keep")->click();
         }); };
@@ -515,13 +630,14 @@ private slots:
         list->selectPaths(paths); auto* search = window.findChild<QLineEdit*>("library-search");
         QVERIFY(search); search->setText("Alpha"); QCOMPARE(clipPaths(list), QStringList{paths[0]}); QCOMPARE(window.findChild<QLabel*>("library-selection-count")->text(), QStringLiteral("1 clip sélectionné"));
         answerTrash(true); remove->click();
-        QTRY_VERIFY_WITH_TIMEOUT(!QFile::exists(paths[0]), 5000); QCOMPARE(asked, QStringList{"Alpha.mp4"});
+        QTRY_VERIFY_WITH_TIMEOUT(!QFile::exists(paths[0]), 5000); QCOMPARE(asked, QStringList{"Alpha.mp4"}); QVERIFY(QFile::exists(directory.filePath("Alpha.mp4.test-trash")));
         QCOMPARE(digest(paths[1]), m_digest); QCOMPARE(digest(paths[2]), m_digest);
         search->clear(); QTRY_COMPARE_WITH_TIMEOUT(clipPaths(list).size(), 2, 5000); emit list->openRequested(paths[1]);
         auto* player = window.findChild<ClipPlayer*>(); QTRY_VERIFY_WITH_TIMEOUT(player->snapshot().loaded, 5000);
         auto* deleteInEditor = window.findChild<QPushButton*>("delete-editor-clip"); QTRY_VERIFY_WITH_TIMEOUT(deleteInEditor->isEnabled(), 5000);
-        answerTrash(true); deleteInEditor->click();
-        QTRY_COMPARE_WITH_TIMEOUT(clipPaths(list).size(), 1, 5000); QVERIFY(!player->snapshot().loaded); QVERIFY(!QFile::exists(paths[1])); QCOMPARE(digest(paths[2]), m_digest);
+        // Deleted for good: the trash operation is not even asked.
+        answerTrash(true, true); deleteInEditor->click(); QVERIFY(safeDefault);
+        QTRY_COMPARE_WITH_TIMEOUT(clipPaths(list).size(), 1, 5000); QVERIFY(!player->snapshot().loaded); QVERIFY(!QFile::exists(paths[1])); QVERIFY(!QFile::exists(directory.filePath("Bravo.mp4.test-trash"))); QCOMPARE(digest(paths[2]), m_digest);
         // The edited copy inherits its category. Its original only leaves through the
         // banner, then the trash dialog. All file moves here use the isolated test operation.
         emit list->openRequested(paths[2]);
@@ -568,6 +684,15 @@ private slots:
             // Nothing can start before the four choices are made, and the strip says why.
             QVERIFY(!window.findChild<QPushButton*>("replay-primary")->isEnabled()); QVERIFY(!window.findChild<QPushButton*>("onboarding-start")->isEnabled());
             window.findChild<QPushButton*>("onboarding-next-0")->click(); QVERIFY(window.grab().save(previewPath("onboarding.png")));
+            // The quality is a step of its own, with the tiles of the settings: a size, a frequency, a preset.
+            QPushButton* screen = nullptr; for (auto* tile : window.findChild<QWidget*>("onboarding")->findChildren<QPushButton*>()) if (!screen && tile->property("target").isValid()) screen = tile;
+            if (screen) {
+                screen->click(); window.findChild<QPushButton*>("onboarding-next-1")->click(); QVERIFY(window.findChild<QPushButton*>("onboarding-quality-1")->isChecked());
+                window.findChild<QPushButton*>("onboarding-resolution-1440")->click(); window.findChild<QPushButton*>("onboarding-quality-2")->click(); QVERIFY(window.findChild<QPushButton*>("onboarding-quality-2")->isChecked());
+                QTest::qWait(60); QCoreApplication::processEvents(); QVERIFY(window.grab().save(previewPath("onboarding-quality.png")));
+                // Back to what the rest of this test expects of a first launch.
+                window.findChild<QPushButton*>("onboarding-resolution-1080")->click(); window.findChild<QPushButton*>("onboarding-quality-1")->click();
+            }
             QVERIFY(!QFile::exists(QDir(configPath).filePath("settings.json")));
             window.findChild<QPushButton*>("onboarding-skip")->click();
             QVERIFY(QFile::exists(QDir(configPath).filePath("settings.json"))); QVERIFY(!welcome->isVisible()); QVERIFY(window.findChild<QWidget*>("sidebar")->isEnabled());
@@ -578,9 +703,15 @@ private slots:
         // The recording has its button beside the replay, and its own shortcut in the settings.
         auto* record = window.findChild<QPushButton*>("record-toggle"); QVERIFY(record); QVERIFY(record->isVisible()); QVERIFY(record->isEnabled()); QCOMPARE(record->text(), QStringLiteral("Enregistrer"));
         QCOMPARE(window.findChild<QKeySequenceEdit*>("record-hotkey")->keySequence(), QKeySequence::fromString("Ctrl+Alt+F9", QKeySequence::PortableText));
-        window.setPage(MainWindow::Settings); auto* fps = window.findChild<QComboBox*>("fps"); auto* saveBar = window.findChild<QWidget*>("savebar"); QVERIFY(fps); QVERIFY(saveBar);
-        QCOMPARE(fps->currentData().toInt(), 60); QVERIFY(saveBar->isHidden()); QVERIFY(window.findChild<QPushButton*>("quality-1")->isChecked());
-        window.findChild<QPushButton*>("quality-0")->click(); QCOMPARE(fps->currentData().toInt(), 30); QVERIFY(window.findChild<QPushButton*>("quality-0")->isChecked()); QVERIFY(!window.findChild<QPushButton*>("quality-1")->isChecked());
+        window.setPage(MainWindow::Settings); auto* fps = window.findChild<Segmented*>("fps"); auto* saveBar = window.findChild<QWidget*>("savebar"); QVERIFY(fps); QVERIFY(saveBar);
+        const auto chosen = [&](const char* name) { return window.findChild<QPushButton*>(name)->isChecked(); }; const auto press = [&](const char* name) { window.findChild<QPushButton*>(name)->click(); };
+        QCOMPARE(fps->currentIndex(), 1); QVERIFY(saveBar->isHidden()); QVERIFY(chosen("quality-1")); QVERIFY(chosen("resolution-1080")); QVERIFY(!window.findChild<QWidget*>("advanced-toggle")->property("checked").toBool());
+        // A preset is a word, whatever the size: light in 1440p gives its own bitrate, and the tiles say what each gives.
+        press("resolution-1440"); press("quality-0"); QVERIFY(chosen("quality-0")); QVERIFY(!chosen("quality-1")); QVERIFY(chosen("resolution-1440")); QVERIFY(!chosen("resolution-1080"));
+        QCOMPARE(window.findChild<QSpinBox*>("bitrate")->value(), presetBitrate("light", 2560, 1440, 60, "h264")); QCOMPARE(fps->currentIndex(), 1);
+        QVERIFY2(window.findChild<QLabel*>("quality-weight")->text().contains(QStringLiteral("Un clip de 60 s")), qPrintable(window.findChild<QLabel*>("quality-weight")->text()));
+        // At 144 FPS the preset follows: more images, more data.
+        fps->setCurrentIndex(3); QCOMPARE(window.findChild<QSpinBox*>("bitrate")->value(), presetBitrate("light", 2560, 1440, 144, "h264")); QVERIFY(chosen("quality-0")); fps->setCurrentIndex(1);
         QVERIFY(!saveBar->isHidden()); QCOMPARE(window.findChild<QLabel*>("settings-dirty")->text(), QStringLiteral("2 modifications non enregistrées")); QVERIFY(window.isWindowModified());
         // Ten minutes at this bitrate do not fit under the default ceiling: the estimate says so.
         window.findChild<QSpinBox*>("replay-duration")->setValue(600); QVERIFY(!window.findChild<QWidget*>("memory-warning")->isHidden());
@@ -592,7 +723,7 @@ private slots:
         QTest::qWait(50); QVERIFY(window.grab().save(previewPath("settings-audio.png")));
         window.findChild<QPushButton*>("settings-tab-2")->click(); QVERIFY(window.grab().save(previewPath("settings-general.png")));
         // "Annuler" gives the saved settings back; nothing was written meanwhile.
-        window.findChild<QPushButton*>("settings-revert")->click(); QCOMPARE(fps->currentData().toInt(), 60); QVERIFY(saveBar->isHidden()); QVERIFY(!window.isWindowModified());
+        window.findChild<QPushButton*>("settings-revert")->click(); QCOMPARE(fps->currentIndex(), 1); QVERIFY(chosen("quality-1")); QVERIFY(chosen("resolution-1080")); QVERIFY(saveBar->isHidden()); QVERIFY(!window.isWindowModified());
         // The lanes are drawn again with the settings given back; the ones they replace go with the next event.
         QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete); QCOMPARE(window.findChild<QSlider*>("track-mix-0")->value(), 100);
         AppConfig stored; QVERIFY(ConfigStore(configPath).load(stored, error)); QCOMPARE(stored.activeProfile()->video.fps, 60); QVERIFY(stored.defaultMix.isEmpty());
@@ -600,15 +731,17 @@ private slots:
         QVERIFY(ConfigStore(configPath).load(stored, error)); QCOMPARE(stored.defaultMix, (TrackMix{{mixKey("Micro"), 0.7}, {mixKey("Discord"), 1.3}}));
         window.findChild<QSlider*>("track-mix-0")->setValue(100); window.findChild<QSlider*>("track-mix-2")->setValue(100); window.findChild<QPushButton*>("settings-save")->click();
         QVERIFY(ConfigStore(configPath).load(stored, error)); QVERIFY(stored.defaultMix.isEmpty());
-        window.findChild<QPushButton*>("quality-2")->click(); window.findChild<QPushButton*>("settings-save")->click(); QVERIFY(saveBar->isHidden());
-        QVERIFY(ConfigStore(configPath).load(stored, error)); QCOMPARE(stored.activeProfile()->video.height, 1440); QCOMPARE(stored.activeProfile()->video.bitrateMbps, 50);
-        // The last preset holds a constant quality: its level appears, the bitrate turns into a ceiling and the estimate into a maximum.
+        press("resolution-1440"); press("quality-2"); window.findChild<QPushButton*>("settings-save")->click(); QVERIFY(saveBar->isHidden());
+        QVERIFY(ConfigStore(configPath).load(stored, error)); QCOMPARE(stored.activeProfile()->video.height, 1440); QCOMPARE(stored.activeProfile()->video.bitrateMbps, 55); QCOMPARE(stored.activeProfile()->video.preset, QString("high"));
+        // Set by hand in the advanced settings: the presets let go, the level appears, the bitrate turns into a ceiling and the estimate into a maximum.
         auto* mode = window.findChild<QComboBox*>("rate-control"); auto* level = window.findChild<QComboBox*>("quality-level"); QVERIFY(mode); QVERIFY(level); QVERIFY(level->isHidden());
         QCOMPARE(stored.activeProfile()->video.rateControl, QString("bitrate")); QVERIFY(window.findChild<QWidget*>("memory-warning")->isHidden());
-        window.findChild<QPushButton*>("quality-3")->click(); QVERIFY(window.findChild<QPushButton*>("quality-3")->isChecked()); QVERIFY(!window.findChild<QPushButton*>("quality-2")->isChecked());
-        QCOMPARE(mode->currentData().toString(), QString("quality")); QCOMPARE(level->currentData().toInt(), 14); QVERIFY(!level->isHidden()); QVERIFY(!window.findChild<QWidget*>("memory-warning")->isHidden());
+        press("settings-tab-0"); QVERIFY(!mode->isVisible()); window.findChild<QCheckBox*>("advanced-toggle")->click(); QVERIFY(mode->isVisible());
+        mode->setCurrentIndex(mode->findData("quality")); level->setCurrentIndex(level->findData(14)); window.findChild<QSpinBox*>("bitrate")->setValue(200);
+        for (const char* name : {"quality-0", "quality-1", "quality-2"}) QVERIFY(!chosen(name)); QVERIFY(window.findChild<QLabel*>("quality-summary")->text().startsWith(QStringLiteral("Personnalisé")));
+        QCOMPARE(mode->currentData().toString(), QString("quality")); QVERIFY(!level->isHidden()); QVERIFY(!window.findChild<QWidget*>("memory-warning")->isHidden());
         for (const auto& name : {"rate-control", "quality-level", "effort", "bitrate", "fps"}) QVERIFY(!window.findChild<QWidget*>(name)->toolTip().isEmpty());
-        window.findChild<QPushButton*>("settings-tab-0")->click(); window.findChild<QPushButton*>("advanced-toggle")->click(); QTest::qWait(50);
+        window.findChild<QPushButton*>("settings-tab-0")->click(); QTest::qWait(50);
         for (auto* area : window.findChildren<QAbstractScrollArea*>()) if (area->isVisible() && area->findChild<QWidget*>("effort")) area->verticalScrollBar()->setValue(area->verticalScrollBar()->maximum());
         QTest::qWait(50); QVERIFY(window.grab().save(previewPath("settings-quality.png")));
         // The estimate is a range that follows the level, with what the ceiling allows at most.
@@ -618,9 +751,9 @@ private slots:
         QTest::qWait(50); QVERIFY(window.grab().save(previewPath("settings-quality-range.png"))); level->setCurrentIndex(level->findData(14));
         window.findChild<QComboBox*>("effort")->setCurrentIndex(1); window.findChild<QPushButton*>("settings-save")->click();
         QVERIFY(ConfigStore(configPath).load(stored, error)); QCOMPARE(stored.activeProfile()->video.rateControl, QString("quality")); QCOMPARE(stored.activeProfile()->video.quality, 14);
-        QCOMPARE(stored.activeProfile()->video.bitrateMbps, 200); QCOMPARE(stored.activeProfile()->video.effort, QString("thorough"));
-        // Back on a target bitrate, the level leaves the page and the preset is recognised again.
-        mode->setCurrentIndex(0); window.findChild<QSpinBox*>("bitrate")->setValue(50); QVERIFY(level->isHidden()); QVERIFY(window.findChild<QPushButton*>("quality-2")->isChecked());
+        QCOMPARE(stored.activeProfile()->video.bitrateMbps, 200); QCOMPARE(stored.activeProfile()->video.effort, QString("thorough")); QVERIFY(stored.activeProfile()->video.preset.isEmpty());
+        // A preset chosen again gives its own settings back: a target bitrate, the level leaves the page.
+        press("quality-2"); QVERIFY(chosen("quality-2")); QCOMPARE(mode->currentData().toString(), QString("bitrate")); QCOMPARE(window.findChild<QSpinBox*>("bitrate")->value(), 55); QVERIFY(level->isHidden());
         // Ten minutes at 300 Mbit/s weigh on the memory of a PC: past a share of it, the disk is proposed, and can be declined.
         window.findChild<QSpinBox*>("replay-duration")->setValue(600); window.findChild<QSpinBox*>("bitrate")->setValue(300);
         auto expected = AppConfig::defaults().profiles.first(); expected.video.width = 2560; expected.video.height = 1440; expected.video.bitrateMbps = 300; expected.replay.durationSeconds = 600;
@@ -1033,18 +1166,19 @@ private slots:
         QTemporaryDir directory; const auto library = directory.filePath("clips"); QVERIFY(QDir().mkpath(library + "/Jeu"));
         ConfigStore store(directory.filePath("config")); auto config = AppConfig::defaults(); config.libraryPath = library; QString error; QVERIFY(store.save(config, error));
         MainWindow window(directory.filePath("config")); window.setAttribute(Qt::WA_DontShowOnScreen); window.show();
-        auto* list = window.findChild<ClipListView*>("clip-library"); auto* shares = window.findChild<ClipListView*>("discord-library"); auto* cache = window.findChild<ThumbnailCache*>(); QVERIFY(list); QVERIFY(shares); QVERIFY(cache);
+        auto* list = window.findChild<ClipListView*>("clip-library"); auto* oldCopies = window.findChild<QWidget*>("compressor-old-copies"); auto* cache = window.findChild<ThumbnailCache*>(); QVERIFY(list); QVERIFY(oldCopies); QVERIFY(cache);
         QTest::qWait(300); QVERIFY(clipPaths(list).isEmpty());
         // Copied by hand into a game folder, the clip shows without anything to refresh.
         const auto added = QDir(library).filePath("Jeu/Ajout.mp4"); QVERIFY(QFile::copy(m_source, added));
         QTRY_VERIFY_WITH_TIMEOUT(clipPaths(list).contains(added), 5000); QCOMPARE(list->clips()->index(list->rowOf(added), 0).data(ClipRole::Game).toString(), QString("Jeu"));
         QVERIFY(QDir().mkpath(library + "/Partage Discord")); const auto copy = QDir(library).filePath("Partage Discord/Ajout-1.discord.mp4"); QVERIFY(QFile::copy(m_source, copy));
-        QTRY_VERIFY_WITH_TIMEOUT(clipPaths(shares).contains(copy), 5000); QVERIFY(!clipPaths(list).contains(copy));
+        // A copy left by an earlier version is offered for cleaning on the page of the compressor, never listed as a clip.
+        QTRY_VERIFY_WITH_TIMEOUT(!oldCopies->isHidden(), 5000); QVERIFY(!clipPaths(list).contains(copy));
         // Nothing reads the clips while the Explorer works on them: the folders are the user's.
         cache->setActive(false); QTRY_VERIFY_WITH_TIMEOUT(!cache->pending().isRunning(), 3000);
         QVERIFY(QDir(library).rename("Jeu", "Autre jeu")); const auto moved = QDir(library).filePath("Autre jeu/Ajout.mp4");
         QTRY_VERIFY_WITH_TIMEOUT(clipPaths(list).contains(moved) && !clipPaths(list).contains(added), 5000); QCOMPARE(list->clips()->index(list->rowOf(moved), 0).data(ClipRole::Game).toString(), QString("Autre jeu"));
-        QVERIFY(QFile::remove(moved)); QVERIFY(QFile::remove(copy)); QTRY_VERIFY_WITH_TIMEOUT(clipPaths(list).isEmpty() && clipPaths(shares).isEmpty(), 5000);
+        QVERIFY(QFile::remove(moved)); QVERIFY(QFile::remove(copy)); QTRY_VERIFY_WITH_TIMEOUT(clipPaths(list).isEmpty() && oldCopies->isHidden(), 5000);
         window.close();
     }
     void startupSettingsChooseWhenTheReplayStartsByItself() {
@@ -1232,6 +1366,12 @@ private slots:
         window.findChild<QPushButton*>("settings-save")->click();
         AppConfig stored; QVERIFY(ConfigStore(configPath).load(stored, error));
         QCOMPARE(stored.screenshotHotkey, QString("Ctrl+Shift+S")); QCOMPARE(stored.screenshotSoundId, QString("coin")); QCOMPARE(stored.screenshotSoundVolume, 70);
+        // A shortcut can also be left out altogether: nothing is bound, the keycaps say so.
+        settings->showTab(0); QCoreApplication::processEvents(); auto* clear = window.findChild<QPushButton*>("screenshot-hotkey-clear"); QVERIFY(clear && clear->isVisible());
+        clear->click(); QVERIFY(key->keySequence().isEmpty()); QVERIFY(!clear->isVisible()); window.findChild<QPushButton*>("settings-save")->click();
+        QVERIFY(ConfigStore(configPath).load(stored, error)); QVERIFY(stored.screenshotHotkey.isEmpty());
+        window.findChild<QPushButton*>("replay-hotkey-clear")->click(); window.findChild<QPushButton*>("settings-save")->click();
+        QVERIFY(ConfigStore(configPath).load(stored, error)); QVERIFY(stored.activeProfile()->replay.hotkey.isEmpty()); QVERIFY(stored.validationErrors().isEmpty());
         window.close();
     }
     void whatsNewShowsTheNotesOfTheInstalledVersionOverTheWindow() {
@@ -1257,8 +1397,9 @@ private slots:
         for (const auto& release : releases) QVERIFY2(!parseReleaseNotes(release.notes).isEmpty(), qPrintable(release.version));
         // A new feature ends on where it is found: the place is given apart, shown under it.
         const auto features = parseReleaseNotes(releases.first().notes).first(); QCOMPARE(features.title, QStringLiteral("Nouveautés"));
-        for (const auto& item : features.items) { QVERIFY2(item.where.startsWith(QStringLiteral("Réglages → ")), qPrintable(item.lead + QStringLiteral(" | where=") + item.where + QStringLiteral(" | text=") + item.text)); QVERIFY(!item.text.contains(QStringLiteral("Réglages →"))); }
-        QCOMPARE(features.items[1].lead, QStringLiteral("Thèmes")); QCOMPARE(features.items[1].where, QStringLiteral("Réglages → Général → Thèmes"));
+        for (const auto& item : features.items) { QVERIFY2(item.where.startsWith(QStringLiteral("Réglages → ")) || item.where.startsWith(QStringLiteral("Barre latérale → ")), qPrintable(item.lead + QStringLiteral(" | where=") + item.where + QStringLiteral(" | text=") + item.text)); QVERIFY(!item.text.contains(QStringLiteral(" → "))); }
+        QCOMPARE(features.items[0].lead, QStringLiteral("Compresseur")); QCOMPARE(features.items[0].where, QStringLiteral("Barre latérale → Compresseur"));
+        QCOMPARE(features.items.size(), 2); QCOMPARE(features.items[1].lead, QStringLiteral("Réglages de capture repensés")); QCOMPARE(features.items[1].where, QStringLiteral("Réglages → Capture → Qualité"));
         QCOMPARE(changelogReleases(sample).size(), 1); QCOMPARE(changelogReleases(sample).first().version, QStringLiteral("0.8.3"));
         const auto composite = [&](QWidget* dialog) { QImage shot = window.grab().toImage(); QPainter painter(&shot); painter.drawPixmap(dialog->mapToGlobal(QPoint()) - window.mapToGlobal(QPoint()), dialog->grab()); return shot; };
         const auto hasText = [](QWidget* widget, const QString& text) { for (auto* found : widget->findChildren<QLabel*>()) if (found->text() == text) return true; return false; };
@@ -1373,7 +1514,7 @@ private slots:
         // Each choice of a setting reads on its own line, its name in bold.
         const auto effort = window.findChild<QComboBox*>("effort")->toolTip(); QVERIFY(effort.contains("<b>Rapide</b>")); QVERIFY(effort.contains("<b>Soigné</b>"));
         QVERIFY(window.findChild<QComboBox*>("rate-control")->toolTip().contains("<b>Qualité constante</b>"));
-        QVERIFY(!window.findChild<QComboBox*>("fps")->toolTip().contains("<b>"));
+        QVERIFY(!window.findChild<QWidget*>("fps")->toolTip().contains("<b>"));
         QToolTip::showText(QPoint(200, 200), effort); QWidget* tip = nullptr;
         QTRY_VERIFY_WITH_TIMEOUT((tip = [] { for (auto* widget : QApplication::topLevelWidgets()) if (widget->inherits("QTipLabel") && widget->isVisible()) return widget; return static_cast<QWidget*>(nullptr); }()), 2000);
         QVERIFY(tip->width() < 600); QVERIFY(tip->grab().save(previewPath("tooltip-effort.png"))); QToolTip::hideText();

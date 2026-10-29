@@ -5,6 +5,7 @@
 #include <QElapsedTimer>
 #include <QFutureWatcher>
 #include <QHash>
+#include <QPointer>
 #include <QThreadPool>
 #include <QTimer>
 #include <QWidget>
@@ -24,6 +25,8 @@ class Bar;
 class Button;
 class ClipTimeline;
 class ElideLabel;
+class IconBox;
+class ModalDialog;
 class Segmented;
 class Tag;
 class Tile;
@@ -35,6 +38,7 @@ public:
     ~ClipEditor() override;
     void openClip(const QString& path);
     void suspend();
+    void release();
     QString clipPath() const { return m_path; }
     ClipEdit currentEdit() const { return m_edit; }
     ClipInfo clipInfo() const { return m_info; }
@@ -48,6 +52,8 @@ public:
     void noteHighQualityExport(const QString& original, const ClipEdit& edit);
     void setSharingBusy(bool busy);
     bool exporting() const { return m_exporter.running(); }
+    // Changed by the user, beyond the usual levels it opened with.
+    bool touched() const;
     // The usual level of each track: where a clip starts, and what "Garder ces volumes" replaces.
     void setDefaultMix(const TrackMix& mix);
     // The edit of the last export, for the mix to learn from.
@@ -88,6 +94,9 @@ private:
     void restoreTracks();
     void stepFrames(int frames);
     void finishRename(bool commit);
+    void showExportDialog(const QString& name);
+    void showExportResult(const QString& path);
+    void closeExportDialog();
     bool hasExportChanges() const;
     ClipPlayer m_player;
     ClipExporter m_exporter;
@@ -114,8 +123,9 @@ private:
     QHash<QString, ClipAnalysis> m_analysisCache;
     QString m_analysisKey;
     QWidget* m_header; Button* m_back; ElideLabel* m_title; QLineEdit* m_titleEdit; Button* m_rename; Tag* m_gameTag; Tag* m_stateTag; QLabel* m_hint;
-    Button* m_discord; Button* m_export; QWidget* m_exportBox; QLabel* m_exportLabel; QLabel* m_exportEta; Bar* m_progress; Button* m_cancelExport;
-    Banner* m_banner; Banner* m_problem;
+    Button* m_discord; Button* m_export;
+    QPointer<ModalDialog> m_exportDialog; IconBox* m_exportMark = nullptr; QWidget* m_exportProgress = nullptr; QLabel* m_exportPercent = nullptr; QLabel* m_exportEta = nullptr; Bar* m_exportBar = nullptr;
+    Banner* m_banner; Banner* m_problem; Button* m_reload; qint64 m_reloadAt = 0;
     VideoCanvas* m_canvas; Segmented* m_mode; Button* m_fullScreen; Button* m_screenshot;
     QVBoxLayout* m_center; QWidget* m_transport; Button* m_play; QLabel* m_time; QLabel* m_total; QLabel* m_selection; QLabel* m_selectionCaption; Button* m_startHere; Button* m_endHere;
     ClipTimeline* m_timeline; QWidget* m_zoomControls; QSlider* m_zoom; QLabel* m_zoomLabel; QScrollBar* m_pan; QLabel* m_zoomHint;

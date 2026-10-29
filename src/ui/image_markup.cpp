@@ -40,9 +40,10 @@ void MarkupLayer::undo() { if (m_marks.isEmpty()) return; m_marks.removeLast(); 
 void MarkupLayer::clear() { if (m_marks.isEmpty()) return; m_marks.clear(); update(); emit changed(); }
 // The canvas changes size: the layer follows it.
 bool MarkupLayer::eventFilter(QObject* watched, QEvent* event) {
-    if (watched == m_canvas && (event->type() == QEvent::Resize || event->type() == QEvent::Show)) { setGeometry(m_canvas->rect()); raise(); }
+    if (watched == m_canvas && (event->type() == QEvent::Resize || event->type() == QEvent::Show)) place();
     return QWidget::eventFilter(watched, event);
 }
+void MarkupLayer::place() { setGeometry(m_canvas->rect()); raise(); if (m_under) m_under->raise(); }
 QPointF MarkupLayer::toImage(QPointF point) const {
     const auto area = m_canvas->imageArea(); const QRectF part(m_canvas->shownPart()); if (area.isEmpty() || part.isEmpty()) return {};
     const QPointF image(part.x() + (point.x() - area.x()) * part.width() / area.width(), part.y() + (point.y() - area.y()) * part.height() / area.height());

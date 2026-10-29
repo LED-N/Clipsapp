@@ -16,6 +16,8 @@ struct CaptureStats {
     bool recording = false; double recordingSeconds = 0; qint64 recordingBytes = 0;
     // Why the replay keeps nothing although it was asked to: its buffer on disk could not be set up.
     QString bufferError;
+    // The screen captured is gone for now: the images are black, and the capture starts again when it is back.
+    bool screenLost = false;
 };
 struct ExportResult { QString path, error; double seconds = 0; };
 // A recording that ended. Its file is kept, readable, even when an error stopped it; "path" is

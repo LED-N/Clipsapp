@@ -1,6 +1,7 @@
 #include "windows_audio.h"
 #include "capture/audio_stream.h"
 #include "core/audio_routing.h"
+#include "platform/windows_monitors.h"
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
@@ -274,13 +275,8 @@ std::vector<unsigned long> applicationProcesses(const QString& executable) {
 }
 QString windowsVideoOptions(const QString& targetId) {
     if (targetId.startsWith("screen:")) {
-        struct Search { QString name; HMONITOR handle = nullptr; } search{targetId.mid(7), nullptr};
-        EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR monitor, HDC, LPRECT, LPARAM data) -> BOOL {
-            auto& query = *reinterpret_cast<Search*>(data); MONITORINFOEXW info{}; info.cbSize = sizeof(info);
-            if (GetMonitorInfoW(monitor, &info) && QString::fromWCharArray(info.szDevice) == query.name) { query.handle = monitor; return FALSE; }
-            return TRUE;
-        }, reinterpret_cast<LPARAM>(&search));
-        if (search.handle) return QString("hmonitor=%1").arg(quintptr(search.handle));
+        // The screen itself, wherever Windows put it: its device may have changed since it was chosen.
+        if (const auto monitor = findMonitor(targetId)) return QString("hmonitor=%1").arg(quintptr(monitor->handle));
     } else if (targetId.startsWith("window:")) {
         const int separator = targetId.indexOf('|', 7);
         struct Search { QString path, title; HWND handle = nullptr; } search{targetId.mid(7, separator - 7), targetId.mid(separator + 1), nullptr};

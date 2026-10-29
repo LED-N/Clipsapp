@@ -73,7 +73,7 @@ public:
         const unsigned picks[]{0x6FE3B4, 0xA98BFF, 0xD48BFF, 0x5EA8FF, 0xF5B24A, 0xFF7EB6, 0xF2777C, 0x7BD4E6, 0x0C0E12, 0x0F0B17, 0x090E18, 0xEEEAF7};
         int index = 0; for (const unsigned pick : picks) {
             auto* swatch = new QPushButton; swatch->setFixedSize(18, 18); swatch->setCursor(Qt::PointingHandCursor); swatch->setToolTip(tk::rgb(pick).name().toUpper());
-            swatch->setStyleSheet(QStringLiteral("QPushButton { background: %1; border: 1px solid %2; border-radius: 4px; } QPushButton:hover { border-color: %3; }").arg(tk::rgb(pick).name(), tk::lineStrong.name(), tk::text.name()));
+            setThemedStyleSheet(swatch, QStringLiteral("QPushButton { background: %1; border: 1px solid {lineStrong}; border-radius: 4px; } QPushButton:hover { border-color: {text}; }").arg(tk::rgb(pick).name()));
             connect(swatch, &QPushButton::clicked, this, [this, pick] { setColor(tk::rgb(pick)); });
             suggestions->addWidget(swatch, index / 6, index % 6); ++index;
         }
@@ -93,7 +93,7 @@ private:
     void setColor(const QColor& color, bool takeHue = true, bool writeCode = true) {
         m_color = color.toRgb(); if (takeHue && color.hsvHueF() >= 0) m_hue = color.hsvHueF();
         m_square->set(m_hue, m_color.hsvSaturationF(), m_color.valueF()); m_hueBar->set(m_hue);
-        m_sample->setStyleSheet(QStringLiteral("QFrame { background: %1; border: 1px solid %2; border-radius: 8px; }").arg(m_color.name(), tk::lineStrong.name()));
+        setThemedStyleSheet(m_sample, QStringLiteral("QFrame { background: %1; border: 1px solid {lineStrong}; border-radius: 8px; }").arg(m_color.name()));
         if (writeCode) m_code->setText(m_color.name().toUpper());
         if (tried) tried(m_color);
     }

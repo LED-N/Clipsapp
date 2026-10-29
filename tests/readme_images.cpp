@@ -137,7 +137,7 @@ int main(int argc, char** argv) {
     }
     for (int index = 0; index < 4; ++index) makeScreenshot(QStringLiteral("%1/Screenshots/Nova Strike/Nova Strike-%2.png").arg(library).arg(index), 0x1E8C7E + index * 0x101010, 0x0E1B2A);
     const auto configDirectory = work.filePath("config"); QDir(configDirectory).removeRecursively();
-    { auto config = AppConfig::defaults(); config.libraryPath = library; config.profiles[0].video.width = 2560; config.profiles[0].video.height = 1440; config.profiles[0].video.bitrateMbps = 50; QString error; if (!ConfigStore(configDirectory).save(config, error)) return 2; }
+    { auto config = AppConfig::defaults(); config.libraryPath = library; config.profiles[0].video.width = 2560; config.profiles[0].video.height = 1440; config.profiles[0].video.preset = QStringLiteral("high"); QString error; if (!ConfigStore(configDirectory).save(config, error)) return 2; }
 
     MainWindow window(configDirectory); window.setAttribute(Qt::WA_DontShowOnScreen); window.resize(1220, 820); window.show();
     auto* list = window.findChild<ClipListView*>("clip-library");
@@ -194,7 +194,7 @@ int main(int argc, char** argv) {
         auto image = ground(2560, 1040); QPainter painter(&image); painter.setRenderHint(QPainter::SmoothPixmapTransform);
         pitch(painter, QRectF(120, 150, 900, 800), QStringLiteral("BIBLIOTHÈQUE ET ÉDITEUR"), QStringLiteral("Retrouver, couper, partager."),
             QStringLiteral("Vos clips sont rangés par jeu et par jour. L'éditeur découpe, recadre et règle chaque piste ; l'original reste intact."),
-            {QStringLiteral("Une copie prête pour Discord, sous la limite de taille"), QStringLiteral("Lecture en plein écran"), QStringLiteral("Screenshots recadrés et annotés")});
+            {QStringLiteral("Le Compresseur : de la place, ou une copie pour Discord"), QStringLiteral("Lecture en plein écran"), QStringLiteral("Screenshots recadrés et annotés")});
         placeWindow(painter, frame(window, scale), QPointF(1110, 110)); painter.end(); image.save(output.filePath("readme-editor.png"));
     }
     window.close(); QThreadPool::globalInstance()->waitForDone(20000);

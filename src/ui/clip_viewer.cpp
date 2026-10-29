@@ -16,6 +16,7 @@
 #include <QStyle>
 #include <algorithm>
 #include <cmath>
+#include <utility>
 #ifdef Q_OS_WIN
 #include <windows.h>
 #endif
@@ -44,11 +45,11 @@ private:
 ClipViewer::ClipViewer(QWidget* owner) : QWidget(owner, Qt::Window | Qt::FramelessWindowHint), m_player(this), m_owner(owner) {
     setObjectName("clip-viewer"); setWindowTitle(QStringLiteral("Clipsapp")); setWindowModality(Qt::ApplicationModal); setAttribute(Qt::WA_OpaquePaintEvent);
     setFocusPolicy(Qt::StrongFocus); setMouseTracking(true); followVisibility(this, owner);
-    setStyleSheet(QStringLiteral("QFrame#viewerBar { background: rgba(12, 14, 18, 224); border: none; }"));
+    setThemedStyleSheet(this, QStringLiteral("QFrame#viewerBar { background: {veil}; border: none; }"));
     auto* top = new QFrame(this); top->setObjectName("viewerBar"); m_top = top; auto* topLayout = new QHBoxLayout(top); topLayout->setContentsMargins(20, 0, 12, 0); topLayout->setSpacing(12);
     m_title = new ElideLabel({}, "clip", Qt::ElideMiddle); m_title->setObjectName("viewer-title"); m_title->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed); topLayout->addWidget(m_title);
     m_count = label({}, "small"); m_count->setObjectName("viewer-count"); topLayout->addWidget(m_count); topLayout->addStretch();
-    topLayout->addWidget(label(QStringLiteral("Échap pour quitter"), "small3"));
+    topLayout->addWidget(label(QStringLiteral("Clic : lecture ou pause · Échap pour quitter"), "small3"));
     auto* close = new Button(QStringLiteral("x"), QString(), Button::Ghost); close->setObjectName("viewer-close"); close->setFocusPolicy(Qt::NoFocus); close->setToolTip(QStringLiteral("Quitter le plein écran (Échap)")); close->setAccessibleName(QStringLiteral("Quitter le plein écran")); topLayout->addWidget(close);
     auto* bottom = new QFrame(this); bottom->setObjectName("viewerBar"); m_bottom = bottom; auto* bottomLayout = new QHBoxLayout(bottom); bottomLayout->setContentsMargins(16, 0, 20, 0); bottomLayout->setSpacing(10);
     // As in the editor, the chevrons move by one image; the barred arrows change clip.
@@ -116,7 +117,11 @@ void ClipViewer::open(const QStringList& playlist, int index, std::optional<Clip
     }
     raise(); activateWindow(); setFocus(); qApp->installEventFilter(this);
     // The image goes straight from the card to the screen where that is possible; the bars stay above it.
-    if (!m_surface && VideoSurface::usable(this)) { m_surface = new VideoSurface(this); m_surface->setGeometry(rect()); m_surface->lower(); m_surface->hide(); for (auto* bar : {m_top, m_bottom}) VideoSurface::raiseAbove(bar); }
+    if (!m_surface && VideoSurface::usable(this)) {
+        m_surface = new VideoSurface(this);
+        if (!m_surface->ready()) delete std::exchange(m_surface, nullptr);
+        else { m_surface->setGeometry(rect()); m_surface->lower(); m_surface->hide(); for (auto* bar : {m_top, m_bottom}) VideoSurface::raiseAbove(bar); }
+    }
     load(std::clamp(index, 0, int(playlist.size()) - 1));
 }
 void ClipViewer::load(int index) {
@@ -135,7 +140,9 @@ void ClipViewer::jump(int index) { if (index < 0 || index >= m_playlist.size() |
 void ClipViewer::finish() {
     if (!m_open) return;
     m_open = false; const auto path = currentPath(); const auto position = m_player.snapshot().positionMs;
-    qApp->removeEventFilter(this); m_hide.stop(); keepAwake(false); m_player.close(); m_image = {}; m_index = -1; m_direct = false; if (m_surface) { m_surface->hide(); m_surface->clear(); } hide(); setCursor(Qt::ArrowCursor);
+    qApp->removeEventFilter(this); m_hide.stop(); keepAwake(false); m_player.close(); m_image = {}; m_index = -1; m_direct = false;
+    // The surface and the device behind it hold a good deal of memory: they are made again for the next clip.
+    m_player.setFrameSink({}); delete std::exchange(m_surface, nullptr); hide(); setCursor(Qt::ArrowCursor);
     emit closed(path, position);
 }
 void ClipViewer::updatePlayer() {
@@ -216,7 +223,8 @@ void ClipViewer::keyPressEvent(QKeyEvent* event) {
     const auto state = m_player.snapshot(); wake();
     if (const int frames = frameStep(event)) { step(frames); return; }
     switch (event->key()) {
-    case Qt::Key_Escape: case Qt::Key_F: case Qt::Key_F11: finish(); break;
+    // Only Échap leaves, or the cross: a key pressed by mistake never ends the viewing.
+    case Qt::Key_Escape: finish(); break;
     case Qt::Key_Space: case Qt::Key_K: if (m_ready) m_player.setPlaying(!state.playing); break;
     case Qt::Key_Left: if (m_ready) m_player.seek(state.positionMs - 5000); break;
     case Qt::Key_Right: if (m_ready) m_player.seek(state.positionMs + 5000); break;
@@ -227,9 +235,10 @@ void ClipViewer::keyPressEvent(QKeyEvent* event) {
     default: QWidget::keyPressEvent(event);
     }
 }
-// A click on the picture plays or pauses; on the bars it belongs to their controls.
+// A click on the picture plays or pauses, as Espace does; on the bars it belongs to their controls.
+// Two quick clicks are two clicks: the second one plays or pauses again, it never leaves.
 void ClipViewer::mousePressEvent(QMouseEvent* event) { wake(); if (const auto* under = childAt(event->position().toPoint()); event->button() == Qt::LeftButton && m_ready && (!under || under == m_surface)) m_player.setPlaying(!m_player.snapshot().playing); }
-void ClipViewer::mouseDoubleClickEvent(QMouseEvent* event) { if (const auto* under = childAt(event->position().toPoint()); event->button() == Qt::LeftButton && (!under || under == m_surface)) finish(); }
+void ClipViewer::mouseDoubleClickEvent(QMouseEvent* event) { mousePressEvent(event); }
 // The wheel sets the volume wherever the pointer is: up for louder, down for quieter, five points a notch.
 void ClipViewer::wheelEvent(QWheelEvent* event) {
     m_wheel += event->angleDelta().y(); const int notches = m_wheel / 120; m_wheel -= notches * 120; event->accept(); wake();

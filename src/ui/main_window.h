@@ -8,7 +8,6 @@
 #include "core/clip_library.h"
 #include "capture/replay_engine.h"
 #include "platform/global_hotkey.h"
-#include "sharing_page.h"
 class QAction;
 class QCloseEvent;
 class QShowEvent;
@@ -24,8 +23,10 @@ class FolderWatcher;
 struct SourceTarget;
 class UpdateService;
 class ClipViewer;
+class CompressBatch;
+class CompressorDialog;
+class CompressorPage;
 class DiscordBatch;
-class DiscordDialog;
 class LibraryPage;
 class OnboardingPage;
 class ReplayStrip;
@@ -36,7 +37,7 @@ class ThumbnailCache;
 class ToastHost;
 class MainWindow final : public QMainWindow {
 public:
-    enum Page { Library, Sharing, Settings, Editor, Onboarding, Screenshots, ScreenshotView };
+    enum Page { Library, Compressor, Settings, Editor, Onboarding, Screenshots, ScreenshotView };
     explicit MainWindow(QString configDirectory, QWidget* parent = nullptr, ClipTrashOperation trashOperation = {});
     QJsonObject smokeReport() const;
     bool smokeCheck(QString& error);
@@ -89,18 +90,24 @@ private:
     void revertConfig();
     void refreshLibrary();
     void rebuildLibrary();
-    void refreshSharing();
+    // The copies earlier versions kept in « Partage Discord », offered for cleaning on the page of the compressor.
+    void refreshOldCopies();
     void updateBusy();
-    void startDiscordSharing(QStringList paths, bool fromEditor = false);
+    // The compressor on these clips, for a goal (CompressorDialog::Goal) or to choose one; with no clip, the library compressing in the background.
+    void openCompressor(QStringList paths, int goal, bool fromEditor = false, bool library = false);
     void savedFeedback(const QString& path);
     void classifyClips(const QStringList& paths, const QString& game);
-    void deleteClips(QStringList paths, bool confirmed = false);
+    // Asked first unless "confirmed"; "permanent" skips the trash of the system.
+    void deleteClips(QStringList paths, bool confirmed = false, bool permanent = false);
     void renameClip(const QString& path, const QString& name);
     void copyFiles(const QStringList& paths);
+    // Whether some of these clips will not play everywhere on Discord: if so it is said, and true.
+    bool warnShared(const QStringList& paths, bool copied = false);
     void revealFile(const QString& path);
     void chooseLibraryFolder();
     void openClip(const QString& path);
-    void openScreenshot(const QString& path);
+    // By value: the editor may hand over a path it forgets on opening.
+    void openScreenshot(QString path);
     void viewImages(const QStringList& playlist, int index);
     void refreshScreenshots();
     void rebuildScreenshots();
@@ -113,6 +120,8 @@ private:
     // The game a clip or a screenshot belongs to: its classification, or its folder. Empty when it has none.
     QString gameOf(const QString& path) const;
     TrackMix mixForClip(const QString& path) const;
+    // Queued or under way in the compression that saves room: it is neither renamed nor deleted meanwhile.
+    bool compressing(const QString& path) const;
     void adoptGameMix(const QString& game, const TrackMix& mix);
     void viewClips(const QStringList& playlist, int index, bool fromEditor = false);
     void toggleCapture();
@@ -146,7 +155,7 @@ private:
     ReplayEngine* m_replay;
     GlobalHotkey* m_globalHotkey;
     QList<ClipEntry> m_clips;
-    QList<ShareCopy> m_copies;
+    QStringList m_oldCopies; qint64 m_oldCopyBytes = 0;
     QSet<QString> m_fresh;
     QStringList m_selectAfterScan;
     QString m_reopenAfterRename;
@@ -155,17 +164,19 @@ private:
     QFutureWatcher<LibraryScan>* m_shareScan;
     QFutureWatcher<ClipRename>* m_rename;
     QString m_renaming;
-    ClipTrashOperation m_trashOperation;
+    ClipTrashOperation m_trashOperation; bool m_trashPermanent = false;
     DiscordBatch* m_batch;
-    QPointer<DiscordDialog> m_shareDialog;
+    QPointer<CompressorDialog> m_compressDialog;
+    // Saving room, one clip or the whole library; what it replaces, the editor opens again on.
+    CompressBatch* m_compress; QString m_reopenAfterCompress; bool m_cacheHeldForCompress = false, m_volumeToSave = false;
     ThumbnailCache* m_cache;
     ToastHost* m_toasts;
     ReplayStrip* m_strip;
     QWidget* m_rail;
-    QWidget* m_clipsNav; QWidget* m_shareNav; QWidget* m_settingsNav; QVBoxLayout* m_subNav; QWidget* m_subNavHost;
+    QWidget* m_clipsNav; QWidget* m_compressNav; QWidget* m_settingsNav; QVBoxLayout* m_subNav; QWidget* m_subNavHost;
     QStackedWidget* m_pages;
     LibraryPage* m_library;
-    SharingPage* m_sharing;
+    CompressorPage* m_compressor;
     SettingsPage* m_settings;
     ClipEditor* m_editor;
     ClipViewer* m_viewer = nullptr;
@@ -175,7 +186,7 @@ private:
     UpdateService* m_updates; Button* m_updateButton;
     QSystemTrayIcon* m_tray; QAction* m_traySave; QAction* m_trayToggle; QAction* m_trayRecord;
     QString m_programs; bool m_quitting = false, m_quitOnClose = false; TrackMix m_mixAsked;
-    QString m_configDirectory, m_loginLocation, m_scanWarning, m_themeIcon; bool m_trayStart = false, m_sharesScanned = false;
+    QString m_configDirectory, m_loginLocation, m_scanWarning, m_themeIcon; bool m_trayStart = false;
     AutoReplay m_auto; QTimer* m_autoWatch; bool m_autoArmed = false;
     // The folder of the clips, followed for what the Explorer adds, renames or removes in it.
     FolderWatcher* m_folderWatch; QTimer* m_folderSettle; bool m_folderLibrary = false, m_folderSharing = false, m_folderShots = false;

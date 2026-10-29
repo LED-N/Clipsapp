@@ -7,6 +7,7 @@
 #include <QPainterPath>
 #include <QString>
 class QApplication;
+class QLabel;
 class QPainter;
 class QWidget;
 namespace clipsapp {
@@ -71,4 +72,11 @@ QIcon appIcon();
 void paintLogo(QPainter& painter, const QRectF& box);
 // Dynamic properties drive the stylesheet; the widget is polished again after a change.
 void setStyleProperty(QWidget* widget, const char* name, const QVariant& value);
+// A style sheet or a rich text written with the colors of the theme by name: {surface}, {line},
+// {accent}, {text2}… {ground} is the background of the window, {veil} the same a little transparent.
+QString themed(QString text);
+// The same, kept by the widget: it is written again in the new colors whenever the theme changes.
+void setThemedStyleSheet(QWidget* widget, const QString& sheet);
+void setThemedText(QLabel* label, const QString& text);
+void setThemedToolTip(QWidget* widget, const QString& tip);
 }

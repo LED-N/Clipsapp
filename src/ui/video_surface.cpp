@@ -1,4 +1,5 @@
 #include "video_surface.h"
+#include "theme.h"
 #include <QCoreApplication>
 #include <QEvent>
 #include <QGuiApplication>
@@ -43,7 +44,7 @@ VideoSurface::VideoSurface(QWidget* parent) : QWidget(parent) {
     // Clicks and moves are not handled: they go on to the view the surface lies in.
     setMouseTracking(true); setFocusPolicy(Qt::NoFocus);
     if (auto* top = window()) top->setProperty("directVideo", true);
-    if (auto* video = GpuVideo::shared()) m_output = std::make_unique<GpuOutput>(video, reinterpret_cast<void*>(winId()));
+    if (auto video = GpuVideo::acquire()) m_output = std::make_unique<GpuOutput>(std::move(video), reinterpret_cast<void*>(winId()));
     if (m_output) m_output->resize(deviceSize());
 }
 VideoSurface::~VideoSurface() = default;
@@ -55,7 +56,7 @@ bool VideoSurface::lost() const { return !m_output || !m_output->valid(); }
 bool VideoSurface::usable(const QWidget* host) {
     if (!host || QGuiApplication::platformName() != QLatin1String("windows")) return false;
     const auto* top = host->window();
-    return !abandoned && top->isVisible() && !top->testAttribute(Qt::WA_DontShowOnScreen) && GpuVideo::shared();
+    return !abandoned && top->isVisible() && !top->testAttribute(Qt::WA_DontShowOnScreen) && GpuVideo::available();
 }
 void VideoSurface::raiseAbove(QWidget* widget) {
     if (!widget || !widget->window()->property("directVideo").toBool()) return;
@@ -66,7 +67,8 @@ QSize VideoSurface::deviceSize() const { const auto ratio = devicePixelRatioF();
 void VideoSurface::present(const GpuFrame& frame) { if (m_output) m_output->show(frame); }
 void VideoSurface::setView(const QRect& source, const QRect& place, const QColor& ground) { if (m_output) m_output->setView(source, place, ground); }
 void VideoSurface::setOverlay(const QImage& overlay) { if (m_output) m_output->setOverlay(overlay); }
-void VideoSurface::setDimmed(bool dimmed) { if (m_output) m_output->setDim(dimmed ? QColor(6, 8, 10, 184) : QColor(0, 0, 0, 0)); }
+// The same veil as the one over the rest of the window, in the colors of the theme.
+void VideoSurface::setDimmed(bool dimmed) { auto veil = tk::mix(tk::window, QColor(Qt::black), 0.45); veil.setAlpha(184); if (m_output) m_output->setDim(dimmed ? veil : QColor(0, 0, 0, 0)); }
 void VideoSurface::clear() { if (m_output) m_output->show({}); }
 quint64 VideoSurface::presented() const { return m_output ? m_output->presented() : 0; }
 QImage VideoSurface::grabFrame() { return m_output ? m_output->grab() : QImage(); }

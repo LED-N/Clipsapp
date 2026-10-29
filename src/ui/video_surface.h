@@ -14,6 +14,8 @@ public:
     ~VideoSurface() override;
     // A window really on screen, on a machine whose card can decode and show a clip this way.
     static bool usable(const QWidget* host);
+    // Whether the card gave it what it needs: a surface without it shows nothing and is let go.
+    bool ready() const { return bool(m_output); }
     // Whether the card still shows what it is given. A driver that was replaced or that failed takes
     // the surface with it: the clip is then opened again and drawn from memory, here and from then on.
     bool lost() const;

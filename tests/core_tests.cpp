@@ -35,7 +35,7 @@ private slots:
         QVERIFY(gameNameFromApplication("C:/Discord/Discord.exe", "Discord").isEmpty());
         QCOMPARE(safeGameFolder("../ARC: Raiders. "), QString(".._ARC_ Raiders")); QCOMPARE(safeGameFolder("CON"), QString("_CON")); QCOMPARE(safeGameFolder(".."), QString("Clips"));
         auto config = AppConfig::defaults(); config.profiles.first().gameName = "ARC Raiders"; config.profiles.first().detectGame = false;
-        AppConfig loaded; QString error; QVERIFY(AppConfig::fromJson(config.toJson(), loaded, error)); QCOMPARE(loaded.profiles.first().gameName, QString("ARC Raiders")); QVERIFY(!loaded.profiles.first().detectGame);
+        AppConfig loaded; QString error; QVERIFY(AppConfig::fromJson(config.toJson(), loaded, error)); QVERIFY(loaded.profiles.first().gameName.isEmpty()); QVERIFY(loaded.profiles.first().detectGame);
     }
     void manualLibraryClassificationSurvivesRestartWithoutChangingTheClip() {
         QTemporaryDir directory; const auto clip = directory.filePath("import.mp4"); QFile file(clip); QVERIFY(file.open(QIODevice::WriteOnly)); file.write("original"); file.close();
@@ -186,6 +186,9 @@ private slots:
         auto profile = AppConfig::defaults().profiles.first(); const qint64 sixteen = 16LL << 30;
         QVERIFY(!suggestsDiskBuffer(profile, sixteen)); QVERIFY(!suggestsDiskBuffer(profile, 0));
         profile.video.bitrateMbps = 200; profile.replay.durationSeconds = 600; QVERIFY(suggestsDiskBuffer(profile, sixteen));
+        // A tenth of the memory, 2 Gio at most: five minutes at 30 Mbit/s (≈ 1,1 Gio) are too much for 8 Go, not for 16; 3 Gio are too much even for 64 Go.
+        profile.video.bitrateMbps = 30; profile.replay.durationSeconds = 300; QVERIFY(suggestsDiskBuffer(profile, sixteen / 2)); QVERIFY(!suggestsDiskBuffer(profile, sixteen));
+        profile.video.bitrateMbps = 80; QVERIFY(suggestsDiskBuffer(profile, sixteen * 4));
     }
     void aRecordingStartsOnTheLastPictureAVideoCanStartOn() {
         ReplayBuffer buffer(60000000, 1048576); QVERIFY(buffer.fromLastKeyframe().isEmpty());
@@ -254,7 +257,7 @@ private slots:
         auto& first = original.profiles.first(); first.name = QStringLiteral("Jeu — équipe 🎮");
         first.sources[1].targetId = QStringLiteral("C:/Jeux/Mon jeu/jeu.exe"); first.sources[1].enabled = true;
         first.sources[2].trackId = first.sources[1].trackId;
-        auto second = first; second.id = newId(); second.name = "4K"; second.video.width = 3840; second.video.height = 2160; second.video.fps = 30;
+        auto second = first; second.id = newId(); second.name = "4K"; second.video.width = 3840; second.video.height = 2160; second.video.fps = 30; applyQualityPreset(second.video);
         original.profiles.append(second); original.activeProfileId = second.id;
         QVERIFY2(store.save(original, error), qPrintable(error)); AppConfig loaded; QVERIFY2(store.load(loaded, error), qPrintable(error));
         QCOMPARE(QJsonDocument(original.toJson()).toJson(), QJsonDocument(loaded.toJson()).toJson());
@@ -287,12 +290,27 @@ private slots:
         const auto oneTrack = estimatedBufferMiB(profile);
         profile.sources.last().trackId = profile.tracks.last().id;
         QVERIFY(estimatedBufferMiB(profile) > oneTrack);
-        const auto expected = (25000000.0 + 192000.0) * 60 / 8 / 1048576;
+        const auto expected = (profile.video.bitrateMbps * 1000000.0 + 192000.0) * 60 / 8 / 1048576;
         QVERIFY(qAbs(oneTrack - expected) < 0.001);
+    }
+    void qualityPresetsFollowTheSizeAndTheOlderQualitiesBecomePresets() {
+        QCOMPARE(presetBitrate("balanced", 1920, 1080, 60, "h264"), 20); QCOMPARE(presetBitrate("light", 1920, 1080, 30, "h264"), 6); QCOMPARE(presetBitrate("high", 2560, 1440, 60, "h264"), 55);
+        // Light in 1440p stays light; HEVC needs less; nothing goes past the ceiling of the settings.
+        QVERIFY(presetBitrate("light", 2560, 1440, 60, "h264") < presetBitrate("balanced", 1920, 1080, 60, "h264")); QVERIFY(presetBitrate("high", 2560, 1440, 60, "hevc") < 55); QCOMPARE(presetBitrate("high", 3840, 2160, 144, "h264"), 185);
+        auto config = AppConfig::defaults(); QCOMPARE(config.profiles.first().video.preset, QString("balanced")); QCOMPARE(config.profiles.first().video.bitrateMbps, 20); QVERIFY(config.validationErrors().isEmpty());
+        // A file of 0.8.4: each of its four qualities becomes a preset, « Maximale » the highest one; a quality set by hand stays as it was.
+        const auto older = [&config](int width, int height, int fps, const QString& mode, int bitrate, int quality) {
+            auto json = config.toJson(); auto profiles = json.value("profiles").toArray(); auto profile = profiles.first().toObject(); auto video = profile.value("video").toObject();
+            video.remove("preset"); video.insert("width", width); video.insert("height", height); video.insert("fps", fps); video.insert("rateControl", mode); video.insert("bitrateMbps", bitrate); video.insert("quality", quality);
+            profile.insert("video", video); profiles.replace(0, profile); json.insert("profiles", profiles); AppConfig loaded; QString error; [&] { QVERIFY2(AppConfig::fromJson(json, loaded, error), qPrintable(error)); }(); return loaded.profiles.first().video; };
+        auto video = older(2560, 1440, 60, "quality", 200, 14); QCOMPARE(video.preset, QString("high")); QCOMPARE(video.rateControl, QString("bitrate")); QCOMPARE(video.bitrateMbps, 55);
+        video = older(1920, 1080, 30, "bitrate", 12, 20); QCOMPARE(video.preset, QString("light")); QCOMPARE(video.bitrateMbps, 6);
+        video = older(2560, 1440, 60, "quality", 75, 14); QVERIFY(video.preset.isEmpty()); QCOMPARE(video.rateControl, QString("quality")); QCOMPARE(video.bitrateMbps, 75); QCOMPARE(video.quality, 14);
+        config.profiles.first().video.preset = "unknown"; QVERIFY(!config.validationErrors().isEmpty());
     }
     void recordingQualityRoundTripsAndOlderFilesKeepATargetBitrate() {
         auto config = AppConfig::defaults(); auto& video = config.profiles.first().video;
-        video.rateControl = "quality"; video.quality = 14; video.effort = "thorough"; video.bitrateMbps = 200;
+        video.rateControl = "quality"; video.quality = 14; video.effort = "thorough"; video.bitrateMbps = 200; video.preset.clear();
         AppConfig loaded; QString error; QVERIFY2(AppConfig::fromJson(config.toJson(), loaded, error), qPrintable(error));
         QCOMPARE(loaded.profiles.first().video.rateControl, QString("quality")); QCOMPARE(loaded.profiles.first().video.quality, 14); QCOMPARE(loaded.profiles.first().video.effort, QString("thorough"));
         // A file written before these settings existed records as it always did.

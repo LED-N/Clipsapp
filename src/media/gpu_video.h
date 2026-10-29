@@ -16,8 +16,12 @@ using GpuFrame = std::shared_ptr<AVFrame>;
 class GpuVideo {
 public:
     // The device of the application, or nothing where it cannot be had: the callers then keep
-    // drawing images from memory, as before.
-    static GpuVideo* shared();
+    // drawing images from memory, as before. It lives as long as someone holds it, a window that
+    // shows a clip or a decoder that feeds one, and is made again for the next clip: closed, a clip
+    // leaves nothing on the card nor in memory.
+    static std::shared_ptr<GpuVideo> acquire();
+    // Whether it can be asked for: false where the card refused it once.
+    static bool available();
     // What a decoder is given so that its images can be shown here. Borrowed: take a reference.
     AVBufferRef* decodingDevice() const;
     struct Impl;
@@ -33,7 +37,7 @@ private:
 class GpuOutput {
 public:
     // window: the native handle (HWND) the picture is presented in.
-    GpuOutput(GpuVideo* video, void* window);
+    GpuOutput(std::shared_ptr<GpuVideo> video, void* window);
     ~GpuOutput();
     bool valid() const;
     // In pixels of the screen.

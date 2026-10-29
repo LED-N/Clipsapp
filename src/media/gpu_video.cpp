@@ -39,13 +39,15 @@ using Compile = HRESULT (WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACR
 
 struct GpuVideo::Impl {
     // The decoder and every window draw through one context, which only one thread may use at a time.
-    std::recursive_mutex lock;
+    // The lock belongs to the decoding device: the images still held after the last window closed
+    // keep it, and the device, until they go.
+    std::recursive_mutex* lock = nullptr;
     Com<ID3D11Device> device; Com<ID3D11DeviceContext> context; Com<ID3D11VideoDevice> videoDevice; Com<ID3D11VideoContext> videoContext;
     Com<ID3D11VertexShader> vertex; Com<ID3D11PixelShader> pixel; Com<ID3D11SamplerState> sampler; Com<ID3D11BlendState> blend; Com<ID3D11RasterizerState> raster;
     AVBufferRef* hardware = nullptr;
     ~Impl() { av_buffer_unref(&hardware); }
-    static void take(void* self) { static_cast<Impl*>(self)->lock.lock(); }
-    static void give(void* self) { static_cast<Impl*>(self)->lock.unlock(); }
+    static void take(void* self) { static_cast<std::recursive_mutex*>(self)->lock(); }
+    static void give(void* self) { static_cast<std::recursive_mutex*>(self)->unlock(); }
     bool create() {
         if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT, nullptr, 0, D3D11_SDK_VERSION, device.out(), nullptr, context.out()))) return false;
         if (FAILED(device->QueryInterface(__uuidof(ID3D11VideoDevice), reinterpret_cast<void**>(videoDevice.out()))) || FAILED(context->QueryInterface(__uuidof(ID3D11VideoContext), reinterpret_cast<void**>(videoContext.out())))) return false;
@@ -63,26 +65,33 @@ struct GpuVideo::Impl {
         D3D11_RASTERIZER_DESC filling{}; filling.FillMode = D3D11_FILL_SOLID; filling.CullMode = D3D11_CULL_NONE; filling.DepthClipEnable = TRUE;
         if (FAILED(device->CreateSamplerState(&sampling, sampler.out())) || FAILED(device->CreateBlendState(&blending, blend.out())) || FAILED(device->CreateRasterizerState(&filling, raster.out()))) return false;
         hardware = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA); if (!hardware) return false;
-        auto* shared = static_cast<AVD3D11VADeviceContext*>(reinterpret_cast<AVHWDeviceContext*>(hardware->data)->hwctx);
-        device->AddRef(); shared->device = device.p; shared->lock = take; shared->unlock = give; shared->lock_ctx = this;
+        auto* context = reinterpret_cast<AVHWDeviceContext*>(hardware->data); lock = new std::recursive_mutex; context->user_opaque = lock;
+        context->free = [](AVHWDeviceContext* self) { delete static_cast<std::recursive_mutex*>(self->user_opaque); };
+        auto* shared = static_cast<AVD3D11VADeviceContext*>(context->hwctx);
+        device->AddRef(); shared->device = device.p; shared->lock = take; shared->unlock = give; shared->lock_ctx = lock;
         return av_hwdevice_ctx_init(hardware) >= 0;
     }
 };
 GpuVideo::GpuVideo() : m_impl(std::make_unique<Impl>()) {}
 GpuVideo::~GpuVideo() = default;
 AVBufferRef* GpuVideo::decodingDevice() const { return m_impl->hardware; }
-GpuVideo* GpuVideo::shared() {
-    static std::unique_ptr<GpuVideo> instance; static std::once_flag once;
-    std::call_once(once, [] {
-        // A way back to the images drawn from memory, for a card or a driver that would misbehave.
-        if (qEnvironmentVariableIsSet("CLIPSAPP_NO_GPU_VIDEO")) return;
-        std::unique_ptr<GpuVideo> candidate(new GpuVideo); if (candidate->m_impl->create()) instance = std::move(candidate);
-    });
-    return instance.get();
+namespace {
+std::mutex sharing; std::weak_ptr<GpuVideo> current; bool refused = false;
 }
+std::shared_ptr<GpuVideo> GpuVideo::acquire() {
+    std::lock_guard guard(sharing);
+    if (auto video = current.lock()) return video;
+    if (!available()) return {};
+    std::shared_ptr<GpuVideo> candidate(new GpuVideo);
+    // A card or a driver that refuses once is not asked again.
+    if (!candidate->m_impl->create()) { refused = true; return {}; }
+    current = candidate; return candidate;
+}
+// A way back to the images drawn from memory, for a card or a driver that would misbehave.
+bool GpuVideo::available() { return !refused && !qEnvironmentVariableIsSet("CLIPSAPP_NO_GPU_VIDEO"); }
 
 struct GpuOutput::Impl {
-    GpuVideo::Impl* gpu = nullptr; HWND window = nullptr;
+    std::shared_ptr<GpuVideo> video; GpuVideo::Impl* gpu = nullptr; HWND window = nullptr;
     Com<IDXGISwapChain1> chain; Com<ID3D11Texture2D> back; Com<ID3D11RenderTargetView> target; Com<ID3D11VideoProcessorOutputView> outputView;
     Com<ID3D11VideoProcessorEnumerator> enumerator; Com<ID3D11VideoProcessor> processor; QSize processorInput, processorOutput;
     Com<ID3D11Texture2D> overlay; Com<ID3D11ShaderResourceView> overlayView; QSize overlaySize;
@@ -108,6 +117,8 @@ struct GpuOutput::Impl {
     // The card scales the part of the image that is shown into its place, and turns its colours into those of the screen.
     bool drawFrame() {
         if (!frame || frame->format != AV_PIX_FMT_D3D11 || !frame->data[0]) return false;
+        // An image decoded on a device that has since gone cannot be shown on this one.
+        if (!frame->hw_frames_ctx || reinterpret_cast<AVHWFramesContext*>(frame->hw_frames_ctx->data)->device_ref->data != gpu->hardware->data) return false;
         const QRect window(QPoint(), size), to = place.intersected(window), from = source.intersected(QRect(0, 0, frame->width, frame->height));
         if (to.isEmpty() || from.isEmpty()) return false;
         auto* texture = reinterpret_cast<ID3D11Texture2D*>(frame->data[0]); D3D11_TEXTURE2D_DESC description; texture->GetDesc(&description);
@@ -167,12 +178,13 @@ struct GpuOutput::Impl {
         return SUCCEEDED(gpu->device->CreateTexture2D(&description, pixels ? &data : nullptr, result.out())) && SUCCEEDED(gpu->device->CreateShaderResourceView(result.p, nullptr, view.out()));
     }
 };
-GpuOutput::GpuOutput(GpuVideo* video, void* window) : m_impl(std::make_unique<Impl>()) { m_impl->gpu = video->impl(); m_impl->window = static_cast<HWND>(window); }
-GpuOutput::~GpuOutput() { std::lock_guard guard(m_impl->gpu->lock); m_impl->frame.reset(); m_impl.reset(); }
-bool GpuOutput::valid() const { std::lock_guard guard(m_impl->gpu->lock); return m_impl->chain.p && !m_impl->failed; }
+GpuOutput::GpuOutput(std::shared_ptr<GpuVideo> video, void* window) : m_impl(std::make_unique<Impl>()) { m_impl->gpu = video->impl(); m_impl->video = std::move(video); m_impl->window = static_cast<HWND>(window); }
+// The device outlives the lock taken here: the last window may be the last to hold it.
+GpuOutput::~GpuOutput() { const auto video = m_impl->video; std::lock_guard guard(*m_impl->gpu->lock); m_impl->frame.reset(); m_impl.reset(); }
+bool GpuOutput::valid() const { std::lock_guard guard(*m_impl->gpu->lock); return m_impl->chain.p && !m_impl->failed; }
 quint64 GpuOutput::presented() const { return m_impl->presented; }
 void GpuOutput::resize(QSize size) {
-    auto& output = *m_impl; std::lock_guard guard(output.gpu->lock);
+    auto& output = *m_impl; std::lock_guard guard(*output.gpu->lock);
     size = size.expandedTo({1, 1}); if (size == output.size && output.chain.p) return;
     output.size = size; output.back.reset(); output.target.reset(); output.outputView.reset();
     if (!output.chain.p) { if (!output.create()) { output.failed = true; return; } }
@@ -180,12 +192,12 @@ void GpuOutput::resize(QSize size) {
     output.render();
 }
 void GpuOutput::setView(const QRect& source, const QRect& place, const QColor& ground) {
-    auto& output = *m_impl; std::lock_guard guard(output.gpu->lock);
+    auto& output = *m_impl; std::lock_guard guard(*output.gpu->lock);
     if (source == output.source && place == output.place && ground == output.ground) return;
     output.source = source; output.place = place; output.ground = ground; output.render();
 }
 void GpuOutput::setOverlay(const QImage& overlay) {
-    auto& output = *m_impl; std::lock_guard guard(output.gpu->lock);
+    auto& output = *m_impl; std::lock_guard guard(*output.gpu->lock);
     if (overlay.isNull()) { if (!output.overlayView.p) return; output.overlayView.reset(); output.overlay.reset(); output.overlaySize = {}; output.render(); return; }
     const QImage pixels = overlay.format() == QImage::Format_ARGB32_Premultiplied ? overlay : overlay.convertToFormat(QImage::Format_ARGB32_Premultiplied);
     if (pixels.size() != output.overlaySize || !output.overlay.p) {
@@ -200,15 +212,15 @@ void GpuOutput::setOverlay(const QImage& overlay) {
     output.render();
 }
 void GpuOutput::setDim(const QColor& veil) {
-    auto& output = *m_impl; std::lock_guard guard(output.gpu->lock);
+    auto& output = *m_impl; std::lock_guard guard(*output.gpu->lock);
     if (veil.alpha() == 0) { if (!output.veilView.p) return; output.veilView.reset(); output.veil.reset(); output.render(); return; }
     const QRgb pixel = qPremultiply(veil.rgba());
     if (output.texture(output.veil, output.veilView, {1, 1}, true, &pixel, 4)) output.render();
 }
-void GpuOutput::show(const GpuFrame& frame) { auto& output = *m_impl; std::lock_guard guard(output.gpu->lock); output.frame = frame; output.render(); }
-void GpuOutput::refresh() { auto& output = *m_impl; std::lock_guard guard(output.gpu->lock); output.render(); }
+void GpuOutput::show(const GpuFrame& frame) { auto& output = *m_impl; std::lock_guard guard(*output.gpu->lock); output.frame = frame; output.render(); }
+void GpuOutput::refresh() { auto& output = *m_impl; std::lock_guard guard(*output.gpu->lock); output.render(); }
 QImage GpuOutput::grab() {
-    auto& output = *m_impl; std::lock_guard guard(output.gpu->lock);
+    auto& output = *m_impl; std::lock_guard guard(*output.gpu->lock);
     if (!output.draw()) return {};
     D3D11_TEXTURE2D_DESC description; output.back->GetDesc(&description); description.Usage = D3D11_USAGE_STAGING; description.BindFlags = 0; description.CPUAccessFlags = D3D11_CPU_ACCESS_READ; description.MiscFlags = 0;
     Com<ID3D11Texture2D> copy; QImage result;
@@ -231,9 +243,10 @@ struct GpuVideo::Impl {};
 struct GpuOutput::Impl {};
 GpuVideo::GpuVideo() = default;
 GpuVideo::~GpuVideo() = default;
-GpuVideo* GpuVideo::shared() { return nullptr; }
+std::shared_ptr<GpuVideo> GpuVideo::acquire() { return {}; }
+bool GpuVideo::available() { return false; }
 AVBufferRef* GpuVideo::decodingDevice() const { return nullptr; }
-GpuOutput::GpuOutput(GpuVideo*, void*) {}
+GpuOutput::GpuOutput(std::shared_ptr<GpuVideo>, void*) {}
 GpuOutput::~GpuOutput() = default;
 bool GpuOutput::valid() const { return false; }
 void GpuOutput::resize(QSize) {}

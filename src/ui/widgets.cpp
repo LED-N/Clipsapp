@@ -37,7 +37,12 @@ QLabel* caption(const QString& text) {
 QLabel* monoLabel(const QString& text, int pixels, const QColor& color, int weight) {
     // The colors of the theme go by role, so that they follow it when it changes.
     auto* result = label(text, color == tk::text2 ? "t2" : color == tk::text3 ? "t3" : nullptr); result->setFont(monoFont(pixels, weight));
-    if (color != tk::text && color != tk::text2 && color != tk::text3) result->setStyleSheet(QStringLiteral("color: %1;").arg(color.name()));
+    // A color of the theme is kept by its name, so that it follows a change of theme too.
+    const std::pair<QColor, const char*> named[]{{tk::accent, "accent"}, {tk::warn, "warn"}, {tk::danger, "danger"}, {tk::info, "info"}, {tk::muted, "muted"}, {tk::textOff, "textOff"}};
+    if (color != tk::text && color != tk::text2 && color != tk::text3) {
+        const auto* token = std::find_if(std::begin(named), std::end(named), [&color](const auto& entry) { return entry.first == color; });
+        if (token != std::end(named)) setThemedStyleSheet(result, QStringLiteral("color: {%1};").arg(QLatin1String(token->second))); else result->setStyleSheet(QStringLiteral("color: %1;").arg(color.name()));
+    }
     return result;
 }
 QFrame* card(const char* kind) { auto* frame = new QFrame; frame->setProperty("card", kind); return frame; }
@@ -225,7 +230,8 @@ void Tile::paintEvent(QPaintEvent*) {
     const double left = m_picture ? 10 : 12; double y = 10;
     if (m_picture) {
         const QRectF picture(left + 0.5, y + 0.5, width() - left * 2 - 1, 63); QPen pen(tk::line, 1); if (m_pictureDashed) pen.setStyle(Qt::DashLine);
-        QLinearGradient gradient(picture.topLeft(), picture.bottomRight()); gradient.setColorAt(0, QColor(0x1F, 0x35, 0x40)); gradient.setColorAt(0.5, QColor(0x12, 0x20, 0x27)); gradient.setColorAt(1, QColor(0x33, 0x40, 0x5A));
+        // A screen at rest, in the colors of the theme.
+        QLinearGradient gradient(picture.topLeft(), picture.bottomRight()); gradient.setColorAt(0, tk::mix(tk::raised, tk::accent, 0.16)); gradient.setColorAt(0.5, tk::surface); gradient.setColorAt(1, tk::mix(tk::raised, tk::info, 0.22));
         painter.setPen(pen); painter.setBrush(m_pictureDashed ? QBrush(Qt::NoBrush) : QBrush(gradient)); painter.drawRoundedRect(picture, 5, 5);
         if (!m_pictureIcon.isEmpty()) paintIcon(painter, m_pictureIcon, QRectF(picture.center().x() - 8, picture.center().y() - 8, 16, 16), tk::text3);
         y += 64 + 8;
@@ -275,17 +281,23 @@ QStringList Keycaps::keyNames(const QKeySequence& sequence) {
     const auto textForm = sequence.toString(QKeySequence::PortableText); auto names = textForm.split('+', Qt::SkipEmptyParts);
     if (textForm.endsWith('+')) names.append(QStringLiteral("+"));
     for (auto& name : names) if (name == QLatin1String("Meta")) name = QStringLiteral("Win");
+    // A key of the numeric keypad is one key, written with its mark: « Num + », « Num 5 ».
+    for (int index = int(names.size()) - 2; index >= 0; --index) if (names[index] == QLatin1String("Num")) { names[index] += QLatin1Char(' ') + names[index + 1]; names.removeAt(index + 1); }
     return names;
 }
+QString shortcutText(const QString& portable, const QString& separator) { return Keycaps::keyNames(QKeySequence::fromString(portable, QKeySequence::PortableText)).join(separator); }
 void Keycaps::setSequence(const QKeySequence& sequence) { m_keys = keyNames(sequence); updateGeometry(); update(); }
 QSize Keycaps::sizeHint() const {
     const QFontMetrics metrics(uiFont(m_large ? 18 : 12, QFont::Bold)); int width = 0;
+    if (m_keys.isEmpty() && !m_empty.isEmpty()) return {QFontMetrics(uiFont(m_large ? 16 : 12)).horizontalAdvance(m_empty) + 2, m_large ? 56 : 28};
     for (const auto& key : m_keys) width += std::max(m_large ? 64 : 34, metrics.horizontalAdvance(key) + (m_large ? 34 : 18));
     const int between = m_large ? 10 + metrics.horizontalAdvance(QLatin1Char('+')) + 10 : 6;
     return {std::max(1, width + between * std::max(0, int(m_keys.size()) - 1)), m_large ? 56 : 28};
 }
 void Keycaps::paintEvent(QPaintEvent*) {
-    QPainter painter(this); painter.setRenderHint(QPainter::Antialiasing); const auto font = uiFont(m_large ? 18 : 12, QFont::Bold); const QFontMetrics metrics(font); painter.setFont(font);
+    QPainter painter(this); painter.setRenderHint(QPainter::Antialiasing);
+    if (m_keys.isEmpty() && !m_empty.isEmpty()) { painter.setFont(uiFont(m_large ? 16 : 12)); painter.setPen(tk::text3); painter.drawText(rect(), Qt::AlignLeft | Qt::AlignVCenter, m_empty); return; }
+    const auto font = uiFont(m_large ? 18 : 12, QFont::Bold); const QFontMetrics metrics(font); painter.setFont(font);
     double x = 0; const double radius = m_large ? 8 : 5, lip = m_large ? 4 : 3;
     for (int index = 0; index < m_keys.size(); ++index) {
         const bool last = m_large && index == m_keys.size() - 1; const double width = std::max(m_large ? 64 : 34, metrics.horizontalAdvance(m_keys[index]) + (m_large ? 34 : 18));
@@ -364,11 +376,13 @@ Banner::Banner(Kind kind, const QString& iconName, QWidget* parent) : QFrame(par
 void Banner::setTexts(const QString& title, const QString& detail) { m_title->setText(title); m_detail->setText(detail); m_detail->setVisible(!detail.isEmpty()); }
 
 namespace {
+// The veil under a dialog: the background of the theme, darkened, a little transparent.
+QColor scrimColor() { auto color = tk::mix(tk::window, QColor(Qt::black), 0.45); color.setAlpha(184); return color; }
 class Scrim final : public QWidget {
 public:
     using QWidget::QWidget;
 protected:
-    void paintEvent(QPaintEvent*) override { QPainter painter(this); painter.fillRect(rect(), QColor(6, 8, 10, 184)); }
+    void paintEvent(QPaintEvent*) override { QPainter painter(this); painter.fillRect(rect(), scrimColor()); }
 };
 }
 ModalDialog::ModalDialog(QWidget* parent, int width) : QDialog(parent, Qt::Dialog | Qt::FramelessWindowHint) {
@@ -432,9 +446,9 @@ bool askText(QWidget* parent, const QString& title, const QString& subtitle, con
 namespace {
 class Toast final : public QFrame {
 public:
-    Toast(ToastHost::Kind kind, const QString& title, const QString& text, QList<ToastAction> actions, const QString& iconName, QWidget* parent) : QFrame(parent) {
+    Toast(ToastHost::Kind kind, const QString& title, const QString& text, QList<ToastAction> actions, const QString& iconName, bool lasting, QWidget* parent) : QFrame(parent) {
         setObjectName("toast"); setFixedWidth(360);
-        setStyleSheet(QStringLiteral("QFrame#toast { background: #1A1F27; border: 1px solid %1; border-radius: 8px; }").arg(kind == ToastHost::Error ? "#5A2A30" : kind == ToastHost::Warn ? "#4D3B1C" : "#323A47"));
+        setThemedStyleSheet(this, QStringLiteral("QFrame#toast { background: {raised}; border: 1px solid %1; border-radius: 8px; }").arg(kind == ToastHost::Error ? "{dangerLine}" : kind == ToastHost::Warn ? "{warnLine}" : "{lineStrong}"));
         static const char* names[]{"ok", "share", "warn", "err"}; const QColor colors[]{tk::accent, tk::info, tk::warn, tk::danger};
         auto* layout = new QHBoxLayout(this); layout->setContentsMargins(14, 12, 10, 12); layout->setSpacing(12);
         layout->addWidget(new IconLabel(iconName.isEmpty() ? QString::fromLatin1(names[kind]) : iconName, colors[kind]), 0, Qt::AlignTop);
@@ -453,7 +467,7 @@ public:
         layout->addWidget(dismiss, 0, Qt::AlignTop); connect(dismiss, &QPushButton::clicked, this, &QWidget::close);
         setAttribute(Qt::WA_DeleteOnClose);
         // Success and information leave by themselves; a warning or an error waits for the user.
-        if (kind == ToastHost::Ok || kind == ToastHost::Info) { m_timer = new QTimer(this); m_timer->setSingleShot(true); m_timer->setInterval(6000); connect(m_timer, &QTimer::timeout, this, &QWidget::close); m_timer->start(); }
+        if ((kind == ToastHost::Ok || kind == ToastHost::Info) && !lasting) { m_timer = new QTimer(this); m_timer->setSingleShot(true); m_timer->setInterval(6000); connect(m_timer, &QTimer::timeout, this, &QWidget::close); m_timer->start(); }
     }
 protected:
     void enterEvent(QEnterEvent*) override { if (m_timer) m_timer->stop(); }
@@ -463,8 +477,8 @@ private:
 };
 }
 ToastHost::ToastHost(QWidget* area) : QObject(area), m_area(area) { area->installEventFilter(this); }
-void ToastHost::show(Kind kind, const QString& title, const QString& text, QList<ToastAction> actions, const QString& iconName) {
-    auto* toast = new Toast(kind, title, text, std::move(actions), iconName, m_area);
+void ToastHost::show(Kind kind, const QString& title, const QString& text, QList<ToastAction> actions, const QString& iconName, bool lasting) {
+    auto* toast = new Toast(kind, title, text, std::move(actions), iconName, lasting, m_area);
     connect(toast, &QObject::destroyed, this, [this] { layout(); });
     m_toasts.append(toast);
     m_toasts.erase(std::remove_if(m_toasts.begin(), m_toasts.end(), [](const auto& entry) { return entry.isNull(); }), m_toasts.end());

@@ -6,6 +6,8 @@
 namespace clipsapp {
 // What an export writes in the comment of its file, and what tells the reader the sound was mixed.
 inline constexpr char mixedMark[] = "Mixé par Clipsapp";
+// What a clip compressed to save room says of itself: it is not offered the same compression twice.
+inline constexpr char compressedMark[] = "Compressé par Clipsapp";
 struct ClipAudioInfo { int stream = -1; QString name; QString codec; };
 struct ClipInfo {
     QString path, decoder;
@@ -18,6 +20,8 @@ struct ClipInfo {
     QString videoCodec;
     // Written by an export of the application: its sound already carries the levels that were chosen.
     bool mixed = false;
+    // Written by the compressor of the application, to save room.
+    bool compressed = false;
 };
 struct TrackEdit { int stream = -1; QString name; double volume = 1; bool muted = false; };
 struct ClipEdit {

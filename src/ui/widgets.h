@@ -159,13 +159,17 @@ public:
     explicit Keycaps(QWidget* parent = nullptr, bool large = false);
     void setSequence(const QKeySequence& sequence);
     QStringList keys() const { return m_keys; }
+    // What is written in place of the keys when there are none: nothing unless it is given.
+    void setEmptyText(const QString& text) { m_empty = text; updateGeometry(); update(); }
     QSize sizeHint() const override;
     static QStringList keyNames(const QKeySequence& sequence);
 protected:
     void paintEvent(QPaintEvent*) override;
 private:
-    QStringList m_keys; bool m_large;
+    QStringList m_keys; bool m_large; QString m_empty;
 };
+// A shortcut written as the keycaps show it, from the form the settings keep: « Ctrl + Alt + Num + ».
+QString shortcutText(const QString& portable, const QString& separator = QStringLiteral(" + "));
 
 class IconBox : public QWidget {
 public:
@@ -280,7 +284,8 @@ class ToastHost : public QObject {
 public:
     enum Kind { Ok, Info, Warn, Error };
     explicit ToastHost(QWidget* area);
-    void show(Kind kind, const QString& title, const QString& text = {}, QList<ToastAction> actions = {}, const QString& iconName = {});
+    // Success and information leave by themselves unless "lasting": a result the user may come back to later stays.
+    void show(Kind kind, const QString& title, const QString& text = {}, QList<ToastAction> actions = {}, const QString& iconName = {}, bool lasting = false);
     void setBottomInset(int inset) { m_inset = inset; layout(); }
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;

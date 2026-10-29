@@ -147,8 +147,8 @@ void ReplayStrip::fill() {
     const bool saveRole = replaying;
     if (saveRole) {
         m_primary->setIconName(QStringLiteral("save")); m_primary->setText(v.saving ? QStringLiteral("Sauvegarde…") : m_compact ? QStringLiteral("Sauvegarder") : QStringLiteral("Sauvegarder le clip"));
-        m_primary->setKbd(m_compact || both ? QString() : QString(v.hotkey).replace('+', ' ')); m_primary->setEnabled(v.canSave && !v.saving);
-        const auto saveKey = QKeySequence::fromString(v.hotkey, QKeySequence::PortableText).toString(QKeySequence::NativeText);
+        m_primary->setKbd(m_compact || both ? QString() : shortcutText(v.hotkey, QStringLiteral(" "))); m_primary->setEnabled(v.canSave && !v.saving);
+        const auto saveKey = shortcutText(v.hotkey);
         m_primary->setToolTip(v.state == ReplayView::Starting ? QStringLiteral("Le replay démarre") : v.saving ? QStringLiteral("Un clip est en cours d'écriture") : !v.canSave ? QStringLiteral("Le buffer attend sa première image") : both && !saveKey.isEmpty() ? QStringLiteral("Sauvegarder le clip (%1)").arg(saveKey) : QString());
     } else {
         m_primary->setKbd({}); m_primary->setIconName(v.state == ReplayView::Error ? QStringLiteral("refresh") : QStringLiteral("rec"));
@@ -166,8 +166,8 @@ void ReplayStrip::fill() {
     m_record->setIconName(v.recording ? QStringLiteral("stop") : QStringLiteral("rec")); m_record->setVariant(v.recording ? Button::Danger : Button::Secondary);
     m_record->setText(m_compact ? QString() : v.recording ? QStringLiteral("Arrêter l'enregistrement") : QStringLiteral("Enregistrer"));
     // Its key is written while the replay does not run; beside the replay, the room goes to the replay's own key.
-    m_record->setKbd(m_compact || replaying ? QString() : QString(v.recordHotkey).replace('+', ' '));
-    const auto recordKey = QKeySequence::fromString(v.recordHotkey, QKeySequence::PortableText).toString(QKeySequence::NativeText);
+    m_record->setKbd(m_compact || replaying ? QString() : shortcutText(v.recordHotkey, QStringLiteral(" ")));
+    const auto recordKey = shortcutText(v.recordHotkey);
     m_record->setToolTip((v.recording ? QStringLiteral("Arrêter l'enregistrement et garder le fichier") : QStringLiteral("Enregistrer tout, sans limite de durée, jusqu'à l'arrêt")) + (recordKey.isEmpty() ? QString() : QStringLiteral(" (%1)").arg(recordKey)));
     m_record->setEnabled(v.state != ReplayView::Idle || v.canStart);
     m_record->updateGeometry(); m_primary->updateGeometry(); m_secondary->updateGeometry();

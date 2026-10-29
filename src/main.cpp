@@ -118,8 +118,9 @@ int main(int argc, char** argv) {
         });
         // The application lasts as long as its window, even hidden behind its icon: not as long as the last window on screen.
         if (!smoke) { application.setQuitOnLastWindowClosed(false); window.quitWhenClosed(); }
-        // Started with the session, the window stays behind its icon; it shows when there is none.
-        if (!(atLogin && !smoke && window.startInTray())) window.show();
+        // Started with the session, the window stays behind its icon, unless the settings ask for it in front
+        // or there is no icon; then it comes to the front.
+        if (!(atLogin && !smoke && window.startInTray())) { window.show(); if (atLogin) window.surface(); }
         if (!smoke) {
             window.beginAutoReplay(atLogin); window.armShortcuts();
             if (const auto report = clipsapp::unseenCrashReport(logDirectory); !report.isEmpty()) window.announceCrash(report);

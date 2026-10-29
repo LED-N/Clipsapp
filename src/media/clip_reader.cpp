@@ -18,6 +18,8 @@ extern "C" {
 namespace clipsapp {
 namespace {
 void check(int code, const char* action) {
+    // Stopped on purpose, wherever FFmpeg noticed it: not a fault of the clip.
+    if (code == AVERROR_EXIT) throw ReadInterrupted(std::string(action) + " : interrompu");
     if (code < 0) { char text[AV_ERROR_MAX_STRING_SIZE]; av_strerror(code, text, sizeof(text)); throw std::runtime_error(std::string(action) + " : " + text); }
 }
 struct Decoder {
@@ -53,7 +55,7 @@ struct ClipReader::Impl {
     std::vector<std::deque<Samples>> audio;
     std::deque<VideoFrame> video;
     std::vector<QImage> spare;
-    QImage lastImage;
+    QImage lastImage; qint64 lastImageMs = -1;
     void recycle(QImage&& image) { if (!image.isNull() && output.fit && spare.size() < 4) spare.push_back(std::move(image)); }
     qint64 originUs = 0, readMs = -1, targetMs = 0, presentMs = -1;
     // While the clip plays, the time it is at keeps moving during a reading: it is followed on the clock.
@@ -62,13 +64,17 @@ struct ClipReader::Impl {
     qint64 pendingBytes = 0;
     bool eof = false, audioOnly = false;
     // Images kept on the card, a few only: each one holds a surface of the decoder.
-    bool presentable = false, direct = false; std::deque<std::pair<qint64, GpuFrame>> gpuVideo; GpuFrame lastGpu;
+    // The device a presentable reader decodes on, held while it decodes.
+    std::shared_ptr<GpuVideo> gpu; bool presentable = false, direct = false; std::deque<std::pair<qint64, GpuFrame>> gpuVideo; GpuFrame lastGpu;
     const std::atomic_bool* stop = nullptr;
     FrameOutput output;
     QSize outputSize(QSize region) const {
         if (!output.fit) return region.width() <= output.box.width() && region.height() <= output.box.height() ? region : region.scaled(output.box, Qt::KeepAspectRatio).expandedTo({2, 2});
         return region.scaled(output.box, Qt::KeepAspectRatio).expandedTo({2, 2});
     }
+    // An interrupted reading leaves its error in the file's input, where a later reading would find it
+    // again and take it for a broken clip.
+    void clearInterruption() { if (file && file->pb && file->pb->error == AVERROR_EXIT) { file->pb->error = 0; file->pb->eof_reached = 0; } }
     ~Impl() {
         decoders.clear(); sws_freeContext(scaler); sws_freeContext(fitScaler); av_frame_free(&view); av_frame_free(&target); av_frame_free(&frame); av_frame_free(&cpu); av_packet_free(&packet); avformat_close_input(&file);
     }
@@ -87,7 +93,7 @@ struct ClipReader::Impl {
         auto* stream = file->streams[info.videoStream]; info.size = {stream->codecpar->width, stream->codecpar->height};
         info.videoBitrate = stream->codecpar->bit_rate;
         info.videoCodec = QString::fromUtf8(avcodec_get_name(stream->codecpar->codec_id));
-        if (const auto* comment = av_dict_get(file->metadata, "comment", nullptr, 0)) info.mixed = strstr(comment->value, mixedMark) != nullptr;
+        if (const auto* comment = av_dict_get(file->metadata, "comment", nullptr, 0)) { info.mixed = strstr(comment->value, mixedMark) != nullptr; info.compressed = strstr(comment->value, compressedMark) != nullptr; }
         const auto rate = av_guess_frame_rate(file, stream, nullptr); if (rate.den && rate.num) info.fps = av_q2d(rate);
         if (info.durationMs <= 0 && stream->duration != AV_NOPTS_VALUE) info.durationMs = av_rescale_q(stream->duration, stream->time_base, {1, 1000});
         if (info.durationMs <= 0 || info.size.width() < 2 || info.size.height() < 2) throw std::runtime_error("Durée ou dimensions du clip invalides.");
@@ -97,7 +103,7 @@ struct ClipReader::Impl {
         // game that keeps the card busy makes that copy wait: a clip faster than 60 images per second
         // falls to a third of its pace. A processor with cores to spare decodes it steadily by itself.
         // None of this concerns images that stay on the card: nothing is copied back.
-        auto* shared = presentable ? GpuVideo::shared() : nullptr;
+        if (presentable) gpu = GpuVideo::acquire(); auto* shared = gpu.get();
         const unsigned cores = std::thread::hardware_concurrency(); const bool spare = !shared && info.fps > 61 && cores >= 12;
         for (unsigned index = 0; index < file->nb_streams; ++index) {
             auto* input = file->streams[index]; const bool isVideo = int(index) == info.videoStream;
@@ -271,10 +277,14 @@ bool ClipReader::setAudioTracks(const QList<TrackEdit>& tracks) {
 }
 void ClipReader::seek(qint64 ms) {
     auto& reader = *m_impl; const qint64 timestamp = ms * 1000 + reader.originUs;
+    // A seek is never cut short: the flag that interrupts a reading may already be raised for the next
+    // request, and a seek stopped halfway would leave the file nowhere. A reading that was interrupted
+    // leaves its mark on the file too; the seek starts from a clean one.
+    reader.stop = nullptr; reader.clearInterruption();
     check(avformat_seek_file(reader.file, -1, INT64_MIN, timestamp, timestamp, 0), "Déplacement dans le clip");
     for (auto& decoder : reader.decoders) if (decoder) { avcodec_flush_buffers(decoder->context); swr_free(&decoder->resampler); decoder->nextAudio = AV_NOPTS_VALUE; decoder->decodedMs = -1; decoder->flushed = false; decoder->clearPackets(); }
     reader.pendingBytes = 0;
-    for (auto& queue : reader.audio) queue.clear(); reader.video.clear(); reader.lastImage = {}; reader.gpuVideo.clear(); reader.lastGpu.reset();
+    for (auto& queue : reader.audio) queue.clear(); reader.video.clear(); reader.lastImage = {}; reader.lastImageMs = -1; reader.gpuVideo.clear(); reader.lastGpu.reset();
     reader.readMs = -1; reader.targetMs = ms; reader.eof = false; av_packet_unref(reader.packet);
 }
 bool ClipReader::setFrameOutput(const FrameOutput& output) {
@@ -298,45 +308,50 @@ void ClipReader::readUntil(qint64 endMs, const std::atomic_bool& stop, bool vide
         const qint64 end = videoEndMs >= 0 && &decoder == videoDecoder ? std::min(endMs, videoEndMs) : endMs;
         return !decoder.flushed && decoder.decodedMs < std::min(end, decoder.endMs);
     };
-    for (int budget = 0; budget < 16384 && !stop; ++budget) {
-        bool missing = false;
-        for (size_t index = 0; index < reader.decoders.size(); ++index) {
-            auto& decoder = reader.decoders[index]; if (!decoder || !decoder->enabled || (videoOnly && int(index) != reader.info.videoStream)) continue;
-            while (!stop && needs(*decoder) && !decoder->pending.empty()) {
-                auto* packet = decoder->pending.front(); decoder->pending.pop_front(); reader.pendingBytes -= packet->size;
-                const int sent = avcodec_send_packet(decoder->context, packet); av_packet_free(&packet); check(sent, "Paquet différé"); reader.receive(int(index));
+    try {
+        for (int budget = 0; budget < 16384 && !stop; ++budget) {
+            bool missing = false;
+            for (size_t index = 0; index < reader.decoders.size(); ++index) {
+                auto& decoder = reader.decoders[index]; if (!decoder || !decoder->enabled || (videoOnly && int(index) != reader.info.videoStream)) continue;
+                while (!stop && needs(*decoder) && !decoder->pending.empty()) {
+                    auto* packet = decoder->pending.front(); decoder->pending.pop_front(); reader.pendingBytes -= packet->size;
+                    const int sent = avcodec_send_packet(decoder->context, packet); av_packet_free(&packet); check(sent, "Paquet différé"); reader.receive(int(index));
+                }
+                if (reader.eof && needs(*decoder) && decoder->pending.empty() && !decoder->flushed) {
+                    check(avcodec_send_packet(decoder->context, nullptr), "Fin de lecture"); reader.receive(int(index)); decoder->flushed = true;
+                }
+                missing |= needs(*decoder);
             }
-            if (reader.eof && needs(*decoder) && decoder->pending.empty() && !decoder->flushed) {
-                check(avcodec_send_packet(decoder->context, nullptr), "Fin de lecture"); reader.receive(int(index)); decoder->flushed = true;
+            if (!missing || reader.eof || stop) break;
+            const int result = av_read_frame(reader.file, reader.packet);
+            // Interrupted, by the flag of this reading or by one raised since: nothing is wrong with the
+            // clip. The file forgets the interruption, and the next reading starts again from here.
+            if (result == AVERROR_EXIT) { reader.clearInterruption(); return; }
+            if (result == AVERROR_EOF) {
+                reader.eof = true;
+                continue;
             }
-            missing |= needs(*decoder);
-        }
-        if (!missing || reader.eof || stop) break;
-        const int result = av_read_frame(reader.file, reader.packet);
-        if (result == AVERROR_EXIT && stop) return;
-        if (result == AVERROR_EOF) {
-            reader.eof = true;
-            continue;
-        }
-        check(result, "Lecture du clip");
-        const int index = reader.packet->stream_index;
-        if (reader.packet->dts != AV_NOPTS_VALUE) reader.readMs = std::max(reader.readMs, av_rescale_q(reader.packet->dts, reader.file->streams[index]->time_base, {1, 1000}) - reader.originUs / 1000);
-        if (reader.decoders[size_t(index)] && reader.decoders[size_t(index)]->enabled) {
-            auto& decoder = *reader.decoders[size_t(index)];
-            if (needs(decoder) && (!videoOnly || index == reader.info.videoStream)) { check(avcodec_send_packet(decoder.context, reader.packet), "Paquet de lecture"); reader.receive(index); }
-            else {
-                auto* copy = av_packet_clone(reader.packet); if (!copy) throw std::bad_alloc();
-                decoder.pending.push_back(copy); reader.pendingBytes += copy->size;
-                if (reader.pendingBytes > 64 * 1024 * 1024) throw std::runtime_error("Les pistes de ce fichier sont trop décalées pour l'aperçu en mémoire.");
+            check(result, "Lecture du clip");
+            const int index = reader.packet->stream_index;
+            if (reader.packet->dts != AV_NOPTS_VALUE) reader.readMs = std::max(reader.readMs, av_rescale_q(reader.packet->dts, reader.file->streams[index]->time_base, {1, 1000}) - reader.originUs / 1000);
+            if (reader.decoders[size_t(index)] && reader.decoders[size_t(index)]->enabled) {
+                auto& decoder = *reader.decoders[size_t(index)];
+                if (needs(decoder) && (!videoOnly || index == reader.info.videoStream)) { check(avcodec_send_packet(decoder.context, reader.packet), "Paquet de lecture"); reader.receive(index); }
+                else {
+                    auto* copy = av_packet_clone(reader.packet); if (!copy) throw std::bad_alloc();
+                    decoder.pending.push_back(copy); reader.pendingBytes += copy->size;
+                    if (reader.pendingBytes > 64 * 1024 * 1024) throw std::runtime_error("Les pistes de ce fichier sont trop décalées pour l'aperçu en mémoire.");
+                }
             }
+            av_packet_unref(reader.packet);
         }
-        av_packet_unref(reader.packet);
-    }
+    } catch (const ReadInterrupted&) { reader.clearInterruption(); }
 }
+qint64 ClipReader::frameTime() const { return m_impl->lastImageMs; }
 QImage ClipReader::frameAt(qint64 positionMs) {
     auto& reader = *m_impl;
     while (!reader.video.empty() && (reader.video.front().ms <= positionMs || reader.lastImage.isNull())) {
-        reader.recycle(std::move(reader.lastImage)); reader.lastImage = std::move(reader.video.front().image); reader.video.pop_front();
+        reader.recycle(std::move(reader.lastImage)); reader.lastImageMs = reader.video.front().ms; reader.lastImage = std::move(reader.video.front().image); reader.video.pop_front();
     }
     return reader.lastImage;
 }
@@ -355,5 +370,15 @@ void ClipReader::mix(qint64 first, int count, const QList<TrackEdit>& tracks, fl
         }
     }
     for (int i = 0; i < count * 2; ++i) output[i] = std::isfinite(output[i]) ? std::clamp(output[i], -1.0f, 1.0f) : 0;
+}
+bool compressedByClipsapp(const QString& path) {
+    AVFormatContext* file = nullptr; if (avformat_open_input(&file, path.toUtf8().constData(), nullptr, nullptr) < 0) return false;
+    const auto* comment = av_dict_get(file->metadata, "comment", nullptr, 0); const bool compressed = comment && strstr(comment->value, compressedMark);
+    avformat_close_input(&file); return compressed;
+}
+QString videoCodecOf(const QString& path) {
+    AVFormatContext* file = nullptr; if (avformat_open_input(&file, path.toUtf8().constData(), nullptr, nullptr) < 0) return {};
+    QString codec; for (unsigned index = 0; index < file->nb_streams; ++index) if (const auto* parameters = file->streams[index]->codecpar; parameters->codec_type == AVMEDIA_TYPE_VIDEO && !(file->streams[index]->disposition & AV_DISPOSITION_ATTACHED_PIC)) { codec = QString::fromUtf8(avcodec_get_name(parameters->codec_id)); break; }
+    avformat_close_input(&file); return codec;
 }
 }

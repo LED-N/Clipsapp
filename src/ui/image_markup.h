@@ -2,6 +2,7 @@
 #include <QColor>
 #include <QList>
 #include <QPointF>
+#include <QPointer>
 #include <QWidget>
 class QPainter;
 namespace clipsapp {
@@ -29,11 +30,14 @@ public:
     void setColor(const QColor& color) { m_color = color; }
     // The thickness, in pixels of the picture.
     void setStrokeWidth(double width) { m_width = width; }
+    // What must stay above the drawing, such as the buttons on the picture: it keeps under them.
+    void keepUnder(QWidget* widget) { m_under = widget; place(); }
     void undo();
     void clear();
 signals:
     void changed();
 protected:
+    void place();
     void paintEvent(QPaintEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
@@ -41,7 +45,7 @@ protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
 private:
     QPointF toImage(QPointF point) const;
-    VideoCanvas* m_canvas; QList<Mark> m_marks; bool m_drawing = false, m_dragging = false;
+    VideoCanvas* m_canvas; QPointer<QWidget> m_under; QList<Mark> m_marks; bool m_drawing = false, m_dragging = false;
     Mark::Kind m_tool = Mark::Pen; QColor m_color = Qt::red; double m_width = 6;
 };
 }

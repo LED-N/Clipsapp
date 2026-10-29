@@ -22,7 +22,8 @@ class ScreenshotEditor final : public QWidget {
     Q_OBJECT
 public:
     explicit ScreenshotEditor(QWidget* parent = nullptr);
-    void openImage(const QString& path);
+    // By value: the path may be one this editor holds, and forgets on opening (the copy just saved).
+    void openImage(QString path);
     QString imagePath() const { return m_path; }
     QSize imageSize() const { return m_size; }
     QRect crop() const { return m_crop; }

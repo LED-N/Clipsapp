@@ -168,6 +168,19 @@ LibraryScan scanLibrary(const QString& directory, bool sharingOnly) {
     });
 }
 LibraryScan scanImages(const QString& directory) { return scanFiles(directory, [](const QFileInfo& info, const QStringList&) { return isImageFile(info.fileName()); }); }
+ClipTrashOperation permanentDeletion() {
+    return [](const QString& path, QString& error) {
+        // A preview still closing its reader may hold the file a moment longer.
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            QFile file(path);
+            if (file.remove()) return true;
+            error = file.errorString();
+            if (!QFileInfo::exists(path)) break;
+            if (attempt < 3) QThread::msleep(75);
+        }
+        return false;
+    };
+}
 ClipTrashResult trashClips(const QStringList& paths, ClipTrashOperation operation) {
     ClipTrashResult result; QSet<QString> seen;
     if (!operation) operation = [](const QString& path, QString& error) {
@@ -189,7 +202,7 @@ ClipTrashResult trashClips(const QStringList& paths, ClipTrashOperation operatio
         QString error;
         if (path.isEmpty() || !file.isFile() || file.isSymLink()) error = QStringLiteral("Le clip n'est plus disponible ou n'est pas un fichier vidéo local.");
         else if (operation(file.absoluteFilePath(), error)) { result.removed.append(file.absoluteFilePath()); continue; }
-        result.errors.append(file.fileName() + " : " + (error.isEmpty() ? QStringLiteral("Impossible de déplacer le clip dans la corbeille.") : error));
+        result.errors.append(file.fileName() + " : " + (error.isEmpty() ? QStringLiteral("Impossible de supprimer le fichier.") : error));
     }
     return result;
 }

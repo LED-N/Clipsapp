@@ -1,5 +1,39 @@
 # Journal des versions
 
+## 0.8.5
+
+**Nouveautés**
+
+- **Compresseur** : il remplace « Préparer pour Discord » et va plus loin. Allégez vos clips sans perte visible, en comparant avant et après d'un glissement sur l'image, ou compressez-les pour Discord, à la taille de votre limite. Plusieurs clips, ou toute la bibliothèque, se compressent en arrière-plan. Barre latérale → Compresseur
+- **Réglages de capture repensés** : régler sa capture est bien plus simple qu'avant : une résolution, une fréquence et un préréglage, Léger, Équilibré ou Haut. Réglages → Capture → Qualité
+
+**Améliorations**
+
+- **Son de l'enregistrement** : choisissez-le et réglez son volume, comme pour les clips et les screenshots.
+- **Démarrage avec Windows** : Clipsapp peut maintenant s'ouvrir au premier plan, et plus seulement réduit près de l'horloge.
+- **Premier lancement** : une étape Qualité, avec la taille de votre écran déjà proposée.
+- **Jeu capturé** : il est toujours reconnu de lui-même, sinon les clips prennent le nom du profil ; le champ « Nom du jeu » disparaît.
+- **Buffer du replay** : le disque est proposé dès que le replay prendrait trop de mémoire pour votre PC (un dixième de la mémoire, 2 Go au plus).
+- **Suppression définitive** : chaque suppression peut aussi se passer de la corbeille, pour les clips, les enregistrements et les screenshots.
+- **Export** : sa progression s'affiche au milieu de la fenêtre, puis propose d'ouvrir le nouveau clip ou de mettre l'original à la corbeille. Il ne s'active qu'une fois le clip réellement modifié.
+- **Plein écran** : un clic sur l'image met en pause ou relance la lecture ; seuls Échap et la croix le ferment.
+- **Clavier** : Espace sert à la lecture dans l'éditeur, et plus aucun bouton ne s'active au clavier par erreur.
+- **Écran capturé** : il reste le même après une veille ou un écran rebranché, et la capture reprend d'elle-même à son retour.
+- **Raccourcis** : les touches du pavé numérique et la ponctuation (« + », « é »…) peuvent servir de raccourci, et chaque raccourci peut être retiré.
+- **Thèmes** : toutes les fenêtres, notifications et lecteurs suivent le thème choisi.
+- **Éditeurs** : Exporter, Compresser et Mettre à la corbeille sont réunis en bas à droite, dans l'éditeur de clips comme dans celui des screenshots.
+- **Glisser un clip** : survolez une application dans la barre des tâches, Discord par exemple, pour l'amener au premier plan et y déposer le fichier.
+- **Partage** : un clip en HEVC ou en AV1, glissé ou copié vers Discord, propose une copie en H.264, lisible partout.
+
+**Corrections**
+
+- La barre de sélection des screenshots disait « clip sélectionné ».
+- L'éditeur pouvait afficher « Lecture impossible : Immediate exit requested » ; un bouton « Recharger le clip » permet aussi de reprendre sans le fermer.
+- Le replay ne démarrait pas sur les GTX 900 et 1000 (« Aucun encodeur matériel disponible ») : l'encodeur de Windows prend désormais le relais.
+- Après avoir regardé un clip, Clipsapp gardait 200 à 300 Mo de mémoire jusqu'à sa fermeture.
+- Un clip pouvait être marqué « Impossible de lire ce fichier » alors qu'il se lisait normalement.
+- Dans l'éditeur de screenshots, le mode Dessiner empêchait de changer de mode, et « Ouvrir la nouvelle image » affichait « Image illisible ».
+
 ## 0.8.4
 
 **Nouveautés**

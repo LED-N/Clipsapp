@@ -51,17 +51,6 @@ private:
     Layout layout(const QRect& item) const;
     bool m_showGame = true, m_images = false;
 };
-class ShareRowDelegate final : public ClipRowDelegate {
-public:
-    using ClipRowDelegate::ClipRowDelegate;
-    void paint(QPainter* painter, const QStyleOptionViewItem& option, const QModelIndex& index) const override;
-    QSize sizeHint(const QStyleOptionViewItem& option, const QModelIndex& index) const override;
-    Hit hitTest(const QRect& row, const QModelIndex& index, const QPoint& position) const override;
-    QRect nameRect(const QRect& row, const QModelIndex& index) const override;
-private:
-    struct Layout { QRectF row, check, thumb, text, size, date, copy, more; };
-    Layout layout(const QRect& item) const;
-};
 
 class ClipListView final : public QListView {
     Q_OBJECT

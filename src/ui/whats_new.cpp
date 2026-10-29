@@ -17,10 +17,10 @@ QString inlineMarkdown(const QString& text) {
     for (const auto& [from, to] : std::initializer_list<std::pair<const char*, const char*>>{{"« ", "«&nbsp;"}, {" »", "&nbsp;»"}, {" :", "&nbsp;:"}, {" ;", "&nbsp;;"}, {" ?", "&nbsp;?"}, {" !", "&nbsp;!"}})
         html.replace(QString::fromUtf8(from), QString::fromUtf8(to));
     static const QRegularExpression code(QStringLiteral("`([^`]+)`")), strong(QStringLiteral("\\*\\*(.+?)\\*\\*")), link(QStringLiteral("\\[([^\\]]+)\\]\\(([^)\\s]+)\\)"));
-    html.replace(code, QStringLiteral("<span style=\"font-family: Consolas, monospace; background-color: #1F242D; color: #E9EDF3;\">&nbsp;\\1&nbsp;</span>"));
-    html.replace(strong, QStringLiteral("<b style=\"color: #E9EDF3;\">\\1</b>"));
-    html.replace(link, QStringLiteral("<a style=\"color: #6FE3B4; text-decoration: none;\" href=\"\\2\">\\1</a>"));
-    return html;
+    html.replace(code, QStringLiteral("<span style=\"font-family: Consolas, monospace; background-color: {chip}; color: {text};\">&nbsp;\\1&nbsp;</span>"));
+    html.replace(strong, QStringLiteral("<b style=\"color: {text};\">\\1</b>"));
+    html.replace(link, QStringLiteral("<a style=\"color: {accent}; text-decoration: none;\" href=\"\\2\">\\1</a>"));
+    return themed(html);
 }
 QList<NoteSection> parseReleaseNotes(const QString& markdown) {
     QList<NoteSection> sections; NoteSection current; bool inItem = false;
@@ -46,7 +46,8 @@ QList<NoteSection> parseReleaseNotes(const QString& markdown) {
                 item.lead = match.captured(1).trimmed(); item.text = match.captured(2).trimmed(); item.afterLead = item.text;
                 if (!item.text.isEmpty()) item.text[0] = item.text[0].toUpper();
             } else item.text = text;
-            static const QRegularExpression place(QStringLiteral("\\s*(?:\\*\\*)?(Réglages\\s*→[^*.]*)(?:\\*\\*)?\\.?\\s*$"));
+            // In the settings, or a page of the side bar such as the compressor.
+            static const QRegularExpression place(QStringLiteral("\\s*(?:\\*\\*)?((?:Réglages|Barre latérale)\\s*→[^*.]*)(?:\\*\\*)?\\.?\\s*$"));
             if (const auto found = place.match(item.text); found.hasMatch() && found.capturedStart() > 0) { item.where = found.captured(1).trimmed(); item.text = item.text.left(found.capturedStart()).trimmed(); }
             if (const auto found = place.match(item.afterLead); found.hasMatch() && found.capturedStart() > 0) item.afterLead = item.afterLead.left(found.capturedStart()).trimmed();
             current.items << item; inItem = true; continue;
@@ -101,6 +102,9 @@ constexpr int dialogWidth = 620;
 // The icon of a new feature, from its name.
 QString featureIcon(const QString& lead) {
     const auto name = lead.toLower();
+    if (name.contains(QStringLiteral("compress"))) return QStringLiteral("compress");
+    if (name.startsWith(QStringLiteral("son "))) return QStringLiteral("speaker");
+    if (name.contains(QStringLiteral("qualité")) || name.contains(QStringLiteral("capture"))) return QStringLiteral("monitor");
     if (name.contains(QStringLiteral("enregistr"))) return QStringLiteral("rec");
     if (name.contains(QStringLiteral("thème"))) return QStringLiteral("star");
     if (name.contains(QStringLiteral("screenshot"))) return QStringLiteral("camera");

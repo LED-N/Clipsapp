@@ -51,7 +51,7 @@ QString ScreenshotEditor::copyPath(const QString& original, const QString& word)
 }
 ScreenshotEditor::ScreenshotEditor(QWidget* parent) : QWidget(parent), m_saving(new QFutureWatcher<QString>(this)) {
     setObjectName("screenshotEditor");
-    setStyleSheet(QStringLiteral("QWidget#screenshotInspector { background: #101318; }"));
+    setThemedStyleSheet(this, QStringLiteral("QWidget#screenshotInspector { background: {rail}; }"));
     auto* root = new QVBoxLayout(this); root->setContentsMargins(0, 0, 0, 0); root->setSpacing(0);
     // The header of the clip editor, with what a picture needs.
     auto* header = new QWidget; header->setFixedHeight(52); auto* top = new QHBoxLayout(header); top->setContentsMargins(16, 0, 16, 0); top->setSpacing(10);
@@ -62,9 +62,8 @@ ScreenshotEditor::ScreenshotEditor(QWidget* parent) : QWidget(parent), m_saving(
     m_rename = new Button(QStringLiteral("edit"), QString(), Button::Ghost, Button::Small); m_rename->setObjectName("screenshot-rename-button"); m_rename->setToolTip(QStringLiteral("Renommer le screenshot (F2)")); m_rename->setAccessibleName(QStringLiteral("Renommer le screenshot")); top->addWidget(m_rename);
     m_gameTag = new Tag; m_gameTag->setIconName(QStringLiteral("tag")); m_gameTag->hide(); top->addWidget(m_gameTag); top->addStretch(1);
     m_reveal = new Button(QStringLiteral("folder"), QString(), Button::Ghost); m_reveal->setObjectName("screenshot-reveal"); m_reveal->setToolTip(QStringLiteral("Afficher dans le dossier")); m_reveal->setAccessibleName(m_reveal->toolTip()); top->addWidget(m_reveal);
-    m_trash = new Button(QStringLiteral("trash"), QString(), Button::Ghost); m_trash->setObjectName("screenshot-trash"); m_trash->setToolTip(QStringLiteral("Mettre à la corbeille (Suppr)")); m_trash->setAccessibleName(QStringLiteral("Mettre à la corbeille")); top->addWidget(m_trash);
-    m_copy = new Button(QStringLiteral("copy"), QStringLiteral("Copier l'image")); m_copy->setObjectName("screenshot-copy"); m_copy->setToolTip(QStringLiteral("Pour la coller dans Discord ou ailleurs (Ctrl C)")); top->addWidget(m_copy);
-    m_save = new Button(QStringLiteral("save"), QStringLiteral("Enregistrer le recadrage"), Button::Primary); m_save->setObjectName("screenshot-save"); top->addWidget(m_save);
+    m_copy = new Button(QStringLiteral("copy"), QStringLiteral("Copier l'image")); m_copy->setObjectName("screenshot-copy"); m_copy->setToolTip(QStringLiteral("Pour la coller dans Discord ou ailleurs (Ctrl C)"));
+    m_save = new Button(QStringLiteral("save"), QStringLiteral("Enregistrer le recadrage"), Button::Primary); m_save->setObjectName("screenshot-save");
     root->addWidget(header); root->addWidget(separator());
 
     auto* workspace = new QHBoxLayout; workspace->setSpacing(0);
@@ -78,11 +77,11 @@ ScreenshotEditor::ScreenshotEditor(QWidget* parent) : QWidget(parent), m_saving(
     m_mode = new Segmented; m_mode->setObjectName("screenshot-mode"); m_mode->setDark(true); m_mode->addOption(QStringLiteral("Cadrer"), QStringLiteral("crop")); m_mode->addOption(QStringLiteral("Dessiner"), QStringLiteral("edit")); m_mode->addOption(QStringLiteral("Résultat"), QStringLiteral("eye"));
     // What is drawn lies over the picture, below the buttons that sit on it.
     m_markup = new MarkupLayer(m_canvas);
-    auto* overlay = new QWidget; auto* overlayLayout = new QHBoxLayout(overlay); overlayLayout->setContentsMargins(0, 0, 0, 0); overlayLayout->addWidget(m_mode); m_canvas->setOverlay(overlay);
+    auto* overlay = new QWidget; auto* overlayLayout = new QHBoxLayout(overlay); overlayLayout->setContentsMargins(0, 0, 0, 0); overlayLayout->addWidget(m_mode); m_canvas->setOverlay(overlay); m_markup->keepUnder(overlay);
     m_mode->setCurrentIndex(2); m_canvas->setCropTool(false); m_canvas->setResultPreview(true);
     workspace->addLayout(center, 1); workspace->addWidget(separator(true));
 
-    auto* scroll = new QScrollArea; scroll->setWidgetResizable(true); scroll->setFrameShape(QFrame::NoFrame); scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff); scroll->setFixedWidth(288); scroll->setStyleSheet(QStringLiteral("QScrollArea { background: #101318; }"));
+    auto* scroll = new QScrollArea; scroll->setWidgetResizable(true); scroll->setFrameShape(QFrame::NoFrame); scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff); scroll->setFixedWidth(288); setThemedStyleSheet(scroll, QStringLiteral("QScrollArea { background: {rail}; }"));
     auto* inspector = new QWidget; inspector->setObjectName("screenshotInspector"); auto* layout = new QVBoxLayout(inspector); layout->setContentsMargins(18, 16, 18, 16); layout->setSpacing(18);
     auto* crop = section(layout, QStringLiteral("Cadrage"), QStringLiteral("crop"));
     auto* ratioRow = new QHBoxLayout; ratioRow->setSpacing(6);
@@ -126,7 +125,13 @@ ScreenshotEditor::ScreenshotEditor(QWidget* parent) : QWidget(parent), m_saving(
         facts->addWidget(label(names[index], "small"), index, 0);
         auto* value = new ElideLabel({}, "small", Qt::ElideMiddle); value->setObjectName(QStringLiteral("screenshot-fact-%1").arg(index)); facts->addWidget(value, index, 1); m_facts.append(value);
     }
-    origin->addLayout(facts); layout->addStretch(); scroll->setWidget(inspector); workspace->addWidget(scroll); root->addLayout(workspace, 1);
+    origin->addLayout(facts); layout->addStretch();
+    // At the bottom of the side, as in the clip editor: what is kept, then what goes.
+    m_trash = new Button(QStringLiteral("trash"), QStringLiteral("Mettre à la corbeille"), Button::Danger); m_trash->setObjectName("screenshot-trash"); m_trash->setToolTip(QStringLiteral("Raccourci : Suppr")); m_trash->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed); 
+    auto* actions = new QVBoxLayout; actions->setSpacing(8);
+    for (auto* action : {m_save, m_copy, m_trash}) { action->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed); actions->addWidget(action); }
+    layout->addLayout(actions);
+    scroll->setWidget(inspector); workspace->addWidget(scroll); root->addLayout(workspace, 1);
 
     connect(m_back, &QPushButton::clicked, this, &ScreenshotEditor::backRequested);
     connect(m_mode, &Segmented::currentChanged, this, [this](int index) { m_canvas->setCropTool(index == 0); m_canvas->setResultPreview(index == 2); m_markup->setDrawing(index == 1); m_markup->update(); });
@@ -157,15 +162,17 @@ ScreenshotEditor::ScreenshotEditor(QWidget* parent) : QWidget(parent), m_saving(
         m_drafts.remove(m_path); m_markup->setMarks({});
         emit saved(result, m_path);
     });
-    const auto shortcut = [this](const QKeySequence& keys, auto&& action) { auto* result = new QShortcut(keys, this); result->setContext(Qt::WidgetWithChildrenShortcut); connect(result, &QShortcut::activated, this, action); };
-    shortcut(Qt::Key_F2, [this] { m_rename->click(); });
+    // The keys of the editor work wherever the focus is in its window while it is shown: a button clicked
+    // never takes them away, and a field being typed in keeps the keys it writes.
+    const auto shortcut = [this](const QKeySequence& keys, auto&& action) { auto* result = new QShortcut(keys, this); result->setContext(Qt::WindowShortcut); connect(result, &QShortcut::activated, this, action); };
+    shortcut(Qt::Key_F2, [this] { if (m_rename->isVisible()) m_rename->click(); });
     shortcut(QKeySequence::Undo, [this] { m_markup->undo(); });
     shortcut(QKeySequence::Delete, [this] { m_trash->click(); });
     shortcut(QKeySequence::Copy, [this] { m_copy->click(); });
-    shortcut(Qt::Key_Escape, [this] { if (!m_titleEdit->isVisible()) m_back->click(); });
+    shortcut(Qt::Key_Escape, [this] { if (m_titleEdit->isVisible()) finishRename(false); else m_back->click(); });
     updateActions();
 }
-void ScreenshotEditor::openImage(const QString& path) {
+void ScreenshotEditor::openImage(QString path) {
     if (!m_path.isEmpty()) { if (m_markup->marks().isEmpty()) m_drafts.remove(m_path); else m_drafts.insert(m_path, m_markup->marks()); }
     m_path = path; m_savedPath.clear(); m_banner->hide(); finishRename(false); m_markup->setMarks(m_drafts.value(path));
     QImageReader reader(path); reader.setAutoTransform(true); m_size = reader.size();

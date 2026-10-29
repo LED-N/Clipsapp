@@ -34,21 +34,36 @@ QVBoxLayout* section(QVBoxLayout* parent, const QString& title, const QString& i
     layout->addLayout(head); parent->addLayout(layout); return layout;
 }
 QString joined(const QStringList& names) { return names.size() > 1 ? names.mid(0, names.size() - 1).join(QStringLiteral(", ")) + QStringLiteral(" et ") + names.last() : names.join(QString()); }
+QString remainingText(qint64 seconds) { seconds = std::max<qint64>(1, seconds); return seconds >= 60 ? QStringLiteral("%1 min %2 s").arg(seconds / 60).arg(seconds % 60, 2, 10, QLatin1Char('0')) : QStringLiteral("%1 s").arg(seconds); }
+// Échap does not close it while the export runs: only « Annuler l'export » stops it.
+class ExportDialog final : public ModalDialog {
+public:
+    explicit ExportDialog(QWidget* parent) : ModalDialog(parent, 500) {}
+    void unlock() { m_locked = false; }
+    void reject() override { if (!m_locked) ModalDialog::reject(); }
+private:
+    bool m_locked = true;
+};
 }
 ClipEditor::ClipEditor(QWidget* parent) : QWidget(parent), m_player(this), m_exporter(this) {
     m_analysisPool.setMaxThreadCount(1);
     setObjectName("clipEditor");
-    setStyleSheet(QStringLiteral(R"(
-        QFrame#timelineFrame { background: #0F1217; border: 1px solid #242A34; border-radius: 8px; }
-        QFrame#zoomBar { background: #111419; border: none; border-top: 1px solid #242A34; border-bottom-left-radius: 7px; border-bottom-right-radius: 7px; }
-        QWidget#inspector { background: #101318; }
-        QFrame#exportBox { background: #14181E; border: 1px solid #2A313C; border-radius: 8px; }
+    setThemedStyleSheet(this, QStringLiteral(R"(
+        QFrame#timelineFrame { background: {field}; border: 1px solid {line}; border-radius: 8px; }
+        QFrame#zoomBar { background: {header}; border: none; border-top: 1px solid {line}; border-bottom-left-radius: 7px; border-bottom-right-radius: 7px; }
+        QWidget#inspector { background: {rail}; }
     )"));
     auto* root = new QVBoxLayout(this); root->setContentsMargins(0, 0, 0, 0); root->setSpacing(0);
     root->addWidget(buildHeader()); root->addWidget(separator());
     auto* workspace = new QHBoxLayout; workspace->setSpacing(0);
     auto* center = new QVBoxLayout; m_center = center; center->setContentsMargins(16, 16, 16, 16); center->setSpacing(12);
     m_problem = new Banner(Banner::Warn, QStringLiteral("warn")); m_problem->setObjectName("editor-problem"); m_problem->hide(); center->addWidget(m_problem);
+    // A reading that failed is tried again where it stopped, without leaving the editor.
+    m_reload = new Button(QStringLiteral("refresh"), QStringLiteral("Recharger le clip"), Button::Secondary, Button::Small); m_reload->setObjectName("editor-reload"); m_reload->hide(); m_problem->actions()->addWidget(m_reload);
+    connect(m_reload, &QPushButton::clicked, this, [this] {
+        if (m_path.isEmpty() || m_exporter.running()) return;
+        const auto position = m_player.snapshot().positionMs; const auto path = m_path; m_reloadAt = position; openClip(path);
+    });
     m_banner = new Banner(Banner::Ok, QStringLiteral("ok")); m_banner->setObjectName("export-banner"); m_banner->hide(); center->addWidget(m_banner);
     auto* openExported = new Button(QStringLiteral("Ouvrir le nouveau clip"), Button::Secondary, Button::Small); openExported->setObjectName("open-exported");
     auto* trashOriginal = new Button(QStringLiteral("Mettre l'original à la corbeille…"), Button::Ghost, Button::Small); trashOriginal->setObjectName("trash-original");
@@ -113,19 +128,21 @@ ClipEditor::ClipEditor(QWidget* parent) : QWidget(parent), m_player(this), m_exp
     connect(m_play, &QPushButton::clicked, this, [this] { m_player.setPlaying(!m_player.snapshot().playing); });
     connect(toStart, &QPushButton::clicked, this, [this] { m_player.seek(m_edit.startMs); });
     connect(previous, &QPushButton::clicked, this, [this] { stepFrames(-1); }); connect(next, &QPushButton::clicked, this, [this] { stepFrames(1); });
-    const auto shortcut = [this](const QKeySequence& keys, auto&& action) { auto* result = new QShortcut(keys, this); result->setContext(Qt::WidgetWithChildrenShortcut); connect(result, &QShortcut::activated, this, action); };
+    // The keys of the editor work wherever the focus is in its window while it is shown: a button clicked
+    // never takes them away, and a field being typed in keeps the keys it writes.
+    const auto shortcut = [this](const QKeySequence& keys, auto&& action) { auto* result = new QShortcut(keys, this); result->setContext(Qt::WindowShortcut); connect(result, &QShortcut::activated, this, action); };
     shortcut(Qt::Key_Space, [this] { if (m_play->isEnabled() && m_transport->isEnabled()) m_play->click(); });
     shortcut(Qt::Key_I, [this] { if (m_transport->isEnabled()) m_startHere->click(); }); shortcut(Qt::Key_O, [this] { if (m_transport->isEnabled()) m_endHere->click(); });
     // The two step keys are the ones around the left hand's forward key: A and E in AZERTY, Q and E in QWERTY.
     auto* stepBack = new QShortcut(this); auto* stepForward = new QShortcut(this);
-    for (auto* step : {stepBack, stepForward}) { step->setContext(Qt::WidgetWithChildrenShortcut); connect(step, &QShortcut::activated, this, [this, step, stepBack] { stepFrames(step == stepBack ? -1 : 1); }); }
+    for (auto* step : {stepBack, stepForward}) { step->setContext(Qt::WindowShortcut); connect(step, &QShortcut::activated, this, [this, step, stepBack] { stepFrames(step == stepBack ? -1 : 1); }); }
     const auto nameStepKeys = [stepBack, stepForward, previous, next] {
         const auto keys = stepKeys(); stepBack->setKey(keys.back); stepForward->setKey(keys.forward);
         previous->setToolTip(QStringLiteral("Image précédente (%1)").arg(keys.backLabel)); next->setToolTip(QStringLiteral("Image suivante (%1)").arg(keys.forwardLabel));
     };
     nameStepKeys(); connect(QGuiApplication::inputMethod(), &QInputMethod::localeChanged, this, nameStepKeys);
     shortcut(Qt::Key_Home, [this] { if (m_transport->isEnabled()) m_player.seek(m_edit.startMs); });
-    shortcut(Qt::Key_F2, [this] { if (m_rename->isEnabled()) m_rename->click(); });
+    shortcut(Qt::Key_F2, [this] { if (m_rename->isEnabled() && m_rename->isVisible()) m_rename->click(); });
     shortcut(Qt::Key_F, [this] { if (m_fullScreen->isEnabled()) m_fullScreen->click(); });
     connect(m_fullScreen, &QPushButton::clicked, this, [this] { if (m_initialized && !m_exporter.running()) emit fullScreenRequested(); });
     connect(m_timeline, &ClipTimeline::seekRequested, &m_player, &ClipPlayer::seek);
@@ -143,10 +160,10 @@ ClipEditor::ClipEditor(QWidget* parent) : QWidget(parent), m_player(this), m_exp
     for (auto* field : {m_start, m_end}) connect(field, &QDoubleSpinBox::valueChanged, this, &ClipEditor::applyEdits);
     connect(m_startHere, &QPushButton::clicked, this, [this] { m_start->setValue(m_player.snapshot().positionMs / 1000.0); }); connect(m_endHere, &QPushButton::clicked, this, [this] { m_end->setValue(m_player.snapshot().positionMs / 1000.0); });
     connect(m_audioMode, &Segmented::currentChanged, this, [this] { applyEdits(); }); connect(m_export, &QPushButton::clicked, this, &ClipEditor::exportClip);
-    connect(m_cancelExport, &QPushButton::clicked, this, [this] { m_exporter.cancel(); });
     connect(&m_exporter, &ClipExporter::progress, this, [this](int value) {
-        m_progress->setValue(value / 100.0); m_exportLabel->setText(QStringLiteral("Export MP4 · %1 %").arg(value));
-        m_exportEta->setText(value >= 5 && value < 100 ? QStringLiteral("encore ≈ %1 s").arg(std::max<qint64>(1, m_exportClock.elapsed() * (100 - value) / value / 1000)) : QString());
+        if (!m_exportDialog) return;
+        m_exportBar->setValue(value / 100.0); m_exportPercent->setText(QStringLiteral("%1 %").arg(value));
+        m_exportEta->setText(value >= 5 && value < 100 ? QStringLiteral("encore ≈ %1").arg(remainingText(m_exportClock.elapsed() * (100 - value) / value / 1000)) : QString());
     });
     connect(&m_exporter, &ClipExporter::completed, this, [this](const QString& path) {
         m_baseline = m_exportEdit;
@@ -156,11 +173,11 @@ ClipEditor::ClipEditor(QWidget* parent) : QWidget(parent), m_player(this), m_exp
         const QFileInfo file(path); const bool beside = file.absolutePath() == QFileInfo(m_exportSource).absolutePath();
         m_banner->setTexts(QStringLiteral("Exporté : %1 · %2").arg(file.fileName(), formatBytes(file.size())),
             !beside ? QDir::toNativeSeparators(file.absolutePath()) : m_game.isEmpty() ? QStringLiteral("Rangé à côté de l'original.") : QStringLiteral("Rangé dans %1, à côté de l'original.").arg(m_game));
-        m_banner->show(); updateActions();
+        m_banner->show(); updateActions(); showExportResult(path);
         const auto original = m_exportSource; emit exported(path, original);
     });
-    connect(&m_exporter, &ClipExporter::failed, this, [this](const QString& error) { updateActions(); emit failed(QStringLiteral("L'export a échoué"), error); });
-    connect(&m_exporter, &ClipExporter::cancelled, this, [this] { updateActions(); });
+    connect(&m_exporter, &ClipExporter::failed, this, [this](const QString& error) { closeExportDialog(); updateActions(); emit failed(QStringLiteral("L'export a échoué"), error); });
+    connect(&m_exporter, &ClipExporter::cancelled, this, [this] { closeExportDialog(); updateActions(); });
     connect(openExported, &QPushButton::clicked, this, [this] { if (!m_exportedPath.isEmpty()) emit openRequested(m_exportedPath); });
     connect(trashOriginal, &QPushButton::clicked, this, [this] { if (!m_exporter.running() && !m_exportSource.isEmpty()) emit deleteRequested(m_exportSource, false); });
     connect(closeBanner, &QPushButton::clicked, m_banner, &QWidget::hide);
@@ -177,12 +194,10 @@ QWidget* ClipEditor::buildHeader() {
     m_gameTag = new Tag; m_gameTag->setIconName(QStringLiteral("tag")); m_gameTag->hide(); layout->addWidget(m_gameTag);
     m_stateTag = new Tag(QStringLiteral("Modifié"), Tag::Warn); m_stateTag->setObjectName("editor-state"); m_stateTag->hide(); layout->addWidget(m_stateTag);
     m_hint = new ElideLabel({}, "small"); m_hint->setObjectName("editor-hint"); layout->addWidget(m_hint, 1);
-    auto* box = new QFrame; box->setObjectName("exportBox"); box->setFixedHeight(36); m_exportBox = box; auto* boxLayout = new QHBoxLayout(box); boxLayout->setContentsMargins(12, 0, 4, 0); boxLayout->setSpacing(12);
-    auto* figures = new QVBoxLayout; figures->setSpacing(4); figures->setContentsMargins(0, 5, 0, 6); auto* line = new QHBoxLayout; m_exportLabel = label(QStringLiteral("Export MP4"), "strong"); m_exportLabel->setFont(uiFont(12, QFont::DemiBold)); m_exportEta = label({}, "small");
-    line->addWidget(m_exportLabel); line->addStretch(); line->addWidget(m_exportEta); figures->addLayout(line); m_progress = new Bar; m_progress->setFixedWidth(220); figures->addWidget(m_progress); boxLayout->addLayout(figures);
-    m_cancelExport = new Button(QStringLiteral("Annuler l'export"), Button::Secondary, Button::Small); m_cancelExport->setObjectName("cancel-export"); boxLayout->addWidget(m_cancelExport); box->hide(); layout->addWidget(box);
-    m_discord = new Button(QStringLiteral("share"), QStringLiteral("Préparer pour Discord")); m_discord->setObjectName("compress-discord-editor"); m_discord->setEnabled(false); layout->addWidget(m_discord);
-    m_export = new Button(QStringLiteral("save"), QStringLiteral("Exporter le clip"), Button::Primary); m_export->setObjectName("export-clip"); m_export->setEnabled(false); layout->addWidget(m_export);
+    m_discord = new Button(QStringLiteral("compress"), QStringLiteral("Compresser")); m_discord->setObjectName("compress-editor"); m_discord->setToolTip(QStringLiteral("Gagner de la place, ou compresser pour Discord")); m_discord->setEnabled(false);
+    m_export = new Button(QStringLiteral("save"), QStringLiteral("Exporter le clip"), Button::Primary); m_export->setObjectName("export-clip"); m_export->setEnabled(false);
+    // Both live at the bottom of the side, above the trash, as in the screenshot editor.
+    for (auto* action : {m_export, m_discord}) action->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     connect(m_rename, &QPushButton::clicked, this, [this] {
         if (!m_initialized || m_exporter.running() || m_sharingBusy) return;
         m_titleEdit->setText(QFileInfo(m_path).completeBaseName()); m_title->hide(); m_rename->hide(); m_titleEdit->show(); m_titleEdit->selectAll(); m_titleEdit->setFocus();
@@ -191,7 +206,7 @@ QWidget* ClipEditor::buildHeader() {
     return m_header;
 }
 QWidget* ClipEditor::buildInspector() {
-    auto* scroll = new QScrollArea; scroll->setWidgetResizable(true); scroll->setFrameShape(QFrame::NoFrame); scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff); scroll->setFixedWidth(288); scroll->setStyleSheet(QStringLiteral("QScrollArea { background: #101318; }")); m_inspector = scroll;
+    auto* scroll = new QScrollArea; scroll->setWidgetResizable(true); scroll->setFrameShape(QFrame::NoFrame); scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff); scroll->setFixedWidth(288); setThemedStyleSheet(scroll, QStringLiteral("QScrollArea { background: {rail}; }")); m_inspector = scroll;
     m_controls = new QWidget; m_controls->setObjectName("inspector"); m_controls->setEnabled(false); auto* layout = new QVBoxLayout(m_controls); layout->setContentsMargins(18, 16, 18, 16); layout->setSpacing(18);
 
     auto* trim = section(layout, QStringLiteral("Découpe"), QStringLiteral("cut")); m_sections.append(trim);
@@ -241,7 +256,8 @@ QWidget* ClipEditor::buildInspector() {
         value->setFont(index == 1 ? monoFont(12) : uiFont(12)); facts->addWidget(value, index, 1); m_details.append(value);
     }
     origin->addWidget(m_facts); layout->addStretch();
-    m_delete = new Button(QStringLiteral("trash"), QStringLiteral("Mettre à la corbeille"), Button::Danger); m_delete->setObjectName("delete-editor-clip"); m_delete->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed); m_delete->setEnabled(false); layout->addWidget(m_delete);
+    m_delete = new Button(QStringLiteral("trash"), QStringLiteral("Mettre à la corbeille"), Button::Danger); m_delete->setObjectName("delete-editor-clip"); m_delete->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed); m_delete->setEnabled(false);
+    auto* actions = new QVBoxLayout; actions->setSpacing(8); actions->addWidget(m_export); actions->addWidget(m_discord); actions->addWidget(m_delete); layout->addLayout(actions);
     scroll->setWidget(m_controls); return scroll;
 }
 void ClipEditor::resizeEvent(QResizeEvent* event) {
@@ -290,7 +306,7 @@ void ClipEditor::beginAnalysis() {
         if (!stop->load() && m_initialized && m_analysis == worker) {
             const auto analysis = worker->result(); m_timeline->setAnalysis(analysis);
             if (analysis.error.isEmpty()) { if (m_analysisCache.size() >= 4) m_analysisCache.erase(m_analysisCache.begin()); m_analysisCache.insert(m_analysisKey, analysis); }
-            else { m_problem->setTexts(QStringLiteral("Aperçu de timeline incomplet"), analysis.error); m_problem->show(); }
+            else { m_problem->setTexts(QStringLiteral("Aperçu de timeline incomplet"), analysis.error); m_reload->hide(); m_problem->show(); }
         }
         if (m_analysis == worker) m_analysis = nullptr;
         worker->deleteLater();
@@ -310,6 +326,8 @@ void ClipEditor::openClip(const QString& path) {
 // Until the view knows the clip, a size that suits most of them.
 QSize ClipEditor::previewBox() const { const auto wanted = m_canvas->wantedSize(); return wanted.isEmpty() ? QSize(1280, 720) : wanted; }
 void ClipEditor::suspend() { stopAnalysis(); m_player.close(); }
+// Left for another page: what shows the clip goes as well, and is made again with the next one.
+void ClipEditor::release() { suspend(); m_player.setFrameSink({}); m_canvas->releaseSurface(); }
 QList<QFuture<ClipAnalysis>> ClipEditor::pendingAnalyses() const {
     QList<QFuture<ClipAnalysis>> pending;
     for (const auto& task : m_analysisTasks) if (!task.isFinished()) pending.append(task);
@@ -350,6 +368,7 @@ void ClipEditor::updatePlayer() {
         m_details[3]->setText(formatBytes(file.size())); m_fileName->setFullText(file.fileName()); m_fileName->setToolTip(QDir::toNativeSeparators(m_path));
         m_ratio = m_edit.crop == QRect(QPoint(), m_info.size) ? 0 : 4; m_canvas->setAspect(0);
         m_updating = false; m_initialized = true; updateCrop(m_edit.crop); applyEdits(); beginAnalysis();
+        if (m_reloadAt > 0) m_player.seek(std::exchange(m_reloadAt, 0));
     }
     // The card stopped showing the clip: it is opened again, drawn from memory this time.
     if (state.direct && m_canvas->surface() && m_canvas->surface()->lost()) { VideoSurface::giveUp(); m_canvas->setDirect(false); m_initialized = false; const auto path = m_path; QMetaObject::invokeMethod(this, [this, path] { if (path == m_path) openClip(path); }, Qt::QueuedConnection); return; }
@@ -363,8 +382,8 @@ void ClipEditor::updatePlayer() {
     m_play->setText(state.playing ? QStringLiteral("Pause") : QStringLiteral("Lire")); m_play->setIconName(state.playing ? QStringLiteral("pause") : QStringLiteral("play"));
     m_timeline->setPosition(state.positionMs); m_time->setText(timeText(state.positionMs)); m_total->setText(QStringLiteral("/ ") + timeText(state.info.durationMs));
     if (state.playing && (state.positionMs < m_timeline->viewStart() || state.positionMs > m_timeline->viewStart() + m_timeline->visibleDuration())) m_timeline->setViewStart(state.positionMs - m_timeline->visibleDuration() / 8);
-    if (!state.error.isEmpty()) { m_problem->setTexts(QStringLiteral("Lecture impossible"), state.error); m_problem->show(); }
-    else if (!state.warning.isEmpty()) { m_problem->setTexts(state.warning, {}); m_problem->show(); }
+    if (!state.error.isEmpty()) { m_problem->setTexts(QStringLiteral("Lecture impossible"), state.error); m_reload->show(); m_problem->show(); }
+    else if (!state.warning.isEmpty()) { m_problem->setTexts(state.warning, {}); m_reload->hide(); m_problem->show(); }
 }
 void ClipEditor::chooseRatio(int index) {
     if (!m_initialized) { for (int tile = 0; tile < m_ratios.size(); ++tile) m_ratios[tile]->setChecked(tile == m_ratio); return; }
@@ -399,7 +418,7 @@ void ClipEditor::applyEdits() {
     m_edit.separateTracks = audioExportTrackCount(m_edit) > 1 && m_audioMode->currentIndex() == 1;
     m_updating = true; m_start->setMaximum(m_end->value() - 0.05); m_end->setMinimum(m_start->value() + 0.05); m_updating = false;
     m_selection->setText(timeText(m_edit.endMs - m_edit.startMs)); m_timeline->setEdit(m_edit);
-    m_kept->setText(QStringLiteral("Gardé : <span style=\"font-family:'Cascadia Mono','Consolas','Noto Sans Mono',monospace; color:#E9EDF3\">%1</span> sur %2").arg(timeText(m_edit.endMs - m_edit.startMs), timeText(m_info.durationMs)));
+    setThemedText(m_kept, QStringLiteral("Gardé : <span style=\"font-family:'Cascadia Mono','Consolas','Noto Sans Mono',monospace; color:{text}\">%1</span> sur %2").arg(timeText(m_edit.endMs - m_edit.startMs), timeText(m_info.durationMs)));
     if (m_drafts.size() >= 128 && !m_drafts.contains(m_path)) m_drafts.erase(m_drafts.begin());
     m_drafts.insert(m_path, m_edit); m_player.setEdit(m_edit); updateActions();
 }
@@ -423,22 +442,23 @@ void ClipEditor::updateActions() {
     m_controls->setEnabled(editable); m_timeline->setEnabled(editable); m_zoomControls->setEnabled(editable); m_canvas->setEnabled(editable); m_mode->setEnabled(editable); m_fullScreen->setEnabled(editable); m_transport->setEnabled(editable);
     m_back->setEnabled(!running); m_rename->setEnabled(editable && !m_sharingBusy); m_delete->setEnabled(editable && !m_sharingBusy);
     m_canvas->setNotice(running ? QStringLiteral("Édition verrouillée pendant l'export") : QString());
-    m_discord->setEnabled(editable && !m_sharingBusy); m_discord->setText(m_sharingBusy ? QStringLiteral("Partage en cours…") : QStringLiteral("Préparer pour Discord"));
+    m_discord->setEnabled(editable && !m_sharingBusy); m_discord->setText(m_sharingBusy ? QStringLiteral("Compression en cours…") : QStringLiteral("Compresser"));
     updateSummary();
     const bool changed = hasExportChanges(), valid = loaded && validateEdit(m_info, m_edit).isEmpty();
-    m_export->setEnabled(editable && !m_sharingBusy && changed && valid); m_export->setVisible(!running); m_discord->setVisible(!running); m_exportBox->setVisible(running);
-    // A disabled export always says why, next to the button rather than in a tooltip.
-    const QString reason = !loaded ? (m_path.isEmpty() ? QStringLiteral("Ouvrez un clip depuis la bibliothèque.") : QStringLiteral("Chargement du clip…")) : m_sharingBusy ? QStringLiteral("Attendez la fin du partage Discord pour exporter.")
-        : !changed ? QStringLiteral("Rien à exporter : coupez, recadrez ou réglez une piste.") : !valid ? validateEdit(m_info, m_edit) : QString();
-    // A clip that only carries the usual levels can be exported, but nobody modified it yet.
+    // Only what the user changed is exported: the usual levels alone, applied on opening, are not a change.
     const bool touched = changed && !sameClipEdits(m_edit, m_usualEdit);
+    m_export->setEnabled(editable && !m_sharingBusy && touched && valid);
+    // A disabled export always says why, next to the button rather than in a tooltip.
+    const QString reason = !loaded ? (m_path.isEmpty() ? QStringLiteral("Ouvrez un clip depuis la bibliothèque.") : QStringLiteral("Chargement du clip…")) : m_sharingBusy ? QStringLiteral("Attendez la fin de la compression pour exporter.")
+        : !changed ? QStringLiteral("Rien à exporter : coupez, recadrez ou réglez une piste.") : !touched ? QStringLiteral("Vos volumes habituels sont appliqués. Coupez, recadrez ou réglez une piste pour exporter.") : !valid ? validateEdit(m_info, m_edit) : QString();
     m_stateTag->setVisible(running || (loaded && touched));
     if (running) m_stateTag->set(QStringLiteral("Export en cours"), Tag::Info); else m_stateTag->set(QStringLiteral("Modifié"), Tag::Warn);
     auto* hint = static_cast<ElideLabel*>(m_hint);
     hint->setAlignment((reason.isEmpty() || running ? Qt::AlignLeft : Qt::AlignRight) | Qt::AlignVCenter);
-    hint->setFullText(running ? QString() : !reason.isEmpty() ? reason : touched ? QStringLiteral("Exportez pour garder vos changements après la fermeture.") : QStringLiteral("Vos volumes habituels sont appliqués. Exportez pour les garder dans un fichier."));
+    hint->setFullText(running ? QString() : !reason.isEmpty() ? reason : QStringLiteral("Exportez pour garder vos changements après la fermeture."));
     m_export->setToolTip(reason);
 }
+bool ClipEditor::touched() const { return hasExportChanges() && !sameClipEdits(m_edit, m_usualEdit); }
 bool ClipEditor::hasExportChanges() const {
     return m_initialized && !sameClipEdits(m_edit, m_originalEdit) && !sameClipEdits(m_edit, m_baseline);
 }
@@ -474,11 +494,45 @@ void ClipEditor::exportClip() {
     QString error; if (!exportTo(path.endsWith(".mp4", Qt::CaseInsensitive) ? path : path + ".mp4", error)) emit failed(QStringLiteral("Export impossible"), error);
 }
 bool ClipEditor::exportTo(const QString& path, QString& error) {
-    if (m_sharingBusy) { error = QStringLiteral("Attendez la fin du partage Discord avant un autre export."); return false; }
+    if (m_sharingBusy) { error = QStringLiteral("Attendez la fin de la compression avant un autre export."); return false; }
     if (!hasExportChanges() || !m_player.snapshot().loaded) { error = QStringLiteral("Modifiez le clip avant de l'exporter."); return false; }
     if (!m_exporter.start(m_info, m_edit, path, error)) return false;
     m_exportSource = m_path; m_exportEdit = m_edit; m_exportClock.restart(); m_banner->hide();
-    m_progress->setValue(0); m_exportLabel->setText(QStringLiteral("Export MP4 · 0 %")); m_exportEta->clear();
+    showExportDialog(QFileInfo(path).fileName());
     updateActions(); return true;
 }
+// The export holds the editor for its whole length: it is shown in the middle of the window, large,
+// and stays until it ends. Then it says what was written and offers what may follow.
+void ClipEditor::showExportDialog(const QString& name) {
+    closeExportDialog();
+    auto* dialog = new ExportDialog(this); m_exportDialog = dialog; dialog->setObjectName("export-dialog"); dialog->setAttribute(Qt::WA_DeleteOnClose);
+    m_exportMark = new IconBox(QStringLiteral("save"), tk::accent, tk::accentSoft); dialog->setHeading(QStringLiteral("Export en cours"), name, m_exportMark, false);
+    m_exportProgress = new QWidget; auto* progress = new QVBoxLayout(m_exportProgress); progress->setContentsMargins(0, 0, 0, 0); progress->setSpacing(10);
+    auto* figures = new QHBoxLayout; m_exportPercent = monoLabel(QStringLiteral("0 %"), 26, tk::text, QFont::Bold); m_exportPercent->setObjectName("export-percent"); figures->addWidget(m_exportPercent, 0, Qt::AlignBottom); figures->addStretch();
+    m_exportEta = label({}, "small"); figures->addWidget(m_exportEta, 0, Qt::AlignBottom); progress->addLayout(figures);
+    m_exportBar = new Bar(nullptr, 8); m_exportBar->setObjectName("export-progress"); progress->addWidget(m_exportBar);
+    progress->addWidget(label(QStringLiteral("L'édition reprend dès la fin de l'export. L'original n'est pas modifié."), "hint", true)); dialog->body()->addWidget(m_exportProgress);
+    auto* cancel = new Button(QStringLiteral("Annuler l'export")); cancel->setObjectName("cancel-export"); dialog->footer()->addWidget(cancel);
+    connect(cancel, &QPushButton::clicked, this, [this] { m_exporter.cancel(); });
+    dialog->open();
+}
+void ClipEditor::showExportResult(const QString& path) {
+    auto* dialog = static_cast<ExportDialog*>(m_exportDialog.data()); if (!dialog) return;
+    dialog->unlock(); m_exportProgress->hide(); m_exportMark->set(QStringLiteral("ok"), tk::accent, tk::accentSoft); dialog->setFixedWidth(640);
+    dialog->body()->addWidget(label(QStringLiteral("Le nouveau clip est dans la bibliothèque. L'original n'a pas changé : gardez-le, ou mettez-le à la corbeille s'il ne sert plus."), "hint", true));
+    const QFileInfo file(path); const bool beside = file.absolutePath() == QFileInfo(m_exportSource).absolutePath();
+    dialog->setHeadingTexts(QStringLiteral("Exporté : %1 · %2").arg(file.fileName(), formatBytes(file.size())),
+        !beside ? QDir::toNativeSeparators(file.absolutePath()) : m_game.isEmpty() ? QStringLiteral("Rangé à côté de l'original.") : QStringLiteral("Rangé dans %1, à côté de l'original.").arg(m_game));
+    while (auto* item = dialog->footer()->takeAt(0)) { if (item->widget()) item->widget()->deleteLater(); delete item; }
+    auto* trash = new Button(QStringLiteral("trash"), QStringLiteral("Mettre l'original à la corbeille…"), Button::Danger); trash->setObjectName("export-trash-original"); dialog->footerLeft()->addWidget(trash);
+    auto* close = new Button(QStringLiteral("Fermer")); close->setObjectName("export-close");
+    auto* open = new Button(QStringLiteral("open"), QStringLiteral("Ouvrir le nouveau clip"), Button::Primary); open->setObjectName("export-open"); open->setAutoDefault(false);
+    dialog->footer()->addWidget(close); dialog->footer()->addWidget(open); close->setDefault(true);
+    connect(close, &QPushButton::clicked, dialog, &QDialog::accept);
+    // The dialog closes first: what follows (the editor on the new clip, a confirmation) opens on the window.
+    connect(open, &QPushButton::clicked, this, [this, dialog] { dialog->accept(); if (!m_exportedPath.isEmpty()) emit openRequested(m_exportedPath); });
+    connect(trash, &QPushButton::clicked, this, [this, dialog] { dialog->accept(); if (!m_exporter.running() && !m_exportSource.isEmpty()) emit deleteRequested(m_exportSource, false); });
+    dialog->refit();
+}
+void ClipEditor::closeExportDialog() { if (auto* dialog = static_cast<ExportDialog*>(m_exportDialog.data())) { dialog->unlock(); dialog->accept(); } m_exportDialog = nullptr; }
 }

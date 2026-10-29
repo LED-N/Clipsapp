@@ -75,7 +75,7 @@ QString clipCount(int count, bool images = false) { return QStringLiteral("%1 %2
 
 ClassifyPopup::ClassifyPopup(QWidget* parent) : QFrame(parent) {
     setObjectName("classify-popup"); setFixedWidth(316); hide();
-    setStyleSheet(QStringLiteral("QFrame#classify-popup { background: #1A1F27; border: 1px solid #3B4553; border-radius: 10px; } QListWidget { background: transparent; border: none; }"));
+    setThemedStyleSheet(this, QStringLiteral("QFrame#classify-popup { background: {raised}; border: 1px solid {lineHover}; border-radius: 10px; } QListWidget { background: transparent; border: none; }"));
     auto* layout = new QVBoxLayout(this); layout->setContentsMargins(1, 1, 1, 1); layout->setSpacing(0);
     auto* top = new QVBoxLayout; top->setContentsMargins(13, 13, 13, 10); top->setSpacing(10); m_title = label({}, "bold"); top->addWidget(m_title);
     m_field = new QLineEdit; m_field->setObjectName("classify-game"); m_field->setMaxLength(80); m_field->setPlaceholderText(QStringLiteral("Nom du jeu")); m_field->addAction(icon(QStringLiteral("tag")), QLineEdit::LeadingPosition);
@@ -146,7 +146,7 @@ LibraryPage::LibraryPage(ThumbnailCache* cache, Kind kind, QWidget* parent) : QW
     m_list = new ClipListView; m_list->setObjectName(images ? "screenshot-library" : "clip-library"); m_rows = new LibraryRowDelegate(m_list, cache); m_rows->setImages(images); m_list->setRowDelegate(m_rows); m_stack->addWidget(m_list);
 
     m_empty = new QWidget; auto* emptyLayout = new QVBoxLayout(m_empty); emptyLayout->setContentsMargins(24, 24, 24, 24); emptyLayout->setSpacing(0); emptyLayout->addStretch();
-    m_keys = new Keycaps(nullptr, true); emptyLayout->addWidget(m_keys, 0, Qt::AlignHCenter); emptyLayout->addSpacing(24);
+    m_keys = new Keycaps(nullptr, true); m_keys->setEmptyText(QStringLiteral("Aucun raccourci choisi · Réglages → Capture")); emptyLayout->addWidget(m_keys, 0, Qt::AlignHCenter); emptyLayout->addSpacing(24);
     auto* emptyTitle = label(images ? QStringLiteral("Aucun screenshot pour l'instant") : QStringLiteral("Aucun clip pour l'instant")); emptyTitle->setFont(uiFont(20, QFont::Bold)); emptyTitle->setAlignment(Qt::AlignCenter); emptyLayout->addWidget(emptyTitle); emptyLayout->addSpacing(8);
     m_emptyText = label({}, "t2", true); m_emptyText->setFont(uiFont(14)); m_emptyText->setAlignment(Qt::AlignCenter); m_emptyText->setFixedWidth(520); emptyLayout->addLayout(centered(m_emptyText)); emptyLayout->addSpacing(22);
     auto* emptyActions = new QHBoxLayout; emptyActions->setSpacing(8); emptyActions->addStretch();
@@ -170,7 +170,7 @@ LibraryPage::LibraryPage(ThumbnailCache* cache, Kind kind, QWidget* parent) : QW
     barTexts->addStretch(); barTexts->addWidget(m_barTitle); barTexts->addLayout(dragLine); barTexts->addStretch();
     bar->addWidget(new PartialBox); bar->addLayout(barTexts); bar->addStretch();
     m_classify = new Button(QStringLiteral("tag"), QStringLiteral("Classer…")); m_classify->setObjectName("classify-clip"); bar->addWidget(m_classify);
-    m_share = new Button(QStringLiteral("share"), QStringLiteral("Préparer pour Discord")); m_share->setObjectName("compress-discord-library"); bar->addWidget(m_share);
+    m_share = new Button(QStringLiteral("compress"), QStringLiteral("Compresser")); m_share->setObjectName("compress-library-selection"); m_share->setToolTip(QStringLiteral("Gagner de la place, ou préparer des copies pour Discord")); bar->addWidget(m_share);
     m_trash = new Button(QStringLiteral("trash"), QStringLiteral("Corbeille"), Button::Danger); m_trash->setObjectName("delete-library-clips"); bar->addWidget(m_trash);
     // A picture needs no copy for Discord: it is dragged, or copied, as it is.
     if (images) { m_share->hide(); m_share->setObjectName("screenshots-share"); m_classify->setObjectName("classify-screenshot"); m_trash->setObjectName("delete-screenshots"); m_bar->setObjectName("screenshots-selection-bar"); m_barTitle->setObjectName("screenshots-selection-count"); m_sortButton->setObjectName("screenshots-sort"); }
@@ -201,7 +201,7 @@ LibraryPage::LibraryPage(ThumbnailCache* cache, Kind kind, QWidget* parent) : QW
     });
     connect(clear, &QPushButton::clicked, this, &LibraryPage::clearSelection);
     connect(m_classify, &QPushButton::clicked, this, &LibraryPage::classify);
-    connect(m_share, &QPushButton::clicked, this, [this] { emit shareRequested(selectedPaths()); });
+    connect(m_share, &QPushButton::clicked, this, [this] { emit compressRequested(selectedPaths()); });
     connect(m_trash, &QPushButton::clicked, this, [this] { emit trashRequested(selectedPaths()); });
     connect(m_popup, &ClassifyPopup::chosen, this, [this](const QString& game) { const auto paths = selectedPaths(); if (!paths.isEmpty()) emit classifyRequested(paths, game); m_list->setFocus(); });
     connect(cache, &ThumbnailCache::ready, m_list->viewport(), qOverload<>(&QWidget::update));
@@ -228,8 +228,10 @@ void LibraryPage::setScreenshotHint(const QKeySequence& hotkey) { if (m_kind == 
 void LibraryPage::setReplayHint(const QKeySequence& hotkey, int seconds, bool canStart, bool running) {
     if (m_kind == Screenshots) return;
     m_keys->setSequence(hotkey); m_startReplay->setEnabled(canStart && !running); m_startReplay->setText(running ? QStringLiteral("Replay actif") : QStringLiteral("Démarrer le replay"));
-    m_emptyText->setText(running ? QStringLiteral("Le replay tourne. Quand il se passe quelque chose, appuyez sur le raccourci : les %1 dernières secondes arrivent ici.").arg(seconds)
-                                 : QStringLiteral("Démarrez le replay avant de jouer. Quand il se passe quelque chose, appuyez sur le raccourci : les %1 dernières secondes arrivent ici.").arg(seconds));
+    // Without a shortcut, the clip is saved from the bar at the top.
+    const auto how = hotkey.isEmpty() ? QStringLiteral("cliquez sur « Sauvegarder le clip », en haut") : QStringLiteral("appuyez sur le raccourci");
+    m_emptyText->setText(running ? QStringLiteral("Le replay tourne. Quand il se passe quelque chose, %2 : les %1 dernières secondes arrivent ici.").arg(seconds).arg(how)
+                                 : QStringLiteral("Démarrez le replay avant de jouer. Quand il se passe quelque chose, %2 : les %1 dernières secondes arrivent ici.").arg(seconds).arg(how));
 }
 QStringList LibraryPage::selectedPaths() const { return m_list->selectedPaths(); }
 void LibraryPage::select(const QStringList& paths) { m_list->selectPaths(paths); }
@@ -265,7 +267,8 @@ void LibraryPage::showMenu(const QString& path, const QPoint& globalPosition) {
     } else {
         add(QStringLiteral("expand"), QStringLiteral("Lire en plein écran"), QStringLiteral("Espace"), single && !m_trashing, [this, path] { view(path); });
         add(QStringLiteral("cut"), QStringLiteral("Ouvrir dans l'éditeur"), QStringLiteral("Entrée"), single && !m_trashing, [this, path] { emit openRequested(path); });
-        add(QStringLiteral("share"), QStringLiteral("Préparer pour Discord"), {}, !busy, [this, paths] { emit shareRequested(paths); });
+        add(QStringLiteral("compress"), QStringLiteral("Compresser…"), {}, !busy, [this, paths] { emit compressRequested(paths); });
+        add(QStringLiteral("share"), QStringLiteral("Compresser pour Discord"), {}, !busy, [this, paths] { emit shareRequested(paths); });
         add(QStringLiteral("copy"), single ? QStringLiteral("Copier le fichier") : QStringLiteral("Copier les fichiers"), QStringLiteral("Ctrl C"), true, [this, paths] { emit copyRequested(paths); });
     }
     add(QStringLiteral("folder"), QStringLiteral("Afficher dans le dossier"), {}, single, [this, path] { emit revealRequested(path); });
@@ -310,8 +313,8 @@ void LibraryPage::refresh() {
           row->setData(clip.name, ClipRole::Name); row->setData(clip.game, ClipRole::Game); row->setData(clip.size, ClipRole::Bytes); row->setData(clip.modified, ClipRole::Modified);
           row->setData(entry->favorite, ClipRole::Favorite); row->setData(entry->fresh, ClipRole::Fresh); row->setData(clip.path, Qt::ToolTipRole);
           row->setData(grouped ? clip.modified.toString(QStringLiteral("HH:mm")) : french.toString(clip.modified, QStringLiteral("d MMM yy HH:mm")), ClipRole::Detail);
-          const bool fits = images || clip.size <= m_limit; row->setData(fits || entry->hasCopy, ClipRole::FitOk);
-          row->setData(images ? QString() : fits ? QStringLiteral("Prêt pour Discord") : entry->hasCopy ? QStringLiteral("Copie Discord prête") : QStringLiteral("Plus de %1").arg(formatLimit(m_limit)), ClipRole::FitText);
+          const bool fits = images || clip.size <= m_limit; row->setData(fits, ClipRole::FitOk);
+          row->setData(images ? QString() : fits ? QStringLiteral("Prêt pour Discord") : QStringLiteral("Plus de %1").arg(formatLimit(m_limit)), ClipRole::FitText);
           model->appendRow(row);
       }
       closeGroup(); }
@@ -327,7 +330,8 @@ void LibraryPage::refresh() {
 void LibraryPage::updateSelection() {
     const auto paths = selectedPaths(); qint64 bytes = 0; for (const auto& path : paths) if (const auto* entry = item(path)) bytes += entry->clip.size;
     const bool visible = !paths.isEmpty(), changed = visible != m_bar->isVisible();
-    m_barTitle->setText(paths.size() > 1 ? QStringLiteral("%1 clips sélectionnés").arg(paths.size()) : QStringLiteral("1 clip sélectionné"));
+    const auto kind = m_kind == Screenshots ? QStringLiteral("screenshot") : QStringLiteral("clip");
+    m_barTitle->setText(paths.size() > 1 ? QStringLiteral("%1 %2s sélectionnés").arg(paths.size()).arg(kind) : QStringLiteral("1 %1 sélectionné").arg(kind));
     m_barDetail->setText((paths.size() > 1 ? QStringLiteral("Glissez-les dans Discord · ") : QStringLiteral("Glissez-le dans Discord · ")) + formatBytes(bytes));
     m_classify->setEnabled(!m_trashing); m_share->setEnabled(!m_trashing && !m_sharing); m_trash->setEnabled(!m_trashing && !m_sharing);
     m_trash->setText(m_trashing ? QStringLiteral("Suppression…") : QStringLiteral("Corbeille")); m_list->setDragEnabled(!m_trashing && !m_sharing);

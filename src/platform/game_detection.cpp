@@ -6,6 +6,7 @@
 #include <QSet>
 #include <functional>
 #ifdef Q_OS_WIN
+#include "platform/windows_monitors.h"
 #include <windows.h>
 #include <tlhelp32.h>
 #include <vector>
@@ -35,8 +36,9 @@ QString detectCapturedGame(const QString& videoTarget) {
     } else if (videoTarget.startsWith("screen:")) {
         const auto window = GetForegroundWindow(); if (!window || !IsWindowVisible(window) || IsIconic(window)) return {};
         DWORD pid = 0; GetWindowThreadProcessId(window, &pid); if (pid == GetCurrentProcessId()) return {};
-        MONITORINFOEXW monitor{}; monitor.cbSize = sizeof(monitor);
-        if (!GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONULL), &monitor) || QString::fromWCharArray(monitor.szDevice) != videoTarget.mid(7)) return {};
+        // The window of the game fills the screen being captured, that screen found by what names it.
+        const auto captured = findMonitor(videoTarget); MONITORINFOEXW monitor{}; monitor.cbSize = sizeof(monitor);
+        if (!captured || MonitorFromWindow(window, MONITOR_DEFAULTTONULL) != captured->handle || !GetMonitorInfoW(static_cast<HMONITOR>(captured->handle), &monitor)) return {};
         RECT rect{}; if (!GetWindowRect(window, &rect)) return {};
         if (rect.right - rect.left < (monitor.rcMonitor.right - monitor.rcMonitor.left) * .6 || rect.bottom - rect.top < (monitor.rcMonitor.bottom - monitor.rcMonitor.top) * .6) return {};
         const auto process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid); if (!process) return {};

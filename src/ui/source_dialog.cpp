@@ -69,7 +69,7 @@ SourceDialog::SourceDialog(const SourceCatalog& catalog, const RecordingProfile&
     connect(m_autoExclusions, &QCheckBox::toggled, chips, [chips, shown](bool on) { chips->setVisible(on && shown > 0); });
     exclusionLayout->addWidget(label(QStringLiteral("Exclure aussi"), "lbl"));
     m_exclusions = new QListWidget; m_exclusions->setObjectName("application-exclusions"); m_exclusions->setItemDelegate(new ExclusionDelegate(m_exclusions)); m_exclusions->setFixedHeight(104); m_exclusions->setSelectionMode(QAbstractItemView::NoSelection); m_exclusions->setFocusPolicy(Qt::NoFocus);
-    m_exclusions->setStyleSheet(QStringLiteral("QListWidget { background: #0F1217; border: 1px solid #242A34; border-radius: 8px; }")); exclusionLayout->addWidget(m_exclusions);
+    setThemedStyleSheet(m_exclusions, QStringLiteral("QListWidget { background: {field}; border: 1px solid {line}; border-radius: 8px; }")); exclusionLayout->addWidget(m_exclusions);
     // An application is listed once, under its current path, even when it was excluded before an update.
     QSet<QString> seen, active; for (const auto& target : m_catalog.applications) active.insert(applicationIdentity(target.id));
     const auto addExclusion = [this, &seen, &active](const QString& path, const QString& name, bool checkedByDefault = false) {

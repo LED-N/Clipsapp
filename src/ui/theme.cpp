@@ -7,12 +7,18 @@
 #include <QFile>
 #include <QImage>
 #include <QRegularExpression>
+#include <QAbstractButton>
+#include <QAbstractSpinBox>
 #include <QApplication>
 #include <QHash>
+#include <QLabel>
+#include <QLineEdit>
+#include <algorithm>
 #include <QLinearGradient>
 #include <QLineF>
 #include <QPainter>
 #include <QPalette>
+#include <QPointer>
 #include <QStyle>
 #include <QVariant>
 #include <QWidget>
@@ -79,6 +85,7 @@ const IconData icons[] = {
     {"edit", "M10.5 2.5l3 3L6 13H3v-3z"},
     {"open", "M9 2.5h4.5V7 M13.5 2.5L7.5 8.5 M11.5 9.5v4h-9v-9h4"},
     {"expand", "M2.5 6V2.5H6 M10 2.5h3.5V6 M13.5 10v3.5H10 M6 13.5H2.5V10"},
+    {"compress", "M6 2.5V6H2.5 M10 2.5V6h3.5 M13.5 10H10v3.5 M2.5 10H6v3.5"},
     {"eye","M1.5 8s2.5-4.5 6.5-4.5S14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8z M8 10a2 2 0 1 0 0-4 2 2 0 0 0 0 4z"},
 };
 bool bold(const QString& name) { return name == QLatin1String("more") || name == QLatin1String("grip"); }
@@ -263,10 +270,24 @@ QLineF gradientLine(const QRectF& box, int angle) {
     const double radians = angle * 3.141592653589793 / 180, dx = std::cos(radians) / 2, dy = std::sin(radians) / 2;
     return {box.center().x() - dx * box.width(), box.center().y() - dy * box.height(), box.center().x() + dx * box.width(), box.center().y() + dy * box.height()};
 }
-QString styleSheet() {
+// Every token a style sheet or a rich text may name, longest names first so that none cuts another.
+QList<std::pair<QString, QString>> themeTokens() {
     using namespace tk;
     const auto axis = gradientLine(QRectF(0, 0, 1, 1), gradientAngle);
     const auto ground = windowGradient ? QStringLiteral("qlineargradient(x1:%1, y1:%2, x2:%3, y2:%4, stop:0 %5, stop:1 %6)").arg(axis.x1()).arg(axis.y1()).arg(axis.x2()).arg(axis.y2()).arg(window.name(), windowEnd.name()) : window.name();
+    const auto veil = QStringLiteral("rgba(%1, %2, %3, 224)").arg(window.red()).arg(window.green()).arg(window.blue());
+    const std::pair<const char*, QColor> colors[]{
+        {"text2", text2}, {"text3", text3}, {"textOff", textOff}, {"text", text}, {"window", window}, {"raised", raised}, {"surface", surface}, {"field", field}, {"header", header},
+        {"rail", rail}, {"lineStrong", lineStrong}, {"lineHover", lineHover}, {"lineSoft", lineSoft}, {"line", line}, {"control", control}, {"selected", selected}, {"highlight", highlight},
+        {"accentSoft", accentSoft}, {"accentLine", accentLine}, {"onAccent", onAccent}, {"accent", accent}, {"liveBg", liveBg}, {"liveLine", liveLine}, {"warnText", warnText}, {"warnBg", warnBg}, {"warnLine", warnLine}, {"warnSoft", warnSoft}, {"warn", warn},
+        {"dangerBg", dangerBg}, {"dangerLine", dangerLine}, {"dangerSoft", dangerSoft}, {"danger", danger}, {"infoSoft", infoSoft}, {"infoLine", infoLine}, {"info", info},
+        {"muted", muted}, {"chip", chip}, {"hover", hover}, {"press", press}};
+    QList<std::pair<QString, QString>> tokens{{QStringLiteral("{ground}"), ground}, {QStringLiteral("{veil}"), veil}};
+    for (const auto& [name, color] : colors) tokens.append({QStringLiteral("{%1}").arg(QLatin1String(name)), color.name()});
+    std::stable_sort(tokens.begin(), tokens.end(), [](const auto& left, const auto& right) { return left.first.size() > right.first.size(); });
+    return tokens;
+}
+QString styleSheet() {
     QString sheet = QStringLiteral(R"(
         QWidget { color: {text}; }
         QWidget:disabled { color: {textOff}; }
@@ -331,14 +352,7 @@ QString styleSheet() {
         QSlider::handle:horizontal:focus { border-color: {info}; }
         QSlider::sub-page:horizontal:disabled, QSlider::handle:horizontal:disabled { background: {textOff}; }
     )");
-    const std::pair<const char*, QColor> tokens[]{
-        {"text2", text2}, {"text3", text3}, {"textOff", textOff}, {"text", text}, {"window", window}, {"raised", raised}, {"surface", surface}, {"field", field}, {"header", header},
-        {"rail", rail}, {"lineStrong", lineStrong}, {"lineHover", lineHover}, {"lineSoft", lineSoft}, {"line", line}, {"control", control}, {"selected", selected}, {"highlight", highlight},
-        {"accent", accent}, {"liveBg", liveBg}, {"liveLine", liveLine}, {"warnText", warnText}, {"warnBg", warnBg}, {"warnLine", warnLine}, {"warn", warn},
-        {"dangerBg", dangerBg}, {"dangerLine", dangerLine}, {"danger", danger}, {"infoSoft", infoSoft}, {"infoLine", infoLine}, {"info", info}};
-    sheet.replace(QStringLiteral("{ground}"), ground);
-    for (const auto& [name, color] : tokens) sheet.replace(QStringLiteral("{%1}").arg(QLatin1String(name)), color.name());
-    return sheet;
+    return themed(sheet);
 }
 void applyPalette(QApplication& application) {
     QPalette palette;
@@ -432,10 +446,44 @@ void applyColors(const ThemeColors& colors) {
     derive(colors);
     if (!application) return;
     applyPalette(*application); application->setStyleSheet(styleSheet());
-    // What draws itself reads the colors when it paints: it only needs to be painted again.
-    for (auto* widget : QApplication::allWidgets()) widget->update();
+    // What draws itself reads the colors when it paints: it only needs to be painted again. What was
+    // written with the tokens of the theme is written again with its new colors.
+    for (auto* widget : QApplication::allWidgets()) {
+        if (const auto sheet = widget->property("themedSheet"); sheet.isValid()) widget->setStyleSheet(themed(sheet.toString()));
+        if (const auto text = widget->property("themedText"); text.isValid()) if (auto* label = qobject_cast<QLabel*>(widget)) label->setText(themed(text.toString()));
+        if (const auto tip = widget->property("themedToolTip"); tip.isValid()) widget->setToolTip(themed(tip.toString()));
+        widget->update();
+    }
+}
+QString themed(QString text) {
+    if (!text.contains(QLatin1Char('{'))) return text;
+    for (const auto& [token, value] : themeTokens()) text.replace(token, value);
+    return text;
+}
+void setThemedStyleSheet(QWidget* widget, const QString& sheet) { widget->setProperty("themedSheet", sheet); widget->setStyleSheet(themed(sheet)); }
+void setThemedText(QLabel* label, const QString& text) { label->setProperty("themedText", text); label->setText(themed(text)); }
+void setThemedToolTip(QWidget* widget, const QString& tip) { widget->setProperty("themedToolTip", tip); widget->setToolTip(themed(tip)); }
+namespace {
+// Buttons, tabs, tiles and switches answer the mouse alone: they never take the focus, so Espace or
+// Entrée never press the one clicked last, and the keys stay with what they are meant for (Espace
+// plays the clip in the editor). Entrée still answers the button a dialog marks as its default.
+// A click on a button ends the typing in a field, as a click that took the focus used to.
+class MouseOnlyButtons final : public QObject {
+public:
+    using QObject::QObject;
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override {
+        if (event->type() == QEvent::Polish) { if (auto* button = qobject_cast<QAbstractButton*>(watched)) button->setFocusPolicy(Qt::NoFocus); }
+        else if (event->type() == QEvent::MouseButtonPress) {
+            auto* button = qobject_cast<QAbstractButton*>(watched); auto* typing = QApplication::focusWidget();
+            if (button && typing && typing != button && !typing->isAncestorOf(button) && typing->window() == button->window() && (qobject_cast<QLineEdit*>(typing) || qobject_cast<QAbstractSpinBox*>(typing))) typing->clearFocus();
+        }
+        return QObject::eventFilter(watched, event);
+    }
+};
 }
 void applyTheme(QApplication& application) {
+    static QPointer<QObject> mouseOnly; if (!mouseOnly) { mouseOnly = new MouseOnlyButtons(&application); application.installEventFilter(mouseOnly); }
     application.setStyle("Fusion");
     QFont font;
 #ifdef Q_OS_WIN

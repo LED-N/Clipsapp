@@ -32,7 +32,7 @@ Les trois fonctionnent pendant que le jeu est au premier plan, et se changent da
 
 - **Replay** : de 15 secondes à 10 minutes gardées en continu, prêtes à devenir un clip d'un raccourci. Il peut démarrer avec Windows, ou seulement quand un de vos jeux est ouvert, et s'arrêter tout seul après lui.
 - **Enregistrement** : une partie entière, sans limite de durée, lancée et arrêtée d'un même raccourci. Il tourne seul ou à côté du replay : chacun a sa barre, verte pour le replay, rouge pour l'enregistrement, et vous pouvez toujours sauvegarder des clips pendant ce temps. Le fichier reste lisible même si le PC s'arrête en cours de route.
-- **Qualité au choix** : quatre préréglages, de « Légère » à « Maximale », ou des réglages avancés : jusqu'en 4K, de 30 à 144 images par seconde, H.264 ou HEVC, débit cible ou qualité constante jusqu'au quasi sans perte. Chaque réglage est expliqué par une infobulle.
+- **Qualité en trois choix** : la résolution (1080p, 1440p ou 4K), la fréquence (30 à 144 images par seconde), puis un préréglage Léger, Équilibré ou Haut qui s'y adapte, avec le poids d'un clip affiché. Les réglages avancés restent à un clic : H.264 ou HEVC, débit cible ou qualité constante jusqu'au quasi sans perte, chacun expliqué par une infobulle. Les cartes NVIDIA, AMD et, par l'encodeur de Windows, les plus anciennes (GTX 900 et 1000) sont prises en charge.
 - **En mémoire ou sur le disque** : le replay garde ses secondes en mémoire, ou sur un SSD pour un long replay qui laisse la mémoire au jeu. Clipsapp vous le propose quand le replay deviendrait lourd.
 - **Son en pistes séparées** : micro, jeu et Discord, chacun sur sa piste, pour les régler ou les couper après coup. « Tout, sauf exclusions » enregistre le son de toutes vos applications, sauf celles que vous écartez, comme Discord ou le navigateur.
 
@@ -58,7 +58,8 @@ Tout se règle dans **Réglages → Général → Thèmes**.
 - **Bibliothèque** : vos clips rangés par jeu et par jour, avec favoris, recherche et renommage. Les clips ajoutés ou supprimés dans l'Explorateur apparaissent aussitôt.
 - **Éditeur** : découpe, recadrage (16:9, 9:16 pour les formats verticaux, 1:1 ou libre), volume de chaque piste, export. L'original est toujours conservé, et Clipsapp retient les volumes que vous préférez, jeu par jeu.
 - **Lecture en plein écran**, pour regarder un clip ou le montrer sans l'envoyer.
-- **Discord** : glissez un clip dans une conversation, ou préparez-en une copie sous la limite de taille, en un clic ou par lot.
+- **Compresseur** : allégez vos clips sans perte visible, en comparant avant et après d'un glissement sur l'image, un clip, une sélection ou toute la bibliothèque à la fois, en arrière-plan.
+- **Discord** : glissez un clip dans une conversation, ou compressez-le pour Discord : une copie temporaire en H.264, sous votre limite de taille, lisible partout.
 - **Screenshots** : rangés par jeu, à part des clips, regardés en plein écran, recadrés ou annotés (pinceau, flèche, cadre, ellipse) dans une copie.
 
 ## Installer
@@ -67,7 +68,7 @@ Tout se règle dans **Réglages → Général → Thèmes**.
 2. Lancez `Clipsapp.exe`, dans ce dossier.
 3. Au premier lancement, Windows peut afficher « Windows a protégé votre ordinateur » : cliquez sur **Informations complémentaires**, puis **Exécuter quand même**. Clipsapp n'est pas signé, c'est la raison de cet avertissement.
 
-Clipsapp pose ensuite quatre questions (dossier des clips, écran ou fenêtre, sons, raccourci) et propose de s'ajouter au menu Démarrer ; le replay peut alors tourner.
+Clipsapp pose ensuite cinq questions (dossier des clips, écran ou fenêtre, qualité, sons, raccourci) et propose de s'ajouter au menu Démarrer ; le replay peut alors tourner.
 
 ## À savoir
 

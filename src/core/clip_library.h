@@ -22,6 +22,8 @@ QString capturedFileName(const QString& gameFolder, const QString& suffix);
 struct ClipTrashResult { QStringList removed, errors; };
 using ClipTrashOperation = std::function<bool(const QString&, QString&)>;
 ClipTrashResult trashClips(const QStringList& paths, ClipTrashOperation operation = {});
+// What trashClips does when the user asked for no trash: the file is deleted for good.
+ClipTrashOperation permanentDeletion();
 // Renames the file in place: same folder, same extension, never over another file.
 struct ClipRename { QString path, error; };
 ClipRename renameClipFile(const QString& path, const QString& name);

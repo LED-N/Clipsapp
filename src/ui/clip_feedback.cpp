@@ -57,9 +57,10 @@ QList<SavedSound> clipSavedSounds() {
     return {{"duo", QStringLiteral("Deux notes")}, {"chime", QStringLiteral("Carillon")}, {"coin", QStringLiteral("Pièce")}, {"drop", QStringLiteral("Goutte")},
             {"bubble", QStringLiteral("Bulle")}, {"shutter", QStringLiteral("Déclencheur photo")}, {"beep", QStringLiteral("Bip")}};
 }
-QByteArray clipSavedSoundWave(const QString& id, int volume) {
+QByteArray clipSavedSoundWave(const QString& id, int volume, int times) {
     bool known = false; for (const auto& sound : clipSavedSounds()) known |= sound.id == id;
-    auto samples = render(known ? id : clipSavedSounds().first().id);
+    const auto once = render(known ? id : clipSavedSounds().first().id); auto samples = once;
+    for (int again = 1; again < std::clamp(times, 1, 3); ++again) { const auto gap = silence(0.07); samples.insert(samples.end(), gap.begin(), gap.end()); samples.insert(samples.end(), once.begin(), once.end()); }
     // Every sound reaches the same peak; the ear hears the square of the setting as an even step.
     double peak = 0; for (const double sample : samples) peak = std::max(peak, std::abs(sample));
     const double level = std::clamp(volume, 0, 100) / 100.0, gain = peak > 0 ? 0.513 * level * level * 32767 / peak : 0;
@@ -72,15 +73,15 @@ QByteArray clipSavedSoundWave(const QString& id, int volume) {
     for (int frame = 0; frame < frames; ++frame) qToLittleEndian<qint16>(qint16(std::lround(std::clamp(samples[size_t(frame)] * gain, -32767.0, 32767.0))), data + 44 + frame * 2);
     return wave;
 }
-void playClipSavedSound(const QString& id, int volume) {
+void playClipSavedSound(const QString& id, int volume, int times) {
 #ifdef Q_OS_WIN
     // Windows reads the sound from memory while it plays: the one playing is stopped before its memory is replaced.
     static QByteArray playing;
     PlaySoundW(nullptr, nullptr, 0);
-    playing = clipSavedSoundWave(id, volume);
+    playing = clipSavedSoundWave(id, volume, times);
     PlaySoundW(reinterpret_cast<LPCWSTR>(playing.constData()), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
 #else
-    Q_UNUSED(id); if (volume > 0) QApplication::beep();
+    Q_UNUSED(id); Q_UNUSED(times); if (volume > 0) QApplication::beep();
 #endif
 }
 }

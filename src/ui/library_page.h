@@ -13,7 +13,7 @@ class ClipListView;
 class Keycaps;
 class LibraryRowDelegate;
 class ThumbnailCache;
-struct LibraryItem { ClipEntry clip; bool favorite = false, fresh = false, hasCopy = false; };
+struct LibraryItem { ClipEntry clip; bool favorite = false, fresh = false; };
 
 // Type a game, pick a suggestion, press Enter. Files are never moved.
 class ClassifyPopup final : public QFrame {
@@ -61,7 +61,9 @@ signals:
     void openRequested(const QString& path);
     // Full-screen viewing of one clip, with the listed clips as the playlist to walk through.
     void viewRequested(const QStringList& playlist, int index);
+    // A copy for Discord, straight away; or the compressor, which asks what for.
     void shareRequested(const QStringList& paths);
+    void compressRequested(const QStringList& paths);
     void trashRequested(const QStringList& paths);
     void classifyRequested(const QStringList& paths, const QString& game);
     void favoriteRequested(const QStringList& paths, bool favorite);
